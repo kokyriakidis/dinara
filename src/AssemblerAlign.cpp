@@ -254,7 +254,7 @@ void Assembler::alignOverlappingOrientedReads(
 // Minimum PAF alignment block length (column 11) for an overlap to be kept.
 static constexpr uint64_t pafMinAlignmentBlockLength = 200;
 
-void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
+void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath, uint64_t threadCount)
 {
     // Memory-map the PAF file and parse it in parallel. The file is split into
     // line-aligned byte ranges (one per thread); each thread parses its range
@@ -304,7 +304,8 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
     ::close(fd);
 
     // ---- Split into line-aligned chunks and parse in parallel. ----
-    uint64_t threadCount = std::thread::hardware_concurrency();
+    // threadCount == 0 means "auto": use all hardware threads.
+    if (threadCount == 0) threadCount = std::thread::hardware_concurrency();
     if (threadCount == 0) threadCount = 1;
 
     const auto ranges = computePafChunkRanges(data, fileSize, threadCount);
@@ -387,15 +388,26 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
         ::munmap(mapping, fileSize);
     }
 
-    // ---- Deduplicate: one entry per read pair, keeping the longest overlap. ----
+    // ---- Deduplicate: one entry per (read pair, strand), keeping the longest
+    // overlap. A pair overlapping in both orientations keeps up to two entries. ----
     const size_t rawCount = entries.size();
     dedupPafEntriesKeepLongest(entries);
     const uint64_t duplicateCount = uint64_t(rawCount - entries.size());
 
-    // ---- Publish results (deterministic: entries are in ascending key order). ----
+    // ---- Publish results (deterministic: entries are in ascending key order,
+    // same-strand before reverse within a key). Each surviving entry becomes one
+    // oriented candidate; both orientations of a pair are folded into the pair's
+    // PafPairIntervals so chaining can look up the interval for either strand. ----
     pafCandidateIntervals.reserve(entries.size());
     for (const PafEntry& e : entries) {
-        pafCandidateIntervals.emplace(e.key, e.iv);
+        PafPairIntervals& pair = pafCandidateIntervals[e.key];
+        if(e.iv.isSameStrand) {
+            pair.same = e.iv;
+            pair.haveSame = true;
+        } else {
+            pair.diff = e.iv;
+            pair.haveDiff = true;
+        }
         const ReadId readId0 = ReadId(e.key >> 32);
         const ReadId readId1 = ReadId(e.key & 0xffffffffULL);
         alignmentCandidates.candidates.push_back(

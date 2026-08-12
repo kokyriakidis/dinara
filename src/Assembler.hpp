@@ -1250,11 +1250,13 @@ private:
     // PAF-imported overlap intervals, keyed by canonical read pair (readId0<readId1).
     // Populated by importAlignmentCandidatesFromPaf and consumed by chainPafCandidates
     // to constrain shared-minimizer collection to the interval hifiasm already agreed on.
-    // PafCandidateInterval is defined in PafImport.hpp; coordinates are half-open base
-    // positions on each read, target coordinates forward-strand (Alignment::ts/te).
+    // Each pair can hold both a same-strand and a reverse overlap (PafPairIntervals),
+    // since inverted repeats can produce both. PafCandidateInterval/PafPairIntervals are
+    // defined in PafImport.hpp; coordinates are half-open base positions on each read,
+    // target coordinates forward-strand (Alignment::ts/te).
     // Key packs (readId0<<32 | readId1) with readId0<readId1.
 public:
-    std::unordered_map<uint64_t, PafCandidateInterval> pafCandidateIntervals;
+    std::unordered_map<uint64_t, PafPairIntervals> pafCandidateIntervals;
 private:
 
 public:
@@ -1283,7 +1285,8 @@ public:
     void accessAlignmentCandidateTable();
     vector<OrientedReadPair> getAlignmentCandidates() const;
     void computeCandidateTable();
-    void importAlignmentCandidatesFromPaf(const string& pafFilePath);
+    // threadCount == 0 means "use all hardware threads".
+    void importAlignmentCandidatesFromPaf(const string& pafFilePath, uint64_t threadCount = 0);
     
     // Chain pre-imported PAF candidates using the inverted index.
     // buildInvertedIndex must be called before this.
@@ -2604,6 +2607,11 @@ private:
          // driver in findMarkersSimdMinimizers owns and frees it).
          const void* hifiasmFilter = nullptr;
          int hifiasmSampleDist = 0; // subsampling distance; <=0 disables it
+         // Per-read staged markers (forward strand: (position, kmerId)), filled
+         // by the single sketch pass and consumed by the store pass so each read
+         // is sketched exactly once. Indexed by ReadId; strand 1 is derived from
+         // strand 0 during the store pass. Entries are freed as they are stored.
+         std::vector<std::vector<std::pair<uint32_t, KmerId>>> stagedMarkers;
     };
     FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
 

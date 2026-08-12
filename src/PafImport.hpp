@@ -61,6 +61,23 @@ struct PafEntry {
     PafCandidateInterval iv;
 };
 
+// Both orientations a read pair may overlap in. A pair can legitimately appear
+// as both a same-strand (+) and a reverse (-) overlap (e.g. inverted repeats),
+// so we keep them separately instead of collapsing to one. Each is optional;
+// the longest overlap is kept per orientation.
+struct PafPairIntervals {
+    bool haveSame = false;
+    bool haveDiff = false;
+    PafCandidateInterval same;   // valid iff haveSame
+    PafCandidateInterval diff;   // valid iff haveDiff
+
+    // Return the interval for the requested orientation, or nullptr if absent.
+    const PafCandidateInterval* get(bool isSameStrand) const {
+        if(isSameStrand) return haveSame ? &same : nullptr;
+        return haveDiff ? &diff : nullptr;
+    }
+};
+
 
 // Return true if c is a field delimiter (space, tab, CR, LF).
 inline bool pafIsDelim(char c)
@@ -164,30 +181,37 @@ inline PafEntry makePafEntry(
 
 
 // Strict ordering used to make deduplication deterministic:
-//   key ascending, then blockLen DESCENDING (so the longest overlap sorts first
-//   for each key), then remaining fields to break ties reproducibly.
+//   key ascending, then strand (same before diff), then blockLen DESCENDING (so
+//   the longest overlap sorts first for each (key, strand)), then remaining
+//   fields to break ties reproducibly.
 inline bool pafEntryLess(const PafEntry& a, const PafEntry& b)
 {
     if(a.key != b.key) return a.key < b.key;
+    // same-strand (true) sorts before reverse (false).
+    if(a.iv.isSameStrand != b.iv.isSameStrand) return int(a.iv.isSameStrand) > int(b.iv.isSameStrand);
     if(a.iv.blockLen != b.iv.blockLen) return a.iv.blockLen > b.iv.blockLen;
     if(a.iv.qStart != b.iv.qStart) return a.iv.qStart < b.iv.qStart;
     if(a.iv.qEnd != b.iv.qEnd) return a.iv.qEnd < b.iv.qEnd;
     if(a.iv.tStart != b.iv.tStart) return a.iv.tStart < b.iv.tStart;
-    if(a.iv.tEnd != b.iv.tEnd) return a.iv.tEnd < b.iv.tEnd;
-    return int(a.iv.isSameStrand) < int(b.iv.isSameStrand);
+    return a.iv.tEnd < b.iv.tEnd;
 }
 
 
-// Sort `entries` in place and collapse duplicates by key, keeping the entry with
-// the largest blockLen (the longest overlap) per key. After this call `entries`
-// holds one entry per unique key in ascending key order (deterministic).
+// Sort `entries` in place and collapse duplicates by (key, strand), keeping the
+// entry with the largest blockLen (the longest overlap) for each (key, strand).
+// A read pair that overlaps in both orientations therefore keeps up to two
+// entries (one +, one -). After this call `entries` is in ascending key order,
+// same-strand before reverse within a key (deterministic).
 inline void dedupPafEntriesKeepLongest(std::vector<PafEntry>& entries)
 {
     std::sort(entries.begin(), entries.end(), pafEntryLess);
     size_t w = 0;
     for(size_t r = 0; r < entries.size(); ++r) {
-        if(w == 0 || entries[r].key != entries[w - 1].key) {
-            entries[w++] = entries[r];   // First per key = longest (sort order).
+        const bool distinct = (w == 0) ||
+            (entries[r].key != entries[w - 1].key) ||
+            (entries[r].iv.isSameStrand != entries[w - 1].iv.isSameStrand);
+        if(distinct) {
+            entries[w++] = entries[r];   // First per (key, strand) = longest.
         }
     }
     entries.resize(w);

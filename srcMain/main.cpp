@@ -1772,8 +1772,22 @@ void dinara::main::assemble(
     // of --Reads.handleDuplicates. The default option is "useOneCopy".
     assembler.findDuplicateReads(assemblerOptions.readsOptions.handleDuplicates);
 
-    // Find markers using either SIMD closed syncmers or the default k-mer based method.
-    if(assemblerOptions.kmersOptions.useSimdClosedSyncmers) {
+    // Marker generation method selection.
+    //
+    // The SIMD minimizer path is the main path and is taken by default because
+    // Kmers.useHifiasmMinimizers defaults to true: it generates markers from
+    // hifiasm's own no-HPC sketcher plus the overlap-path minimizer filter, so
+    // the marker seeds match the seeds hifiasm uses for overlaps. This is what
+    // pairs with the PAF/hifiasm overlap path.
+    //
+    // Within the SIMD path the position source is:
+    //   - hifiasm sketcher            when useHifiasmMinimizers (default)
+    //   - simd-minimizers library     when only useSimdClosedSyncmers is set
+    // The legacy k-mer marker method is used only when BOTH flags are false.
+    const bool useSimdMinimizerPath =
+        assemblerOptions.kmersOptions.useHifiasmMinimizers ||
+        assemblerOptions.kmersOptions.useSimdClosedSyncmers;
+    if(useSimdMinimizerPath) {
         // // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
         // assembler.findMarkersSimdClosedSyncmers(
         //     threadCount,
@@ -2040,7 +2054,7 @@ void dinara::main::assemble(
     }
 
     if(!overlapsPafFile.empty()) {
-        assembler.importAlignmentCandidatesFromPaf(overlapsPafFile);
+        assembler.importAlignmentCandidatesFromPaf(overlapsPafFile, threadCount);
         assembler.chainPafCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,

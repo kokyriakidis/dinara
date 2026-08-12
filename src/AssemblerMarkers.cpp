@@ -461,13 +461,26 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
     const uint64_t readCount = reads->readCount();
     const uint64_t batchSize = 100;
 
-    // Pass 1: Count markers for each oriented read.
+    // Sketching is the dominant cost here, so each read is sketched exactly once.
+    // Pass 1 sketches and stages the forward-strand markers per read (in
+    // stagedMarkers) while incrementing the CSR counts; pass 2 just fills the
+    // memory-mapped vectors from the staged data (deriving strand 1) and frees
+    // each read's stage as it goes.
+    //
+    // Memory tradeoff: staging holds the forward-strand markers for all reads in
+    // RAM between the two passes (~half of what the final memory-mapped
+    // markers/markerKmerIds hold, since those store both strands). This is the
+    // cost of not sketching twice; the peak is transient and freed during pass 2.
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.resize(readCount);
+
+    // Pass 1: sketch once, stage forward markers, count.
     markers->beginPass1(2 * readCount);
     markerKmerIds->beginPass1(2 * readCount);
     setupLoadBalancing(readCount, batchSize);
     runThreads(&Assembler::findMarkersSimdMinimizersPass1, threadCount);
 
-    // Pass 2: Store markers.
+    // Pass 2: store markers from the staged data (no re-sketch).
     markers->beginPass2();
     markerKmerIds->beginPass2();
     setupLoadBalancing(readCount, batchSize);
@@ -475,6 +488,10 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
 
     markers->endPass2(false);
     markerKmerIds->endPass2(false);
+
+    // Release staging memory.
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.shrink_to_fit();
 
     const auto tEnd = std::chrono::steady_clock::now();
     const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
@@ -505,12 +522,17 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
-            const size_t count = getMinimizerMarkersForRead(
+            // Sketch once and stage the forward-strand markers for this read.
+            // stagedMarkers is indexed by ReadId; each thread owns a disjoint
+            // set of read IDs via the load balancer, so no locking is needed.
+            std::vector<std::pair<uint32_t, KmerId>>& staged =
+                findMarkersSimdMinimizersData.stagedMarkers[readId];
+            getMinimizerMarkersForRead(
                 readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx,
                 hifiasmFilter, hifiasmSampleDist,
-                kmerChecker, readSequence, positionBuffer, nullptr);
+                kmerChecker, readSequence, positionBuffer, &staged);
 
-            const uint64_t count64 = count;
+            const uint64_t count64 = staged.size();
             this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
             this->markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
             markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
@@ -523,54 +545,44 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
 
 void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
 {
+    // No sketching here: consume the forward-strand markers staged in pass 1.
     const int k = findMarkersSimdMinimizersData.k;
-    const int w = findMarkersSimdMinimizersData.w;
-    const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
-    const hifiasm_filter_t* hifiasmFilter =
-        static_cast<const hifiasm_filter_t*>(findMarkersSimdMinimizersData.hifiasmFilter);
-    const int hifiasmSampleDist = findMarkersSimdMinimizersData.hifiasmSampleDist;
-    SimdSketcher* sketcher = useHifiasm ? nullptr : simd_sketcher_new(
-        static_cast<uint8_t>(k), static_cast<uint8_t>(w));
-    hifiasm_sketch_ctx_t* hifiasmCtx = useHifiasm ? hifiasm_sketch_ctx_init() : nullptr;
-    string readSequence;
-    std::vector<uint32_t> positionBuffer;
-    std::vector<std::pair<uint32_t, KmerId>> markerBuffer;
 
     uint64_t begin, end;
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
-            const LongBaseSequenceView read = reads->getRead(readId);
-            getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx,
-                hifiasmFilter, hifiasmSampleDist,
-                kmerChecker, readSequence, positionBuffer, &markerBuffer);
+            std::vector<std::pair<uint32_t, KmerId>>& staged =
+                findMarkersSimdMinimizersData.stagedMarkers[readId];
 
-            if(markerBuffer.empty()) continue;
+            if(!staged.empty()) {
+                const LongBaseSequenceView read = reads->getRead(readId);
 
-            CompressedMarker* markerPointerStrand0 = this->markers->begin(OrientedReadId(readId, 0).getValue());
-            CompressedMarker* markerPointerStrand1 = this->markers->end(OrientedReadId(readId, 1).getValue()) - 1;
+                CompressedMarker* markerPointerStrand0 = this->markers->begin(OrientedReadId(readId, 0).getValue());
+                CompressedMarker* markerPointerStrand1 = this->markers->end(OrientedReadId(readId, 1).getValue()) - 1;
 
-            KmerId* kmerIdPointerStrand0 = markerKmerIds->begin(OrientedReadId(readId, 0).getValue());
-            KmerId* kmerIdPointerStrand1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
+                KmerId* kmerIdPointerStrand0 = markerKmerIds->begin(OrientedReadId(readId, 0).getValue());
+                KmerId* kmerIdPointerStrand1 = markerKmerIds->end(OrientedReadId(readId, 1).getValue()) - 1;
 
-            for(const auto& [position, kmerId] : markerBuffer) {
-                // Strand 0.
-                markerPointerStrand0->position = position;
-                ++markerPointerStrand0;
-                *kmerIdPointerStrand0 = kmerId;
-                ++kmerIdPointerStrand0;
+                for(const auto& [position, kmerId] : staged) {
+                    // Strand 0.
+                    markerPointerStrand0->position = position;
+                    ++markerPointerStrand0;
+                    *kmerIdPointerStrand0 = kmerId;
+                    ++kmerIdPointerStrand0;
 
-                // Strand 1: reverse complement.
-                Kmer kmer(kmerId, k);
-                markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
-                --markerPointerStrand1;
-                *kmerIdPointerStrand1 = kmer.reverseComplement(k).id(k);
-                --kmerIdPointerStrand1;
+                    // Strand 1: reverse complement.
+                    Kmer kmer(kmerId, k);
+                    markerPointerStrand1->position = static_cast<uint32_t>(read.baseCount - k - position);
+                    --markerPointerStrand1;
+                    *kmerIdPointerStrand1 = kmer.reverseComplement(k).id(k);
+                    --kmerIdPointerStrand1;
+                }
             }
+
+            // Free this read's staged markers now that they are stored.
+            std::vector<std::pair<uint32_t, KmerId>>().swap(staged);
         }
     }
-    if(sketcher) simd_sketcher_free(sketcher);
-    if(hifiasmCtx) hifiasm_sketch_ctx_destroy(hifiasmCtx);
 }
 
 

@@ -288,115 +288,33 @@ static inline HifiasmLchainDpOptions getHifiasmLchainDpOptions(
 }
 
 /**
- * @brief Per-thread scratchpad for high-performance DP chaining.
+ * @brief Per-thread scratchpad for hit collection and PAF interval chaining.
  *
- * This struct uses a Structure-of-Arrays (SoA) layout for the DP arrays,
- * which is critical for cache efficiency during the O(N^2) chaining loop.
- * The scratchpad is recycled across reads to avoid allocation overhead.
+ * Hits are first collected in AoS format (InvertedIndexTempHit) during the
+ * k-mer matching phase, then unpacked into Structure-of-Arrays (SoA) vectors
+ * for cache-efficient access. The scratchpad is recycled across reads to avoid
+ * allocation overhead.
  *
- * ## Memory Layout Strategy (AoS → SoA conversion):
+ *   **Hit coordinates**:
+ *   - `hitPosA`, `hitPosB`: base positions of each anchor on reads A and B.
+ *   - `hitOrdinalA`, `hitOrdinalB`: marker ordinals for alignment output.
+ *   - `hitWeights`: frequency-based weights for score normalization.
  *
- *   Hits are first collected in AoS format (InvertedIndexTempHit) during
- *   the k-mer matching phase for convenient per-hit field access. Before
- *   the DP loop, they are unpacked into separate SoA vectors so the inner
- *   loop touches only the position arrays, keeping cache lines full of
- *   useful data.
- *
- *   AoS (collection):                 SoA (DP):
- *   ┌─────────────────────┐          hitPosA:    [p0, p1, p2, ...]
- *   │ hit0: readB posA .. │   ──►    hitPosB:    [q0, q1, q2, ...]
- *   │ hit1: readB posA .. │          hitWeights:  [w0, w1, w2, ...]
- *   │ hit2: readB posA .. │          dpSame:      [s0, s1, s2, ...]
- *   └─────────────────────┘          parentSame:  [-1, 0,  1, ...]
- *
- * ## Key Array Groups:
- *
- *   **Hit coordinates** (read from index, used in DP scoring):
- *   - `hitPosA`, `hitPosB`: Base positions of each anchor on reads A and B.
- *   - `hitOrdinalA`, `hitOrdinalB`: Marker ordinals for alignment output.
- *   - `hitWeights`: Frequency-based weights for score normalization.
- *
- *   **DP state** (populated during the chaining loop):
- *   - `dpSame`, `dpDiff`: Best DP score ending at each anchor (same/diff strand).
- *   - `parentSame`, `parentDiff`: Backtrack pointers for chain reconstruction.
- *   - `backtrackVisit*`: Visit marks for hifiasm's max_skip pruning heuristic.
- *   - `chainOccurrences*`: Anchor counts per chain, used for weak-chain filtering.
- *
- *   **Post-DP workspaces** (used during chain extraction and filtering):
- *   - `chainCandidates`: All chains sorted by (score desc, chainLen asc).
- *   - `mcopy*`: Workspace for multi-copy chain extraction.
- *   - `weakMetas`, `suppress*`: Workspace for R485 weak-chain suppression.
- *   - `strongAnchor*`: Flattened anchor positions for overlap-based filtering.
+ *   **PAF interval path**: the actual chaining. Shared minimizers falling inside
+ *   a PAF overlap interval are chained directly via a longest increasing
+ *   subsequence (`intervalAnchors` + `lisTails`/`lisPrev`). The heavy hifiasm
+ *   DP chainer used by the discovery path lives in the external hifiasm
+ *   `hifiasm_lchain_*` routines, not here.
  */
 struct ThreadScratchpad {
-    /// @brief Metadata for a single chain during weak-chain suppression.
-    /// Stores the query-coordinate span [qs, qe), anchor count, and score
-    /// so we can quickly test overlap and dominance conditions.
-    struct WeakFilterMeta {
-        uint32_t qs = 0;
-        uint32_t qe = 0;   ///< Half-open interval [qs, qe) on the query read.
-        uint32_t occ = 0;  ///< Number of anchors in the chain.
-        int32_t score = 0;  ///< DP score of the chain.
-    };
-
-    // ---- Stage 1: Hit Collection (AoS format for sorting) ----
-    vector<InvertedIndexTempHit> flatHits;     ///< Collected k-mer hits before DP.
+    // ---- Hit collection (AoS) ----
+    vector<InvertedIndexTempHit> flatHits;      ///< Collected k-mer hits.
     vector<InvertedIndexTempHit> flatHitsTmp;   ///< Auxiliary buffer for radix sort.
 
-    // ---- Stage 2: SoA Unpacking (cache-efficient DP layout) ----
+    // ---- SoA unpacking ----
     vector<uint32_t> hitPosA, hitPosB, hitOrdinalA, hitOrdinalB;
     vector<uint32_t> hitOrderByPosB;   ///< Permutation array: indices sorted by posB.
     vector<uint32_t> hitWeights;        ///< Frequency-based weight per anchor.
-
-    // ---- Stage 3: DP State (dual-strand chaining) ----
-    vector<int32_t> dpSame, dpDiff;                 ///< Best DP score ending at anchor i.
-    vector<int32_t> parentSame, parentDiff;         ///< Predecessor for backtracking.
-    vector<int32_t> backtrackVisitSame, backtrackVisitDiff; ///< Visit marks for max_skip.
-    vector<uint32_t> chainOccurrencesSame, chainOccurrencesDiff; ///< Anchor count per chain.
-
-    // ---- Stage 4: Chain Candidate Extraction ----
-    /// @brief A candidate chain endpoint with score and metadata.
-    /// Sorted by (score descending, chainLen ascending) for hifiasm-compatible
-    /// tie-breaking: among equal-score chains, prefer shorter alignment length
-    /// (i.e., tighter, more compact overlaps).
-    struct ChainCandidate {
-        int32_t score;      ///< DP chain score.
-        uint64_t chainLen;  ///< Normalized alignment length for tie-breaking.
-        int32_t endK;       ///< Index of the chain's terminal anchor in the SoA arrays.
-        bool isDiff;        ///< True if this chain is on the reverse-complement strand.
-        /// @brief Comparison: higher score first, then shorter chainLen.
-        bool operator<(const ChainCandidate& other) const {
-            if (score != other.score) return score > other.score;
-            return chainLen < other.chainLen;
-        }
-    };
-    vector<ChainCandidate> chainCandidates;       ///< All chain endpoints, sorted by score.
-    vector<ChainCandidate> filteredCandidates;    ///< Surviving chains after suppression.
-
-    // ---- Stage 5: Weak-Chain Suppression Workspace ----
-    // Hifiasm's R485 algorithm suppresses low-anchor chains that overlap with
-    // high-anchor chains on the query read. These arrays partition candidates
-    // into weak (few anchors) and strong (many anchors) groups, then test
-    // whether each weak chain is "dominated" by a strong one.
-    vector<WeakFilterMeta> weakMetas;              ///< Per-candidate [qs,qe) + occ + score.
-    vector<size_t> weakIdxWorkspace;               ///< Indices of weak candidates.
-    vector<size_t> strongIdxWorkspace;             ///< Indices of strong candidates.
-    vector<uint8_t> suppressWorkspace;             ///< 1 = suppress this candidate.
-    vector<uint64_t> strongAnchorBegin;            ///< Start offset in flat anchor array.
-    vector<uint64_t> strongAnchorEnd;              ///< End offset in flat anchor array.
-    vector<uint32_t> strongAnchorStartsFlat;       ///< Sorted posA values for binary search.
-
-    // ---- Stage 6: Multi-Copy Extraction Workspace ----
-    // Used by applyMcopyFastSelection to extract multiple independent chains.
-    vector<uint8_t> mcopyNodeUsed;                 ///< 1 = this anchor is already claimed.
-    vector<int32_t> mcopyPathNodes;                ///< Temporary backtrack path buffer.
-    vector<ChainCandidate> mcopySelectedCandidates; ///< Accepted secondary chains.
-
-    // ---- Miscellaneous scratch ----
-    struct ChainInterval { uint32_t qs; uint32_t qe; }; ///< Query-span of an accepted chain.
-    vector<ChainInterval> acceptedIntervalsSame;   ///< Used in gap-based interval analysis.
-    vector<ChainInterval> acceptedIntervalsDiff;
-    vector<uint32_t> currentChainPath;             ///< Backtracked anchor indices for current chain.
 
     // ---- PAF interval-anchor path ----
     // Shared minimizers falling inside a PAF overlap interval, from which the chain
@@ -408,36 +326,20 @@ struct ThreadScratchpad {
         uint32_t ordinalB;  ///< Marker ordinal on read B (forward strand).
     };
     vector<IntervalAnchor> intervalAnchors;   ///< Filtered shared minimizers in the PAF window.
-    vector<uint32_t> lisTails;                ///< LIS: index (into intervalAnchors) of the tail of the best subsequence of each length.
+    vector<uint32_t> lisTails;                ///< LIS: best-subsequence length ending at each anchor.
     vector<uint32_t> lisPrev;                 ///< LIS: predecessor index for reconstruction.
+    vector<uint32_t> currentChainPath;        ///< Backtracked anchor indices for the current chain.
 
     /// @brief Reset all vectors without releasing memory (amortized O(1) per read).
     void clear() {
         flatHits.clear();
         flatHitsTmp.clear();
-        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear(); hitOrderByPosB.clear(); hitWeights.clear();
-        dpSame.clear(); dpDiff.clear();
-        parentSame.clear(); parentDiff.clear();
-        backtrackVisitSame.clear(); backtrackVisitDiff.clear();
-        chainOccurrencesSame.clear(); chainOccurrencesDiff.clear();
-        chainCandidates.clear();
-        filteredCandidates.clear();
-        weakMetas.clear();
-        weakIdxWorkspace.clear();
-        strongIdxWorkspace.clear();
-        suppressWorkspace.clear();
-        strongAnchorBegin.clear();
-        strongAnchorEnd.clear();
-        strongAnchorStartsFlat.clear();
-        mcopyNodeUsed.clear();
-        mcopyPathNodes.clear();
-        mcopySelectedCandidates.clear();
-        acceptedIntervalsSame.clear();
-        acceptedIntervalsDiff.clear();
-        currentChainPath.clear();
+        hitPosA.clear(); hitPosB.clear(); hitOrdinalA.clear(); hitOrdinalB.clear();
+        hitOrderByPosB.clear(); hitWeights.clear();
         intervalAnchors.clear();
         lisTails.clear();
         lisPrev.clear();
+        currentChainPath.clear();
     }
 };
 
@@ -584,269 +486,6 @@ static inline uint64_t foldKmerIdToUint64(const KmerId k)
     return lo ^ hi;
 }
 
-struct QuickLinearChainResult {
-    bool fullySolved = false;
-    size_t solvedPrefix = 0;
-    int32_t maxScore = 0;
-    int32_t bestEnd = -1;
-};
-
-// ============================================================================
-// QUICK LINEAR CHAINING OPTIMIZATION (Hifiasm quick_ck_lchain)
-// ============================================================================
-// Reference: Hifiasm anchor.cpp:1425-1470 (quick_ck_lchain)
-//
-// Purpose: Fast O(n) prefix chaining for strictly monotonic hit sequences
-// - Many read pairs have perfectly collinear markers at the start
-// - For these "clean" prefixes, we can skip the expensive O(n²) DP
-// - Process hits one-by-one until monotonicity breaks
-// - Return the solved prefix length for full DP to continue from
-//
-// Algorithm:
-// 1. Start with first hit (i=0) as base
-// 2. For each subsequent hit i:
-//    a. Check if positions are strictly increasing on both reads:
-//       - Same-strand: posA[i] > posA[i-1] AND posB[i] > posB[i-1]
-//       - Diff-strand: posA[i] > posA[i-1] AND posB[i] < posB[i-1] (RC)
-//    b. If monotonic: chain i → i-1 with score calculation
-//    c. If NOT monotonic: STOP and return solved prefix
-// 3. If entire sequence is monotonic: mark fullySolved=true
-//
-// Benefits:
-// - Reduces DP from O(n²) to O(n) for clean alignments
-// - Typical in high-quality data where many read pairs align perfectly
-// - Saves significant CPU time on common cases
-//
-// Return:
-// - solvedPrefix: Index where full DP should start
-// - fullySolved: true if entire sequence was monotonic (skip full DP)
-// - maxScore, bestEnd: Best chain endpoint found in prefix
-// ============================================================================
-static inline QuickLinearChainResult runQuickLinearChainPrefix(
-    const bool isDiff,
-    const bool useEcScoring,
-    const vector<uint32_t>& hitPosA,
-    const vector<uint32_t>& hitPosB,
-    const vector<uint32_t>& hitWeights,
-    const uint32_t kmerLen,
-    const double bwRate,
-    const double chnPenGap,
-    const double chnPenSkip,
-    const uint64_t readLenA,
-    const uint64_t readLenB,
-    vector<int32_t>& dp,
-    vector<int32_t>& parent,
-    vector<uint32_t>& chainOccurrences)
-{
-    QuickLinearChainResult result;
-    const size_t n = hitPosA.size();
-    if(n == 0) {
-        return result;
-    }
-
-    const uint8_t span0 = uint8_t(std::min<uint32_t>(kmerLen, 255));
-    dp[0] = int32_t(span0);
-    parent[0] = -1;
-    chainOccurrences[0] = 1;
-    result.maxScore = dp[0];
-    result.bestEnd = 0;
-    result.solvedPrefix = 1;
-
-    for(size_t i = 1; i < n; ++i) {
-        if(hitPosA[i] <= hitPosA[i - 1]) {
-            break;
-        }
-
-        const uint32_t posAi = hitPosA[i];
-        const uint32_t posAj = hitPosA[i - 1];
-        uint32_t posBi = 0;
-        uint32_t posBj = 0;
-        if(!isDiff) {
-            if(hitPosB[i] <= hitPosB[i - 1]) {
-                break;
-            }
-            posBi = hitPosB[i];
-            posBj = hitPosB[i - 1];
-        } else {
-            if(hitPosB[i] >= hitPosB[i - 1]) {
-                break;
-            }
-            posBi = uint32_t(readLenB - 1 - uint64_t(hitPosB[i]));
-            posBj = uint32_t(readLenB - 1 - uint64_t(hitPosB[i - 1]));
-        }
-
-        const uint8_t spanI = uint8_t(std::min<uint32_t>(kmerLen, 255));
-        int32_t sc = useEcScoring ?
-            hifiasm_comput_sc_ch_ec(
-                posAi,
-                posBi,
-                posAj,
-                posBj,
-                hitWeights[i],
-                spanI,
-                bwRate,
-                chnPenGap,
-                chnPenSkip,
-                readLenA,
-                readLenB) :
-            hifiasm_comput_sc_ch(
-                posAi,
-                posBi,
-                posAj,
-                posBj,
-                hitWeights[i],
-                spanI,
-                bwRate,
-                chnPenGap,
-                chnPenSkip,
-                readLenA,
-                readLenB);
-        if(sc == INT32_MIN) {
-            break;
-        }
-        sc += dp[i - 1];
-
-        if(sc < int32_t(spanI)) {
-            break;
-        }
-
-        dp[i] = sc;
-        parent[i] = int32_t(i - 1);
-        chainOccurrences[i] = chainOccurrences[i - 1] + 1U;
-        if(sc > result.maxScore) {
-            result.maxScore = sc;
-            result.bestEnd = int32_t(i);
-        }
-        result.solvedPrefix = i + 1;
-    }
-
-    result.fullySolved = (result.solvedPrefix == n);
-    return result;
-}
-
-
-// ============================================================================
-// MULTI-COPY (MCOPY) CHAIN SELECTION
-// ============================================================================
-// Reference: Hifiasm ecovlp.cpp:3274, anchor.cpp:1797-1835
-//
-// Purpose: Extract multiple independent high-quality chains from the same read pair
-// - Needed for repetitive regions, segmental duplications, and paralogous sequences
-// - Ensures we don't miss alternative alignments when a read has multiple valid mappings
-//
-// Algorithm:
-// 1. Select the best chain and mark all its nodes as "used"
-// 2. Iterate through remaining candidates in score-descending order
-// 3. For each candidate:
-//    - Check if score >= bestScore * mcopyRate (default 0.7)
-//    - Check if chain has >= mcopyKhitCutoff markers (default 32)
-//    - Trace chain backward until hitting a "used" node
-//    - If the independent portion has high enough score, accept it
-//    - Mark all nodes in accepted chain as "used"
-// 4. Stop when we've selected mcopyNum chains (default 3) or exhausted candidates
-//
-// Key Parameters (from hifiasm):
-// - mcopyNum: Maximum chains to extract (hifiasm: 3)
-// - mcopyRate: Minimum score ratio relative to best (hifiasm: 0.7)
-// - mcopyKhitCutoff: Minimum markers required to enable mcopy (hifiasm: 32)
-//
-// This allows capturing biologically real multi-mappings while filtering noise.
-// ============================================================================
-static inline void applyMcopyFastSelection(
-    vector<ThreadScratchpad::ChainCandidate>& chainCandidates,
-    const vector<int32_t>& parentSame,
-    const vector<int32_t>& parentDiff,
-    const vector<int32_t>& dpSame,
-    const vector<int32_t>& dpDiff,
-    const vector<uint32_t>& chainOccurrencesSame,
-    const vector<uint32_t>& chainOccurrencesDiff,
-    const uint32_t mcopyNum,
-    const double mcopyRate,
-    const uint32_t mcopyKhitCutoff,
-    vector<uint8_t>& nodeUsed,
-    vector<int32_t>& pathNodes,
-    vector<ThreadScratchpad::ChainCandidate>& selectedCandidates)
-{
-    if(chainCandidates.empty() || mcopyNum <= 1) {
-        return;
-    }
-
-    const auto getOcc = [&](const ThreadScratchpad::ChainCandidate& c) -> uint32_t {
-        return c.isDiff ? chainOccurrencesDiff[size_t(c.endK)] : chainOccurrencesSame[size_t(c.endK)];
-    };
-    const auto& bestCand = chainCandidates.front();
-    if(getOcc(bestCand) < mcopyKhitCutoff) {
-        return;
-    }
-
-    const size_t nodeCount = std::max(dpSame.size(), dpDiff.size());
-    nodeUsed.assign(nodeCount, uint8_t(0));
-    selectedCandidates.clear();
-    selectedCandidates.reserve(std::min<size_t>(chainCandidates.size(), size_t(mcopyNum)));
-
-    auto markChain = [&](const ThreadScratchpad::ChainCandidate& c) {
-        const auto& parentArr = c.isDiff ? parentDiff : parentSame;
-        for(int32_t k = c.endK; k != -1; k = parentArr[size_t(k)]) {
-            nodeUsed[size_t(k)] = uint8_t(1);
-        }
-    };
-
-    markChain(bestCand);
-    selectedCandidates.push_back(bestCand);
-
-    int32_t minScore = int32_t(double(bestCand.score) * mcopyRate);
-    if(minScore < 1) {
-        minScore = 1;
-    }
-
-    for(size_t ci = 1; ci < chainCandidates.size(); ++ci) {
-        if(selectedCandidates.size() >= size_t(mcopyNum)) {
-            break;
-        }
-        const auto& cand = chainCandidates[ci];
-        if(cand.score < minScore) {
-            break;
-        }
-        if(getOcc(cand) < mcopyKhitCutoff) {
-            continue;
-        }
-
-        const auto& parentArr = cand.isDiff ? parentDiff : parentSame;
-        const auto& dpArr = cand.isDiff ? dpDiff : dpSame;
-        pathNodes.clear();
-        int32_t ancestor = cand.endK;
-        while(ancestor >= 0 && !nodeUsed[size_t(ancestor)]) {
-            pathNodes.push_back(ancestor);
-            ancestor = parentArr[size_t(ancestor)];
-        }
-        if(pathNodes.empty()) {
-            continue;
-        }
-
-        int32_t adjustedScore = cand.score;
-        if(ancestor >= 0) {
-            adjustedScore -= dpArr[size_t(ancestor)];
-        }
-        if(adjustedScore < minScore) {
-            continue;
-        }
-        // Keep tiny chains only for the best chain (hifiasm mcopy_fast behavior).
-        if(pathNodes.size() <= 1) {
-            continue;
-        }
-
-        for(const int32_t k : pathNodes) {
-            nodeUsed[size_t(k)] = uint8_t(1);
-        }
-        auto selected = cand;
-        selected.score = adjustedScore;
-        selectedCandidates.push_back(selected);
-    }
-
-    if(selectedCandidates.size() < chainCandidates.size()) {
-        chainCandidates = selectedCandidates;
-    }
-}
 
 // Strict port of hifiasm 0.25.0-r726 (ec9a8b2) chaining pipeline.
 // Variable names and control flow match hifiasm for step-parity verification.
@@ -3007,7 +2646,6 @@ void Assembler::chainPafCandidates(
     const uint64_t hashMask = invertedIndexData.hashTable.size() - 1;
     const auto* hashTablePtr = invertedIndexData.hashTable.data();
     const uint64_t kmerLen = invertedIndexData.k;
-    const double maxDriftRateLocal = invertedIndexData.maxDriftRate;
     const uint64_t coverageHet = invertedIndexData.coverageHet;
     const uint64_t lowFreqThreshold = std::max<uint64_t>(
         2ULL, uint64_t(double(coverageHet) * invertedIndexData.lowFreqMultiplier));
@@ -3023,12 +2661,6 @@ void Assembler::chainPafCandidates(
         1U, invertedIndexData.highFrequencySampleDistance);
     const uint32_t maxHighFrequencyPerStreak = std::max<uint32_t>(
         1U, invertedIndexData.maxHighFrequencyPerStreak);
-    const bool lchainIsAccurate = invertedIndexData.lchainIsAccurate;
-    const bool useEcScoring = invertedIndexData.useEcScoring;
-    const bool enableMcopyFast = invertedIndexData.enableMcopyFast;
-    const uint32_t mcopyNum = std::max<uint32_t>(1U, invertedIndexData.mcopyNum);
-    const double mcopyRate = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyRate));
-    const uint32_t mcopyKhitCutoff = std::max<uint32_t>(1U, invertedIndexData.mcopyKhitCutoff);
     const uint32_t mcopyOcvWindow = std::max<uint32_t>(1U, invertedIndexData.mcopyOcvWindow);
     const double mcopyOcvWeakKeepRatio = std::max<double>(0.0, std::min<double>(1.0, invertedIndexData.mcopyOcvWeakKeepRatio));
     const uint32_t maxChainingFreq = invertedIndexData.maxChainingFreq;
@@ -3110,31 +2742,38 @@ void Assembler::chainPafCandidates(
                     if(numMarkersA == 0 || numMarkersB == 0) continue;
 
                     const uint64_t readLenA = reads->getReadRawSequenceLength(readIdA);
-                    const uint64_t readLenB = reads->getReadRawSequenceLength(readIdB);
 
                     // PAF interval for this pair. Every PAF candidate has one (no
                     // transitive expansion is performed). Restrict marker generation on
                     // read A to the q-window, and keep only partner hits inside the
                     // t-window, so we only build markers for k-mers shared inside the
                     // interval the PAF agreed on rather than scanning the whole read.
+                    // Every imported PAF pair has an interval (import stores one per
+                    // candidate under the same key). The pair may hold both a same-strand
+                    // and a reverse interval; select the one matching this candidate's
+                    // orientation. If it is somehow missing there is nothing to chain, so
+                    // skip: the PAF path only chains overlaps the PAF already agreed on and
+                    // does no transitive/DP expansion.
                     const uint64_t pafKey = (uint64_t(readIdA) << 32) | uint64_t(readIdB);
                     const auto pafIt = pafCandidateIntervals.find(pafKey);
-                    const bool haveInterval = (pafIt != pafCandidateIntervals.end());
-                    const uint32_t kLen = uint32_t(kmerLen);
-                    uint32_t winQStart = 0, winQEnd = 0, winTStart = 0, winTEnd = 0;
-                    if(haveInterval) {
-                        winQStart = pafIt->second.qStart;
-                        winQEnd   = pafIt->second.qEnd;
-                        winTStart = pafIt->second.tStart;
-                        winTEnd   = pafIt->second.tEnd;
+                    if(pafIt == pafCandidateIntervals.end()) {
+                        continue;
                     }
+                    const PafCandidateInterval* pafIv = pafIt->second.get(pafSameStrand);
+                    if(pafIv == nullptr) {
+                        continue;
+                    }
+                    const uint32_t kLen = uint32_t(kmerLen);
+                    const uint32_t winQStart = pafIv->qStart;
+                    const uint32_t winQEnd   = pafIv->qEnd;
+                    const uint32_t winTStart = pafIv->tStart;
+                    const uint32_t winTEnd   = pafIv->tEnd;
 
                     // Marker index range on read A whose k-mer spans [p, p+k) intersect
                     // the q-window [winQStart, winQEnd). Markers are position-sorted and
                     // indexed by ordinal, so a binary search gives the range directly.
-                    size_t iLo = 0;
-                    size_t iHi = numMarkersA;
-                    if(haveInterval) {
+                    size_t iLo, iHi;
+                    {
                         // iLo: first ordinal with position + kLen > winQStart.
                         size_t lo = 0, hi = numMarkersA;
                         while(lo < hi) {
@@ -3179,8 +2818,7 @@ void Assembler::chainPafCandidates(
                             if (compactOccs[j].readId == readIdB) {
                                 const uint32_t posBEncoded = compactOccs[j].position;
                                 const uint32_t posB = posBEncoded & 0x7fffffffU;
-                                if (haveInterval &&
-                                    (posB + kLen <= winTStart || posB >= winTEnd)) {
+                                if (posB + kLen <= winTStart || posB >= winTEnd) {
                                     continue;   // Outside the PAF t-window.
                                 }
                                 const uint8_t isRcB = uint8_t(posBEncoded >> 31);
@@ -3254,12 +2892,8 @@ void Assembler::chainPafCandidates(
                     }
                     if(downsampleHighFrequencyMarkers && !highFrequencyStreak.empty()) {
                         // Right boundary for the final streak: the end of the scanned
-                        // window (q-window end when we have the interval, else read end).
-                        const uint32_t rightBoundary = haveInterval ?
-                            winQEnd :
-                            uint32_t(std::min<uint64_t>(
-                                readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
-                        doFlushStreak(rightBoundary);
+                        // window, which is always the PAF q-window end on this path.
+                        doFlushStreak(winQEnd);
                     }
 
                     if(scratch.flatHits.empty()) {
@@ -3308,836 +2942,119 @@ void Assembler::chainPafCandidates(
                     // both reads' marker ordinals (increasing on B for same-strand,
                     // decreasing for reverse-complement). Alignment coordinates come from
                     // the PAF interval and the score is the PAF block length.
+                    //
+                    // Note: al.qs/qe/ts/te below are copied verbatim from the PAF record,
+                    // i.e. the full overlap window the PAF agreed on. This is deliberately
+                    // NOT the exact span of the LIS-selected anchors (which may be a subset
+                    // and, under minimizer subsampling, sparse). The verbatim window serves
+                    // as the seed region; computeBaseAlignmentsAndStore recomputes tight
+                    // coordinates from the CIGAR downstream.
                     {
-                        if(haveInterval) {
-                            const PafCandidateInterval& iv = pafIt->second;
-                            const bool sameStrandWanted = pafSameStrand;
+                        const PafCandidateInterval& iv = *pafIv;
+                        const bool sameStrandWanted = pafSameStrand;
 
-                            scratch.intervalAnchors.clear();
-                            for(size_t k = 0; k < numHits; ++k) {
-                                const auto& h = scratch.flatHits[k];
-                                const uint8_t rev = uint8_t(h.isRcA ^ h.isRcB);
-                                const bool hitSameStrand = (rev == 0);
-                                if(hitSameStrand != sameStrandWanted) continue;
+                        scratch.intervalAnchors.clear();
+                        for(size_t k = 0; k < numHits; ++k) {
+                            const auto& h = scratch.flatHits[k];
+                            const uint8_t rev = uint8_t(h.isRcA ^ h.isRcB);
+                            const bool hitSameStrand = (rev == 0);
+                            if(hitSameStrand != sameStrandWanted) continue;
 
-                                const uint32_t oB = scratch.hitOrdinalB[k];
-                                if(oB == std::numeric_limits<uint32_t>::max()) continue;
+                            const uint32_t oB = scratch.hitOrdinalB[k];
+                            if(oB == std::numeric_limits<uint32_t>::max()) continue;
 
-                                scratch.intervalAnchors.push_back(
-                                    {scratch.hitPosA[k], scratch.hitPosB[k],
-                                     scratch.hitOrdinalA[k], oB});
-                            }
+                            scratch.intervalAnchors.push_back(
+                                {scratch.hitPosA[k], scratch.hitPosB[k],
+                                 scratch.hitOrdinalA[k], oB});
+                        }
 
-                            const size_t na = scratch.intervalAnchors.size();
-                            const uint32_t minAnchors =
-                                std::max<uint32_t>(2u, minChainedMarkerCount);
-                            if(na < minAnchors) {
-                                // Too few shared minimizers agree with the PAF interval.
-                                continue;
-                            }
+                        const size_t na = scratch.intervalAnchors.size();
+                        const uint32_t minAnchors =
+                            std::max<uint32_t>(2u, minChainedMarkerCount);
+                        if(na < minAnchors) {
+                            // Too few shared minimizers agree with the PAF interval.
+                            continue;
+                        }
 
-                            // Order anchors by A ordinal, breaking ties on B ordinal so the
-                            // monotone-subsequence search keeps at most one anchor per A ordinal.
-                            auto& anchors = scratch.intervalAnchors;
-                            std::sort(anchors.begin(), anchors.end(),
-                                [](const ThreadScratchpad::IntervalAnchor& a,
-                                   const ThreadScratchpad::IntervalAnchor& b) {
-                                    if(a.ordinalA != b.ordinalA) return a.ordinalA < b.ordinalA;
-                                    return a.ordinalB < b.ordinalB;
-                                });
-
-                            // Longest strictly-monotone chain (O(n^2); n is small per interval).
-                            scratch.lisTails.assign(na, 1);
-                            scratch.lisPrev.assign(na, std::numeric_limits<uint32_t>::max());
-                            uint32_t bestLen = 0;
-                            uint32_t bestEnd = std::numeric_limits<uint32_t>::max();
-                            for(size_t i = 0; i < na; ++i) {
-                                for(size_t j = 0; j < i; ++j) {
-                                    const bool okA = anchors[j].ordinalA < anchors[i].ordinalA;
-                                    if(!okA) continue;
-                                    const bool okB = sameStrandWanted ?
-                                        (anchors[j].ordinalB < anchors[i].ordinalB) :
-                                        (anchors[j].ordinalB > anchors[i].ordinalB);
-                                    if(!okB) continue;
-                                    if(scratch.lisTails[j] + 1 > scratch.lisTails[i]) {
-                                        scratch.lisTails[i] = scratch.lisTails[j] + 1;
-                                        scratch.lisPrev[i] = uint32_t(j);
-                                    }
-                                }
-                                if(scratch.lisTails[i] > bestLen) {
-                                    bestLen = scratch.lisTails[i];
-                                    bestEnd = uint32_t(i);
-                                }
-                            }
-                            if(bestLen < minAnchors) {
-                                continue;
-                            }
-
-                            // Reconstruct the chain.
-                            scratch.currentChainPath.clear();
-                            for(uint32_t cur = bestEnd;
-                                cur != std::numeric_limits<uint32_t>::max();
-                                cur = scratch.lisPrev[cur]) {
-                                scratch.currentChainPath.push_back(cur);
-                            }
-                            std::reverse(scratch.currentChainPath.begin(),
-                                         scratch.currentChainPath.end());
-
-                            Alignment al;
-                            al.ordinals.reserve(scratch.currentChainPath.size());
-                            const uint32_t numMB = uint32_t(markersB.size());
-                            for(uint32_t idxA : scratch.currentChainPath) {
-                                uint32_t oA = anchors[idxA].ordinalA;
-                                uint32_t oB = anchors[idxA].ordinalB;
-                                // Alignment ordinals are stored on strand 0 of each read.
-                                // For reverse-complement overlaps, flip B so both columns are
-                                // strictly increasing (checkStrictlyIncreasing invariant).
-                                if(!sameStrandWanted) {
-                                    oB = numMB - 1 - oB;
-                                }
-                                al.ordinals.push_back({oA, oB});
-                            }
-
-                            // Keep the interval the PAF agreed on, verbatim.
-                            // ts/te are forward-strand coordinates on read B, which is the
-                            // PAF target convention, so no reverse conversion is needed.
-                            al.qs = iv.qStart;
-                            al.qe = iv.qEnd;
-                            al.ts = iv.tStart;
-                            al.te = iv.tEnd;
-
-                            const uint32_t readLenA32 = uint32_t(std::min<uint64_t>(
-                                readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
-                            const uint8_t overlapType =
-                                uint8_t(getOverlapType(iv.qStart, iv.qEnd, readLenA32));
-
-                            localResults.push_back(PafChainedCandidate{
-                                OrientedReadPair(readIdA, readIdB, sameStrandWanted),
-                                std::move(al),
-                                int32_t(iv.blockLen),
-                                overlapType,
-                                readIdA
+                        // Order anchors by A ordinal, breaking ties on B ordinal so the
+                        // monotone-subsequence search keeps at most one anchor per A ordinal.
+                        auto& anchors = scratch.intervalAnchors;
+                        std::sort(anchors.begin(), anchors.end(),
+                            [](const ThreadScratchpad::IntervalAnchor& a,
+                               const ThreadScratchpad::IntervalAnchor& b) {
+                                if(a.ordinalA != b.ordinalA) return a.ordinalA < b.ordinalA;
+                                return a.ordinalB < b.ordinalB;
                             });
+
+                        // Longest strictly-monotone chain (O(n^2); n is small per interval).
+                        scratch.lisTails.assign(na, 1);
+                        scratch.lisPrev.assign(na, std::numeric_limits<uint32_t>::max());
+                        uint32_t bestLen = 0;
+                        uint32_t bestEnd = std::numeric_limits<uint32_t>::max();
+                        for(size_t i = 0; i < na; ++i) {
+                            for(size_t j = 0; j < i; ++j) {
+                                const bool okA = anchors[j].ordinalA < anchors[i].ordinalA;
+                                if(!okA) continue;
+                                const bool okB = sameStrandWanted ?
+                                    (anchors[j].ordinalB < anchors[i].ordinalB) :
+                                    (anchors[j].ordinalB > anchors[i].ordinalB);
+                                if(!okB) continue;
+                                if(scratch.lisTails[j] + 1 > scratch.lisTails[i]) {
+                                    scratch.lisTails[i] = scratch.lisTails[j] + 1;
+                                    scratch.lisPrev[i] = uint32_t(j);
+                                }
+                            }
+                            if(scratch.lisTails[i] > bestLen) {
+                                bestLen = scratch.lisTails[i];
+                                bestEnd = uint32_t(i);
+                            }
+                        }
+                        if(bestLen < minAnchors) {
                             continue;
                         }
-                    }
 
-                    // Hifiasm-style DP chaining for this fixed pair.
-                    // Unlike discovery, PAF path enforces a single expected orientation
-                    // (same/diff) based on the imported pair metadata.
-                    scratch.dpSame.assign(numHits, 0);
-                    scratch.dpDiff.assign(numHits, 0);
-                    scratch.parentSame.assign(numHits, -1);
-                    scratch.parentDiff.assign(numHits, -1);
-                    scratch.backtrackVisitSame.assign(numHits, -1);
-                    scratch.backtrackVisitDiff.assign(numHits, -1);
-                    scratch.chainOccurrencesSame.assign(numHits, 1);
-                    scratch.chainOccurrencesDiff.assign(numHits, 1);
+                        // Reconstruct the chain.
+                        scratch.currentChainPath.clear();
+                        for(uint32_t cur = bestEnd;
+                            cur != std::numeric_limits<uint32_t>::max();
+                            cur = scratch.lisPrev[cur]) {
+                            scratch.currentChainPath.push_back(cur);
+                        }
+                        std::reverse(scratch.currentChainPath.begin(),
+                                     scratch.currentChainPath.end());
 
-                    const auto dpOptions = getHifiasmLchainDpOptions(
-                        lchainIsAccurate,
-                        uint32_t(kmerLen));
-                    const int32_t MAX_ITER = dpOptions.maxIter;
-                    const int32_t MAX_SKIP = dpOptions.maxSkip;
-                    const int32_t MAX_DIST_X = dpOptions.maxDist;
-                    const int32_t MAX_DIST_Y = dpOptions.maxDist;
-                    const double CHN_PEN_GAP = dpOptions.chnPenGap;
-                    const double CHN_PEN_SKIP = dpOptions.chnPenSkip;
-                    const double BW_RATE = maxDriftRateLocal;
-
-                    int32_t maxScSame = 0, maxScDiff = 0;
-                    const bool runSame = pafSameStrand;
-                    const bool runDiff = !pafSameStrand;
-                    QuickLinearChainResult quickSameResult;
-                    QuickLinearChainResult quickDiffResult;
-                    if(dpOptions.quickCheck) {
-                        if(runSame) {
-                            quickSameResult = runQuickLinearChainPrefix(
-                                false,
-                                useEcScoring,
-                                scratch.hitPosA,
-                                scratch.hitPosB,
-                                scratch.hitWeights,
-                                uint32_t(kmerLen),
-                                BW_RATE,
-                                CHN_PEN_GAP,
-                                CHN_PEN_SKIP,
-                                readLenA,
-                                readLenB,
-                                scratch.dpSame,
-                                scratch.parentSame,
-                                scratch.chainOccurrencesSame);
-                            if(quickSameResult.bestEnd >= 0) {
-                                maxScSame = quickSameResult.maxScore;
+                        Alignment al;
+                        al.ordinals.reserve(scratch.currentChainPath.size());
+                        const uint32_t numMB = uint32_t(markersB.size());
+                        for(uint32_t idxA : scratch.currentChainPath) {
+                            uint32_t oA = anchors[idxA].ordinalA;
+                            uint32_t oB = anchors[idxA].ordinalB;
+                            // Alignment ordinals are stored on strand 0 of each read.
+                            // For reverse-complement overlaps, flip B so both columns are
+                            // strictly increasing (checkStrictlyIncreasing invariant).
+                            if(!sameStrandWanted) {
+                                oB = numMB - 1 - oB;
                             }
-                        }
-                        if(runDiff) {
-                            quickDiffResult = runQuickLinearChainPrefix(
-                                true,
-                                useEcScoring,
-                                scratch.hitPosA,
-                                scratch.hitPosB,
-                                scratch.hitWeights,
-                                uint32_t(kmerLen),
-                                BW_RATE,
-                                CHN_PEN_GAP,
-                                CHN_PEN_SKIP,
-                                readLenA,
-                                readLenB,
-                                scratch.dpDiff,
-                                scratch.parentDiff,
-                                scratch.chainOccurrencesDiff);
-                            if(quickDiffResult.bestEnd >= 0) {
-                                maxScDiff = quickDiffResult.maxScore;
-                            }
-                        }
-                    }
-                    const bool quickSame = runSame && quickSameResult.fullySolved;
-                    const bool quickDiff = runDiff && quickDiffResult.fullySolved;
-                    const size_t dpStartSame = runSame ? (quickSame ? numHits : quickSameResult.solvedPrefix) : numHits;
-                    const size_t dpStartDiff = runDiff ? (quickDiff ? numHits : quickDiffResult.solvedPrefix) : numHits;
-                    const size_t dpStart = std::min(dpStartSame, dpStartDiff);
-                    int32_t st_same = 0, st_diff = 0;
-                    int32_t max_ii_same = -1, max_ii_diff = -1;
-                    // quick_ck_lchain-style short-circuit for the required orientation(s).
-                    const bool skipFullDp =
-                        (!runSame || quickSame) &&
-                        (!runDiff || quickDiff);
-                    for(size_t i = dpStart; i < numHits && !skipFullDp; ++i) {
-                        const bool processSame = runSame && !quickSame && i >= dpStartSame;
-                        const bool processDiff = runDiff && !quickDiff && i >= dpStartDiff;
-                        const uint32_t posAi = scratch.hitPosA[i], posBi = scratch.hitPosB[i];
-                        const uint8_t spanI = (uint8_t)std::min((uint32_t)kmerLen, (uint32_t)255);
-
-                        // Initialize with self score (raw span, NOT normalized - hifiasm line 1589)
-                        // Weight normalization only applies when scoring between pairs
-                        int32_t max_f_same = (int32_t)spanI;
-                        int32_t max_f_diff = max_f_same;
-                        int32_t max_j_same = -1, max_j_diff = -1;
-                        int32_t n_skip_same = 0, n_skip_diff = 0;
-
-                        // Update start position for same-strand (pure index-based, hifiasm line 1591)
-                        if(processSame && (int32_t)i - st_same > MAX_ITER) st_same = (int32_t)i - MAX_ITER;
-
-                        // Same-strand DP
-                        int32_t end_j_same = st_same;
-                        for(int32_t j = (int32_t)i - 1; processSame && j >= st_same; --j) {
-                            // Use CURRENT hit's weight (scratch.hitWeights[i]), not previous hit's weight!
-                            int32_t sc = useEcScoring ?
-                                hifiasm_comput_sc_ch_ec(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
-                                    scratch.hitWeights[i], spanI,
-                                    BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
-                                    readLenA, readLenB) :
-                                hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[j], scratch.hitPosB[j],
-                                    scratch.hitWeights[i], spanI,
-                                    BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
-                                    readLenA, readLenB);
-                            if(sc == INT32_MIN) continue;
-                            sc += scratch.dpSame[j];
-                            if(sc > max_f_same) {
-                                max_f_same = sc;
-                                max_j_same = j;
-                                if(n_skip_same > 0) --n_skip_same;
-                            } else if(scratch.backtrackVisitSame[j] == (int32_t)i) {
-                                if(++n_skip_same > MAX_SKIP) break;
-                            }
-                            if(scratch.parentSame[j] >= 0) scratch.backtrackVisitSame[scratch.parentSame[j]] = (int32_t)i;
-                            end_j_same = j;
+                            al.ordinals.push_back({oA, oB});
                         }
 
-                        // Rescue for same-strand
-                        // Track by TARGET position (hitPosB) as hifiasm does
-                        if(processSame &&
-                            (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] > (uint32_t)MAX_DIST_Y))) {
-                            int32_t max_val = INT32_MIN;
-                            max_ii_same = -1;
-                            for(int32_t j = (int32_t)i - 1; j >= st_same; --j) {
-                                if(max_val < scratch.dpSame[j]) {
-                                    max_val = scratch.dpSame[j];
-                                    max_ii_same = j;
-                                }
-                            }
-                        }
-                        if(processSame && max_ii_same >= 0 && max_ii_same < end_j_same) {
-                            int32_t tmp = useEcScoring ?
-                                hifiasm_comput_sc_ch_ec(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
-                                    scratch.hitWeights[i], spanI,
-                                    BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
-                                    readLenA, readLenB) :
-                                hifiasm_comput_sc_ch(posAi, posBi, scratch.hitPosA[max_ii_same], scratch.hitPosB[max_ii_same],
-                                    scratch.hitWeights[i], spanI,
-                                    BW_RATE, CHN_PEN_GAP, CHN_PEN_SKIP,
-                                    readLenA, readLenB);
-                            if(tmp != INT32_MIN && max_f_same < tmp + scratch.dpSame[max_ii_same]) {
-                                max_f_same = tmp + scratch.dpSame[max_ii_same];
-                                max_j_same = max_ii_same;
-                            }
-                        }
+                        // Keep the interval the PAF agreed on, verbatim.
+                        // ts/te are forward-strand coordinates on read B, which is the
+                        // PAF target convention, so no reverse conversion is needed.
+                        al.qs = iv.qStart;
+                        al.qe = iv.qEnd;
+                        al.ts = iv.tStart;
+                        al.te = iv.tEnd;
 
-                        if(processSame) {
-                            scratch.dpSame[i] = max_f_same;
-                            scratch.parentSame[i] = max_j_same;
-                            if(max_j_same >= 0) {
-                                scratch.chainOccurrencesSame[i] = scratch.chainOccurrencesSame[size_t(max_j_same)] + 1U;
-                            }
-                        }
-                        // Update max_ii tracker based on target position
-                        if(processSame &&
-                            (max_ii_same < 0 || (scratch.hitPosB[i] - scratch.hitPosB[max_ii_same] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpSame[max_ii_same] < scratch.dpSame[i]))) {
-                            max_ii_same = (int32_t)i;
-                        }
-
-                        // ---------------------------------------------------------
-                        // DIFF-STRAND DP (manually inlined, lchain_dp style)
-                        // ---------------------------------------------------------
-                        // For diff-strand (reverse-complement) overlaps, the target
-                        // positions DECREASE as the query positions INCREASE.
-                        // Hits are stored in original strand-0 coordinates, so for
-                        // diff-strand we look for posB[j] > posB[i] (reverse order).
-                        //
-                        // The scoring uses the same comput_sc_ch formula, but with
-                        // an explicit coordinate flip: posB is converted to forward
-                        // coordinates (readLenB - 1 - posB) before computing the
-                        // dynamic bandwidth threshold via cal_bw.
-                        //
-                        // This section is manually inlined (not calling run_main_dp_loop)
-                        // because the PAF path runs only one orientation per pair,
-                        // and the diff-strand distance checks differ materially from
-                        // same-strand (reversed comparisons, flipped bandwidth).
-                        // ---------------------------------------------------------
-                        if(processDiff && (int32_t)i - st_diff > MAX_ITER) st_diff = (int32_t)i - MAX_ITER;
-
-                        int32_t end_j_diff = st_diff;
-                        for(int32_t j = (int32_t)i - 1; processDiff && j >= st_diff; --j) {
-                            // For diff-strand: target position must be LARGER than current
-                            // (positions are stored in strand-0 coords, so RC pairs have
-                            // posB decreasing as posA increases).
-                            if(scratch.hitPosB[j] <= posBi) continue;
-
-                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[j];
-                            int32_t dB = (int32_t)scratch.hitPosB[j] - (int32_t)posBi;
-
-                            if(dA <= 0 || dA > MAX_DIST_X || dB <= 0 || dB > MAX_DIST_Y) continue;
-
-                            // Gap size and minimum distance
-                            int32_t dd = std::abs(dA - dB);
-                            int32_t dg = std::min(dA, dB);
-
-                            // Dynamic bandwidth check (only if dd > 16) - chainPafCandidates version
-                            if(dd > 16) {
-                                uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
-                                uint32_t posBj_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[j]);
-                                int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[j], posBj_fwd,
-                                                                  BW_RATE, readLenA, readLenB);
-                                if(dd > bw_diff) continue;
-                            }
-
-                            // Base score using CURRENT hit's weight (comput_sc_ch style)
-                            int32_t q_span = (int32_t)spanI;
-                            int32_t sc = (q_span < dg) ? q_span : dg;
-                            const int32_t wI =
-                                (scratch.hitWeights[i] > uint32_t(std::numeric_limits<int32_t>::max())) ?
-                                std::numeric_limits<int32_t>::max() : int32_t(scratch.hitWeights[i]);
-                            sc = HIFIASM_NORMAL_W(sc, wI);
-
-                            // Apply gap penalty (comput_sc_ch style)
-                            if(dd > 0 || (dg > q_span && dg > 0)) {
-                                double lin_pen = CHN_PEN_GAP * (double)dd;
-                                double a_pen = ((double)sc) * (((double)dd) / ((double)dg)) / BW_RATE;
-                                if(useEcScoring && dd >= 4) {
-                                    if(lin_pen < a_pen) {
-                                        lin_pen = a_pen;
-                                    }
-                                } else {
-                                    if(lin_pen > a_pen) {
-                                        lin_pen = a_pen;
-                                    }
-                                }
-                                lin_pen += CHN_PEN_SKIP * (double)dg;
-                                sc -= (int32_t)lin_pen;
-                            }
-
-                            sc += scratch.dpDiff[j];
-                            if(sc > max_f_diff) {
-                                max_f_diff = sc;
-                                max_j_diff = j;
-                                if(n_skip_diff > 0) --n_skip_diff;
-                            } else if(scratch.backtrackVisitDiff[j] == (int32_t)i) {
-                                if(++n_skip_diff > MAX_SKIP) break;
-                            }
-                            if(scratch.parentDiff[j] >= 0) scratch.backtrackVisitDiff[scratch.parentDiff[j]] = (int32_t)i;
-                            end_j_diff = j;
-                        }
-
-                        // Rescue for diff-strand
-                        // For diff-strand, posB decreases, so check: posB[max_ii] - posB[i]
-                        if(processDiff &&
-                            (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] > (uint32_t)MAX_DIST_Y))) {
-                            int32_t max_val = INT32_MIN;
-                            max_ii_diff = -1;
-                            for(int32_t j = (int32_t)i - 1; j >= st_diff; --j) {
-                                if(max_val < scratch.dpDiff[j]) {
-                                    max_val = scratch.dpDiff[j];
-                                    max_ii_diff = j;
-                                }
-                            }
-                        }
-                        if(processDiff &&
-                            max_ii_diff >= 0 && max_ii_diff < end_j_diff && scratch.hitPosB[max_ii_diff] > posBi) {
-                            int32_t dA = (int32_t)posAi - (int32_t)scratch.hitPosA[max_ii_diff];
-                            int32_t dB = (int32_t)scratch.hitPosB[max_ii_diff] - (int32_t)posBi;
-                            if(dA > 0 && dB > 0) {
-                                int32_t dd = std::abs(dA - dB);
-                                int32_t dg = std::min(dA, dB);
-
-                                // Check bandwidth (comput_sc_ch style)
-                                bool bw_ok = (dd <= 16);
-                                if(!bw_ok && dd > 16) {
-                                    uint32_t posBi_fwd = (uint32_t)(readLenB - 1 - posBi);
-                                    uint32_t posBmax_fwd = (uint32_t)(readLenB - 1 - scratch.hitPosB[max_ii_diff]);
-                                    int32_t bw_diff = hifiasm_cal_bw(posAi, posBi_fwd, scratch.hitPosA[max_ii_diff], posBmax_fwd,
-                                                                      BW_RATE, readLenA, readLenB);
-                                    bw_ok = (dd <= bw_diff);
-                                }
-
-                                if(bw_ok) {
-                                    // Base score using CURRENT hit's weight
-                                    int32_t q_span = (int32_t)spanI;
-                                    int32_t tmp = (q_span < dg) ? q_span : dg;
-                                    const int32_t wI =
-                                        (scratch.hitWeights[i] > uint32_t(std::numeric_limits<int32_t>::max())) ?
-                                        std::numeric_limits<int32_t>::max() : int32_t(scratch.hitWeights[i]);
-                                    tmp = HIFIASM_NORMAL_W(tmp, wI);
-
-                                    // Apply gap penalty (comput_sc_ch style)
-                                    if(dd > 0 || (dg > q_span && dg > 0)) {
-                                        double lin_pen = CHN_PEN_GAP * (double)dd;
-                                        double a_pen = ((double)tmp) * (((double)dd) / ((double)dg)) / BW_RATE;
-                                        if(useEcScoring && dd >= 4) {
-                                            if(lin_pen < a_pen) {
-                                                lin_pen = a_pen;
-                                            }
-                                        } else {
-                                            if(lin_pen > a_pen) {
-                                                lin_pen = a_pen;
-                                            }
-                                        }
-                                        lin_pen += CHN_PEN_SKIP * (double)dg;
-                                        tmp -= (int32_t)lin_pen;
-                                    }
-
-                                    tmp += scratch.dpDiff[max_ii_diff];
-                                    if(max_f_diff < tmp) {
-                                        max_f_diff = tmp;
-                                        max_j_diff = max_ii_diff;
-                                    }
-                                }
-                            }
-                        }
-
-                        if(processDiff) {
-                            scratch.dpDiff[i] = max_f_diff;
-                            scratch.parentDiff[i] = max_j_diff;
-                            if(max_j_diff >= 0) {
-                                scratch.chainOccurrencesDiff[i] = scratch.chainOccurrencesDiff[size_t(max_j_diff)] + 1U;
-                            }
-                        }
-                        // Update max_ii tracker for diff-strand (posB decreases)
-                        if(processDiff &&
-                            (max_ii_diff < 0 || (scratch.hitPosB[max_ii_diff] - scratch.hitPosB[i] <= (uint32_t)MAX_DIST_Y &&
-                                                 scratch.dpDiff[max_ii_diff] < scratch.dpDiff[i]))) {
-                            max_ii_diff = (int32_t)i;
-                        }
-
-                        if(processSame && scratch.dpSame[i] > maxScSame) {
-                            maxScSame = scratch.dpSame[i];
-                        }
-                        if(processDiff && scratch.dpDiff[i] > maxScDiff) {
-                            maxScDiff = scratch.dpDiff[i];
-                        }
-                    }
-
-                    // Extract best chain based on PAF strand info.
-                    // Enforce the orientation given by the PAF record and
-                    // apply the same weak-chain cleanup used in discovery chaining.
-                    // Hifiasm: collect ALL chains (no per-pair limiting)
-                    const bool useSameStrand = pafSameStrand;
-                    const bool wantDiff = !useSameStrand;
-
-                    auto getAlignmentLength = [&](uint32_t pA, uint32_t pB) -> uint64_t {
-                        uint32_t xB = pA, yB = pB;
-                        if (xB <= yB) {
-                            yB -= xB;
-                            xB = 0;
-                        } else {
-                            xB -= yB;
-                            yB = 0;
-                        }
-                        uint64_t xR = readLenA - pA - 1, yR = readLenB - pB - 1;
-                        uint32_t xE = (xR <= yR) ? (uint32_t)(readLenA - 1) : pA + (uint32_t)yR;
-                        return (uint64_t)(xE - xB + 1);
-                    };
-
-                    scratch.chainCandidates.clear();
-                    for(size_t k = 0; k < numHits; ++k) {
-                        // Collect all chains with positive score, matching PAF orientation
-                        if(useSameStrand && scratch.dpSame[k] > 0) {
-                            scratch.chainCandidates.push_back({
-                                scratch.dpSame[k],
-                                uint64_t(0), // Filled below.
-                                int32_t(k),
-                                false});
-                        } else if(wantDiff && scratch.dpDiff[k] > 0) {
-                            scratch.chainCandidates.push_back({
-                                scratch.dpDiff[k],
-                                uint64_t(0), // Filled below.
-                                int32_t(k),
-                                true});
-                        }
-                    }
-                    if(scratch.chainCandidates.empty()) continue;
-
-                    // Fill in alignment lengths
-                    for(auto& cand : scratch.chainCandidates) {
-                        if(cand.isDiff) {
-                            cand.chainLen = getAlignmentLength(
-                                scratch.hitPosA[size_t(cand.endK)],
-                                uint32_t(readLenB - 1 - scratch.hitPosB[size_t(cand.endK)]));
-                        } else {
-                            cand.chainLen = getAlignmentLength(
-                                scratch.hitPosA[size_t(cand.endK)],
-                                scratch.hitPosB[size_t(cand.endK)]);
-                        }
-                    }
-
-                    // Sort by score descending
-                    std::sort(scratch.chainCandidates.begin(), scratch.chainCandidates.end());
-
-                    if(enableMcopyFast &&
-                        mcopyNum > 1 &&
-                        numHits >= size_t(mcopyKhitCutoff))
-                    {
-                        applyMcopyFastSelection(
-                            scratch.chainCandidates,
-                            scratch.parentSame,
-                            scratch.parentDiff,
-                            scratch.dpSame,
-                            scratch.dpDiff,
-                            scratch.chainOccurrencesSame,
-                            scratch.chainOccurrencesDiff,
-                            mcopyNum,
-                            mcopyRate,
-                            mcopyKhitCutoff,
-                            scratch.mcopyNodeUsed,
-                            scratch.mcopyPathNodes,
-                            scratch.mcopySelectedCandidates);
-                    }
-
-                    // Hifiasm-style weak-chain suppression (anchor.cpp: OFL/CH_OCC/CH_SC logic).
-                    if(minChainedMarkerCount >= 2 && !scratch.chainCandidates.empty()) {
-                        // Hifiasm lch-style gate: run weak suppression only when both
-                        // weak and strong chains are present for this read pair.
-                        bool hasWeakChain = false;
-                        bool hasStrongChain = false;
-                        for(const auto& cand : scratch.chainCandidates) {
-                            const uint32_t occ = cand.isDiff ?
-                                scratch.chainOccurrencesDiff[cand.endK] :
-                                scratch.chainOccurrencesSame[cand.endK];
-                            if(occ < minChainedMarkerCount) {
-                                hasWeakChain = true;
-                            } else {
-                                hasStrongChain = true;
-                            }
-                            if(hasWeakChain && hasStrongChain) {
-                                break;
-                            }
-                        }
-                        const bool runWeakSuppression = hasWeakChain && hasStrongChain;
-
-                        if(runWeakSuppression) {
-                            const size_t candidateCount = scratch.chainCandidates.size();
-                            auto& metas = scratch.weakMetas;
-                            metas.resize(candidateCount);
-                            auto& weakIdx = scratch.weakIdxWorkspace;
-                            auto& strongIdx = scratch.strongIdxWorkspace;
-                            weakIdx.clear();
-                            strongIdx.clear();
-                            weakIdx.reserve(candidateCount);
-                            strongIdx.reserve(candidateCount);
-
-                            for(size_t ci = 0; ci < candidateCount; ++ci) {
-                                const auto& cand = scratch.chainCandidates[ci];
-                                const auto& parentArrTmp = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
-                                int32_t rootK = cand.endK;
-                                while(parentArrTmp[rootK] != -1) {
-                                    rootK = parentArrTmp[rootK];
-                                }
-
-                                uint32_t qs = markersA[scratch.hitOrdinalA[rootK]].position;
-                                uint32_t qe = markersA[scratch.hitOrdinalA[cand.endK]].position + uint32_t(kmerLen);
-                                if(qe < qs) {
-                                    std::swap(qs, qe);
-                                }
-
-                                const uint32_t occ = cand.isDiff ?
-                                    scratch.chainOccurrencesDiff[cand.endK] :
-                                    scratch.chainOccurrencesSame[cand.endK];
-                                metas[ci] = ThreadScratchpad::WeakFilterMeta{qs, qe, occ, cand.score};
-
-                                if(occ < minChainedMarkerCount) {
-                                    weakIdx.push_back(ci);
-                                } else {
-                                    strongIdx.push_back(ci);
-                                }
-                            }
-
-                            if(!weakIdx.empty() && !strongIdx.empty()) {
-                                std::sort(strongIdx.begin(), strongIdx.end(),
-                                    [&](const size_t a, const size_t b) {
-                                        if(metas[a].qs != metas[b].qs) {
-                                            return metas[a].qs < metas[b].qs;
-                                        }
-                                        return metas[a].qe < metas[b].qe;
-                                    });
-
-                                auto& strongAnchorBegin = scratch.strongAnchorBegin;
-                                auto& strongAnchorEnd = scratch.strongAnchorEnd;
-                                auto& strongAnchorStartsFlat = scratch.strongAnchorStartsFlat;
-                                strongAnchorBegin.assign(candidateCount, 0);
-                                strongAnchorEnd.assign(candidateCount, 0);
-                                uint64_t totalStrongAnchors = 0;
-                                for(const size_t si : strongIdx) {
-                                    totalStrongAnchors += metas[si].occ;
-                                }
-                                strongAnchorStartsFlat.clear();
-                                strongAnchorStartsFlat.reserve(totalStrongAnchors);
-                                for(const size_t si : strongIdx) {
-                                    const auto& cand = scratch.chainCandidates[si];
-                                    const auto& parentArrTmp = cand.isDiff ? scratch.parentDiff : scratch.parentSame;
-                                    const uint64_t begin = strongAnchorStartsFlat.size();
-                                    scratch.currentChainPath.clear();
-                                    for(int32_t k = cand.endK; k != -1; k = parentArrTmp[k]) {
-                                        scratch.currentChainPath.push_back(scratch.hitPosA[size_t(k)]);
-                                    }
-                                    std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
-                                    strongAnchorStartsFlat.insert(
-                                        strongAnchorStartsFlat.end(),
-                                        scratch.currentChainPath.begin(),
-                                        scratch.currentChainPath.end());
-                                    scratch.currentChainPath.clear();
-                                    strongAnchorBegin[si] = begin;
-                                    strongAnchorEnd[si] = strongAnchorStartsFlat.size();
-                                }
-
-                                auto& suppress = scratch.suppressWorkspace;
-                                suppress.assign(candidateCount, uint8_t(0));
-                                for(const size_t wi : weakIdx) {
-                                    const auto& w = metas[wi];
-                                    const uint32_t weakSpan = (w.qe > w.qs) ? (w.qe - w.qs) : 0;
-                                    const uint32_t minOverlap =
-                                        std::max<uint32_t>(16U, uint32_t(double(weakSpan) * HIFIASM_OFL));
-                                    const uint64_t minStrongOcc = uint64_t(w.occ) << HIFIASM_CH_OCC; // ocn
-                                    const int64_t minStrongScore = int64_t(w.score) * int64_t(HIFIASM_CH_SC);
-
-                                    for(const size_t si : strongIdx) {
-                                        const auto& s = metas[si];
-                                        if(s.qe <= w.qs) {
-                                            continue;
-                                        }
-                                        if(s.qs >= w.qe) {
-                                            break;
-                                        }
-                                        if(uint64_t(s.occ) < minStrongOcc) {
-                                            continue;
-                                        }
-                                        if(int64_t(s.score) < minStrongScore) {
-                                            continue;
-                                        }
-
-                                        const uint32_t os = std::max(w.qs, s.qs);
-                                        const uint32_t oe = std::min(w.qe, s.qe);
-                                        if(oe <= os) {
-                                            continue;
-                                        }
-                                        const uint32_t overlap = oe - os;
-                                        if(overlap < minOverlap) {
-                                            continue;
-                                        }
-
-                                        const uint64_t begin = strongAnchorBegin[si];
-                                        const uint64_t end = strongAnchorEnd[si];
-                                        if(begin == end || oe < uint32_t(kmerLen)) {
-                                            continue;
-                                        }
-                                        const uint32_t maxAnchorStart = oe - uint32_t(kmerLen);
-                                        if(maxAnchorStart < os) {
-                                            continue;
-                                        }
-                                        auto itBegin = std::lower_bound(
-                                            strongAnchorStartsFlat.begin() + begin,
-                                            strongAnchorStartsFlat.begin() + end,
-                                            os);
-                                        auto itEnd = std::upper_bound(
-                                            itBegin,
-                                            strongAnchorStartsFlat.begin() + end,
-                                            maxAnchorStart);
-                                        const uint64_t overlapAnchorCount =
-                                            uint64_t(std::distance(itBegin, itEnd));
-                                        if(overlapAnchorCount < minStrongOcc) {
-                                            continue;
-                                        }
-
-                                        suppress[wi] = uint8_t(1);
-                                        break;
-                                    }
-                                }
-
-                                bool anySuppressed = false;
-                                for(const size_t wi : weakIdx) {
-                                    if(suppress[wi]) {
-                                        anySuppressed = true;
-                                        break;
-                                    }
-                                }
-                                if(anySuppressed) {
-                                    scratch.filteredCandidates.clear();
-                                    scratch.filteredCandidates.reserve(candidateCount);
-                                    for(size_t ci = 0; ci < candidateCount; ++ci) {
-                                        if(!suppress[ci]) {
-                                            scratch.filteredCandidates.push_back(scratch.chainCandidates[ci]);
-                                        }
-                                    }
-                                    scratch.chainCandidates = std::move(scratch.filteredCandidates);
-                                }
-                            }
-                        }
-                    }
-
-                    int32_t bestEndIdx = -1;
-                    int32_t selectedScore = 0;
-                    for(const auto& cand : scratch.chainCandidates) {
-                        if(cand.isDiff != wantDiff) {
-                            continue;
-                        }
-                        if(minChainedMarkerCount > 0) {
-                            const uint32_t occ = cand.isDiff ?
-                                scratch.chainOccurrencesDiff[cand.endK] :
-                                scratch.chainOccurrencesSame[cand.endK];
-                            if(occ < minChainedMarkerCount) {
-                                continue;
-                            }
-                        }
-                        bestEndIdx = cand.endK;
-                        selectedScore = cand.score;
-                        break;
-                    }
-                    if(bestEndIdx < 0) {
-                        continue;
-                    }
-                    const auto& parentArr = useSameStrand ? scratch.parentSame : scratch.parentDiff;
-
-                    // Backtrack to get chain
-                    scratch.currentChainPath.clear();
-                    int32_t currK = bestEndIdx;
-                    while(currK != -1) {
-                        scratch.currentChainPath.push_back(currK);
-                        currK = parentArr[currK];
-                    }
-                    std::reverse(scratch.currentChainPath.begin(), scratch.currentChainPath.end());
-
-
-                    // Build alignment
-                    Alignment al;
-                    al.ordinals.reserve(scratch.currentChainPath.size());
-
-                    for(uint32_t idxK : scratch.currentChainPath) {
-                        const uint32_t ordB = scratch.hitOrdinalB[idxK];
-                        if(ordB == std::numeric_limits<uint32_t>::max()) {
-                            al.ordinals.clear();
-                            break;
-                        }
-                        al.ordinals.push_back({scratch.hitOrdinalA[idxK], ordB});
-                    }
-
-                    if(!al.ordinals.empty()) {
-                        // Set alignment coordinates.
-                        // Note: Alignment stores ts/te in forward-read coordinates, even for reverse overlaps.
-                        uint32_t qPstart = markersA[al.ordinals.front()[0]].position;
-                        uint32_t qPend = markersA[al.ordinals.back()[0]].position + (uint32_t)kmerLen;
-                        uint32_t tPstart = markersB[al.ordinals.front()[1]].position;
-                        uint32_t tPend = markersB[al.ordinals.back()[1]].position + (uint32_t)kmerLen;
-
-                        al.qs = qPstart;
-                        al.qe = qPend;
-                        if(useSameStrand) {
-                            al.ts = tPstart;
-                            al.te = tPend;
-                        } else {
-                            // In the diff-strand chain, the target marker positions are decreasing.
-                            // Convert the (strand-0) forward interval to the canonical forward interval.
-                            const uint32_t minB = std::min(tPstart, tPend >= uint32_t(kmerLen) ? (tPend - uint32_t(kmerLen)) : tPend);
-                            const uint32_t maxB = std::max(tPstart, tPend >= uint32_t(kmerLen) ? (tPend - uint32_t(kmerLen)) : tPend) + uint32_t(kmerLen);
-                            const uint32_t tsExt = uint32_t(readLenB) - maxB;
-                            const uint32_t teExt = uint32_t(readLenB) - minB;
-                            const auto p = dinara::rcIntervalToForward(uint32_t(readLenB), tsExt, teExt);
-                            al.ts = p.first;
-                            al.te = p.second;
-                        }
-
-                        // Flip ordinals for opposite strand
-                        if(!useSameStrand) {
-                            uint32_t numMB = (uint32_t)markersB.size();
-                            for(auto& p : al.ordinals) p[1] = numMB - 1 - p[1];
-                        }
-
-                        // Optional: reject candidates with small pre-extension overlap span.
-                        if(invertedIndexData.minOverlapLength > 0) {
-                            const uint32_t qSpan = al.qe - al.qs;
-                            const uint32_t tSpan = al.te - al.ts;
-                            if(std::min(qSpan, tSpan) < invertedIndexData.minOverlapLength) {
-                                continue;
-                            }
-                        }
-
-                        // Optional: reject overlaps with large softclips.
-                        // Two complementary checks:
-                        // 1. Per-read: reject if a read is "internal" (both its clips exceed maxEndFuzz).
-                        // 2. Joint: reject if neither read reaches a given side (min of both clips exceeds maxEndFuzz).
-                        if(invertedIndexData.maxEndFuzz > 0) {
-                            const uint32_t qRightClip = uint32_t(std::max<int64_t>(int64_t(readLenA) - int64_t(al.qe), 0));
-                            uint32_t tLeftClip, tRightClip;
-                            if(useSameStrand) {
-                                tLeftClip = al.ts;
-                                tRightClip = uint32_t(std::max<int64_t>(int64_t(readLenB) - int64_t(al.te), 0));
-                            } else {
-                                tLeftClip = uint32_t(readLenB) - al.te;
-                                tRightClip = al.ts;
-                            }
-                            if(al.qs > invertedIndexData.maxEndFuzz && qRightClip > invertedIndexData.maxEndFuzz) {
-                                continue;
-                            }
-                            if(tLeftClip > invertedIndexData.maxEndFuzz && tRightClip > invertedIndexData.maxEndFuzz) {
-                                continue;
-                            }
-                            const uint32_t leftNeed = std::min(al.qs, tLeftClip);
-                            const uint32_t rightNeed = std::min(qRightClip, tRightClip);
-                            if(leftNeed > invertedIndexData.maxEndFuzz || rightNeed > invertedIndexData.maxEndFuzz) {
-                                continue;
-                            }
-                        }
-
-                        // readIdA < readIdB is guaranteed: PAF pairs come from the
-                        // candidate table which was populated with canonical ordering.
                         const uint32_t readLenA32 = uint32_t(std::min<uint64_t>(
-                            readLenA,
-                            uint64_t(std::numeric_limits<uint32_t>::max())));
-                        const uint8_t overlapType = uint8_t(getOverlapType(qPstart, qPend, readLenA32));
+                            readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
+                        const uint8_t overlapType =
+                            uint8_t(getOverlapType(iv.qStart, iv.qEnd, readLenA32));
 
                         localResults.push_back(PafChainedCandidate{
-                            OrientedReadPair(readIdA, readIdB, useSameStrand),
+                            OrientedReadPair(readIdA, readIdB, sameStrandWanted),
                             std::move(al),
-                            selectedScore,
+                            int32_t(iv.blockLen),
                             overlapType,
                             readIdA
                         });
