@@ -107,7 +107,8 @@ public:
     uint16_t port;
     string alignmentsPafFile;
     string overlapsFromPafFile;
-    bool overlapsFromHifiasm;  // Generate overlaps via the hifiasm library, then use the PAF path.
+    bool overlapsFromHifiasm;       // Run hifiasm and ALSO write hifiasm.ovlp.paf, then import it (file path).
+    bool overlapsFromInvertedIndex; // Opt out of hifiasm; use dinara's own inverted-index discovery.
     bool saveBinaryData;
 };
 

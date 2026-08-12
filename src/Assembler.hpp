@@ -34,6 +34,10 @@
 #include "mode3-Anchor.hpp"
 #include "PafImport.hpp"
 
+// hifiasm in-memory overlap bridge: provides the hifiasm_overlap_t type used by
+// importAlignmentCandidatesFromMemory. The header is a plain C ABI declaration.
+#include "hifiasm_overlaps.h"
+
 // Standard library.
 #include "memory.hpp"
 #include "string.hpp"
@@ -1287,7 +1291,18 @@ public:
     void computeCandidateTable();
     // threadCount == 0 means "use all hardware threads".
     void importAlignmentCandidatesFromPaf(const string& pafFilePath, uint64_t threadCount = 0);
-    
+
+    // Import candidates directly from hifiasm's in-memory overlaps (no PAF file).
+    // overlaps/names/nameOffsets come from hifiasm_detect_overlaps_mem(); read
+    // ids are resolved by name. threadCount == 0 means "use all hardware threads".
+    void importAlignmentCandidatesFromMemory(
+        const hifiasm_overlap_t* overlaps,
+        uint64_t overlapCount,
+        const char* names,
+        const uint64_t* nameOffsets,
+        uint64_t readCountFromHifiasm,
+        uint64_t threadCount = 0);
+
     // Chain pre-imported PAF candidates using the inverted index.
     // buildInvertedIndex must be called before this.
     void chainPafCandidates(
@@ -1298,6 +1313,11 @@ public:
     );
 
 private:
+    // Shared dedup + publish tail for both overlap importers (PAF file and
+    // in-memory hifiasm). Returns the number of duplicate entries merged away.
+    uint64_t publishPafEntries(vector<PafEntry>& entries);
+
+public:
     void checkAlignmentCandidatesAreOpen() const;
 
 

@@ -36,6 +36,9 @@ using namespace dinara;
 #include <sys/types.h>
 #include <unistd.h>
 
+// hifiasm in-memory overlap bridge (hifiasm_overlap_t).
+#include "hifiasm_overlaps.h"
+
 
 
 // Compute a marker alignment of two oriented reads.
@@ -388,16 +391,43 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath, uint
         ::munmap(mapping, fileSize);
     }
 
-    // ---- Deduplicate: one entry per (read pair, strand), keeping the longest
-    // overlap. A pair overlapping in both orientations keeps up to two entries. ----
+    // ---- Deduplicate + publish. Shared with the in-memory hifiasm path so the
+    // two overlap sources cannot drift in dedup or candidate-emission semantics. ----
     const size_t rawCount = entries.size();
+    const uint64_t duplicateCount = publishPafEntries(entries);
+
+    const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        steady_clock::now() - tBegin).count());
+    cout << timestamp << "Parsed " << parsedTotal << " PAF overlap records ("
+         << duplicateCount << " duplicate pairs merged";
+    if (malformedTotal > 0) {
+        cout << ", " << malformedTotal << " malformed lines skipped";
+    }
+    cout << ") in " << seconds << " s using " << nRanges << " threads." << endl;
+    cout << timestamp << "Total PAF candidates: " << alignmentCandidates.candidates.size() << endl;
+    (void)rawCount;
+}
+
+
+// Deduplicate the parsed/collected PAF entries (one entry per (read pair,
+// strand), keeping the longest overlap) and publish them into
+// alignmentCandidates.candidates + pafCandidateIntervals. Returns the number of
+// duplicate entries that were merged away. Shared by the PAF-file importer and
+// the in-memory hifiasm importer; the caller must have created
+// alignmentCandidates.candidates and cleared pafCandidateIntervals.
+uint64_t Assembler::publishPafEntries(vector<PafEntry>& entries)
+{
+    const size_t rawCount = entries.size();
+
+    // One entry per (read pair, strand), keeping the longest overlap. A pair
+    // overlapping in both orientations keeps up to two entries.
     dedupPafEntriesKeepLongest(entries);
     const uint64_t duplicateCount = uint64_t(rawCount - entries.size());
 
-    // ---- Publish results (deterministic: entries are in ascending key order,
-    // same-strand before reverse within a key). Each surviving entry becomes one
-    // oriented candidate; both orientations of a pair are folded into the pair's
-    // PafPairIntervals so chaining can look up the interval for either strand. ----
+    // Publish (deterministic: entries are in ascending key order, same-strand
+    // before reverse within a key). Each surviving entry becomes one oriented
+    // candidate; both orientations of a pair are folded into the pair's
+    // PafPairIntervals so chaining can look up the interval for either strand.
     pafCandidateIntervals.reserve(entries.size());
     for (const PafEntry& e : entries) {
         PafPairIntervals& pair = pafCandidateIntervals[e.key];
@@ -415,16 +445,104 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath, uint
     }
 
     alignmentCandidates.unreserve();
+    return duplicateCount;
+}
+
+
+// Import alignment candidates directly from hifiasm's in-memory overlaps,
+// avoiding the PAF file round-trip. `overlaps` and the name table come from
+// hifiasm_detect_overlaps_mem(): each overlap's q_id/t_id index into the name
+// table, and read ids are resolved BY NAME (via reads->getReadId) exactly as
+// the PAF-file path does, so load-order differences do not matter.
+void Assembler::importAlignmentCandidatesFromMemory(
+    const hifiasm_overlap_t* overlaps,
+    uint64_t overlapCount,
+    const char* names,
+    const uint64_t* nameOffsets,
+    uint64_t readCountFromHifiasm,
+    uint64_t threadCount)
+{
+    cout << timestamp << "Importing " << overlapCount
+         << " hifiasm overlaps from memory..." << endl;
+    const auto tBegin = steady_clock::now();
+
+    alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
+    pafCandidateIntervals.clear();
+
+    if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
+    if(threadCount == 0) threadCount = 1;
+
+    // Resolve hifiasm read index -> dinara ReadId once, by name. Names in the
+    // table are not individually NUL-terminated: read i occupies the byte range
+    // [nameOffsets[i], nameOffsets[i+1]).
+    vector<ReadId> hifiToDinara(readCountFromHifiasm, invalidReadId);
+    for(uint64_t i = 0; i < readCountFromHifiasm; i++) {
+        const uint64_t b = nameOffsets[i];
+        const uint64_t e = nameOffsets[i + 1];
+        hifiToDinara[i] = reads->getReadId(span<const char>(names + b, size_t(e - b)));
+    }
+
+    // Build PafEntry records in parallel, mirroring the per-record filtering of
+    // the PAF importer (block length floor, distinct, non-palindromic).
+    const uint64_t batch = std::max<uint64_t>(1, overlapCount / threadCount);
+    vector<vector<PafEntry>> threadEntries(threadCount);
+    vector<uint64_t> threadKept(threadCount, 0);
+    vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for(uint64_t ti = 0; ti < threadCount; ti++) {
+        workers.emplace_back([&, ti]() {
+            auto& out = threadEntries[ti];
+            uint64_t kept = 0;
+            for(uint64_t i = ti * batch;
+                i < overlapCount && (ti == threadCount - 1 || i < (ti + 1) * batch);
+                i++) {
+                const hifiasm_overlap_t& o = overlaps[i];
+                if(o.block_len < pafMinAlignmentBlockLength) continue;
+                if(o.q_id >= readCountFromHifiasm || o.t_id >= readCountFromHifiasm) continue;
+                const ReadId readId0 = hifiToDinara[o.q_id];
+                const ReadId readId1 = hifiToDinara[o.t_id];
+                const bool valid =
+                    readId0 != invalidReadId &&
+                    readId1 != invalidReadId &&
+                    readId0 != readId1 &&
+                    !reads->getFlags(readId0).isPalindromic &&
+                    !reads->getFlags(readId1).isPalindromic;
+                if(!valid) continue;
+                out.push_back(makePafEntry(
+                    readId0, readId1,
+                    o.q_start, o.q_end,
+                    o.t_start, o.t_end,
+                    o.block_len, o.is_same_strand != 0));
+                ++kept;
+            }
+            threadKept[ti] = kept;
+        });
+    }
+    for(auto& t : workers) t.join();
+
+    // Concatenate thread-local entries (order-independent: dedup sorts).
+    size_t total = 0;
+    uint64_t keptTotal = 0;
+    for(uint64_t ti = 0; ti < threadCount; ti++) {
+        total += threadEntries[ti].size();
+        keptTotal += threadKept[ti];
+    }
+    vector<PafEntry> entries;
+    entries.reserve(total);
+    for(uint64_t ti = 0; ti < threadCount; ti++) {
+        auto& te = threadEntries[ti];
+        entries.insert(entries.end(), te.begin(), te.end());
+        vector<PafEntry>().swap(te);
+    }
+
+    const uint64_t duplicateCount = publishPafEntries(entries);
 
     const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(
         steady_clock::now() - tBegin).count());
-    cout << timestamp << "Parsed " << parsedTotal << " PAF overlap records ("
-         << duplicateCount << " duplicate pairs merged";
-    if (malformedTotal > 0) {
-        cout << ", " << malformedTotal << " malformed lines skipped";
-    }
-    cout << ") in " << seconds << " s using " << nRanges << " threads." << endl;
-    cout << timestamp << "Total PAF candidates: " << alignmentCandidates.candidates.size() << endl;
+    cout << timestamp << "Imported " << keptTotal << " hifiasm overlaps ("
+         << duplicateCount << " duplicate pairs merged) in " << seconds
+         << " s using " << threadCount << " threads." << endl;
+    cout << timestamp << "Total candidates: " << alignmentCandidates.candidates.size() << endl;
 }
 
 

@@ -86,6 +86,39 @@ size_t countLines(const string& s) {
     return n;
 }
 
+// Mirror of one hifiasm in-memory overlap (see hifiasm_overlap_t in
+// external/hifiasmCandidates/hifiasm_overlaps.h). Duplicated here so the pure
+// PafImport unit tests do not need to link the submodule; the field semantics
+// must stay in sync with that header.
+struct MemOverlap {
+    uint32_t q_id, t_id;
+    uint32_t q_start, q_end;
+    uint32_t t_start, t_end;
+    uint32_t n_match, block_len;
+    bool     is_same_strand;
+};
+
+// Build a deduplicated PafEntry set from in-memory overlaps, exactly as
+// Assembler::importAlignmentCandidatesFromMemory does (same filters, same
+// makePafEntry call, same dedup). Read ids are the overlap's own q_id/t_id here
+// (the real importer resolves them by name first, which is orthogonal to the
+// dedup/keying property under test).
+vector<PafEntry> importMem(
+    const vector<MemOverlap>& ovs, uint64_t minBlock = 200)
+{
+    vector<PafEntry> entries;
+    for (const MemOverlap& o : ovs) {
+        if (o.block_len < minBlock) continue;
+        if (o.q_id == o.t_id) continue;
+        entries.push_back(makePafEntry(
+            ReadId(o.q_id), ReadId(o.t_id),
+            o.q_start, o.q_end, o.t_start, o.t_end,
+            o.block_len, o.is_same_strand));
+    }
+    dedupPafEntriesKeepLongest(entries);
+    return entries;
+}
+
 } // namespace
 
 
@@ -332,4 +365,122 @@ TEST_CASE("import: CRLF line endings across chunk boundaries", "[paf]") {
             REQUIRE(got[i].iv.blockLen == reference[i].iv.blockLen);
         }
     }
+}
+
+
+// --------------------------------------------------------------------------
+// In-memory overlap import parity (the deep-integration path).
+//
+// hifiasm's aligned emitter writes PAF with query/target SWAPPED relative to
+// its internal (q=x, t=y) overlap record, while the in-memory bridge hands back
+// the record's own orientation. These tests pin the property that both routes
+// converge on the same canonical PafEntry, so switching the default from the
+// PAF file to the in-memory path does not change downstream candidates.
+// --------------------------------------------------------------------------
+
+// Helper: compare two entry vectors for full equality of the fields that
+// downstream chaining consumes.
+static void requireSameEntries(const vector<PafEntry>& a, const vector<PafEntry>& b) {
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        REQUIRE(a[i].key == b[i].key);
+        REQUIRE(a[i].iv.isSameStrand == b[i].iv.isSameStrand);
+        REQUIRE(a[i].iv.blockLen == b[i].iv.blockLen);
+        REQUIRE(a[i].iv.qStart == b[i].iv.qStart);
+        REQUIRE(a[i].iv.qEnd   == b[i].iv.qEnd);
+        REQUIRE(a[i].iv.tStart == b[i].iv.tStart);
+        REQUIRE(a[i].iv.tEnd   == b[i].iv.tEnd);
+    }
+}
+
+TEST_CASE("mem import: query/target swap yields identical canonical entry", "[paf][mem]") {
+    // A single overlap between reads 0 and 1.
+    // PAF-file route (aligned emitter swaps q/t): query=read1 [50,850),
+    // target=read0 [100,900), strand '+'.
+    NameTable names;
+    names.ids = {{"r0", 0}, {"r1", 1}};
+    const string pafBuf =
+        "r1\t1000\t50\t850\t+\tr0\t1000\t100\t900\t700\t800\n";
+    vector<PafEntry> fromPaf = importBuffer(pafBuf, names, 1);
+
+    // In-memory route (record's own orientation): q_id=0 [100,900),
+    // t_id=1 [50,850), same strand. Same overlap, opposite (q,t) labeling.
+    vector<MemOverlap> mem = {
+        {0, 1, 100, 900, 50, 850, 700, 800, true},
+    };
+    vector<PafEntry> fromMem = importMem(mem);
+
+    REQUIRE(fromPaf.size() == 1);
+    requireSameEntries(fromPaf, fromMem);
+
+    // And the canonical interval is q=min(id) coords regardless of route.
+    REQUIRE(fromMem[0].key == ((uint64_t(0) << 32) | 1));
+    REQUIRE(fromMem[0].iv.qStart == 100);  // read 0 (min id) coords
+    REQUIRE(fromMem[0].iv.qEnd   == 900);
+    REQUIRE(fromMem[0].iv.tStart == 50);   // read 1 coords
+    REQUIRE(fromMem[0].iv.tEnd   == 850);
+}
+
+TEST_CASE("mem import: both orientations of a pair are kept", "[paf][mem]") {
+    // Reads 0 and 1 overlap both same-strand and reverse-complement (e.g. an
+    // inverted repeat). Both must survive as distinct entries.
+    vector<MemOverlap> mem = {
+        {0, 1, 100, 900, 50, 850, 700, 800, true},   // +
+        {0, 1, 100, 900, 50, 850, 700, 800, false},  // -
+    };
+    vector<PafEntry> got = importMem(mem);
+    REQUIRE(got.size() == 2);
+    // Deterministic order: same-strand before reverse within a key.
+    REQUIRE(got[0].key == got[1].key);
+    REQUIRE(got[0].iv.isSameStrand == true);
+    REQUIRE(got[1].iv.isSameStrand == false);
+}
+
+TEST_CASE("mem import: longest overlap wins per (pair, strand)", "[paf][mem]") {
+    vector<MemOverlap> mem = {
+        {0, 1, 100, 500, 50, 450, 380, 400, true},   // shorter +
+        {0, 1, 100, 900, 50, 850, 700, 800, true},   // longer  + (kept)
+        {2, 3, 0, 400, 0, 400, 380, 150, true},      // dropped: block_len < 200
+    };
+    vector<PafEntry> got = importMem(mem);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].iv.blockLen == 800);
+    REQUIRE(got[0].iv.qStart == 100);
+    REQUIRE(got[0].iv.qEnd   == 900);
+}
+
+TEST_CASE("mem import: block_len floor and self-overlaps filtered", "[paf][mem]") {
+    vector<MemOverlap> mem = {
+        {0, 0, 0, 400, 0, 400, 380, 800, true},      // self overlap: dropped
+        {0, 1, 0, 400, 0, 400, 380, 199, true},      // below floor: dropped
+        {0, 1, 0, 400, 0, 400, 380, 200, true},      // exactly floor: kept
+    };
+    vector<PafEntry> got = importMem(mem);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].iv.blockLen == 200);
+}
+
+TEST_CASE("mem import: full parity with PAF route over a mixed set", "[paf][mem]") {
+    NameTable names;
+    names.ids = {{"r0", 0}, {"r1", 1}, {"r2", 2}, {"r3", 3}};
+
+    // PAF route: as the aligned emitter would write it (q/t swapped vs record).
+    // Line fields: q qlen qs qe strand t tlen ts te matches blocklen
+    const string pafBuf =
+        "r1\t1000\t50\t850\t+\tr0\t1000\t100\t900\t700\t800\n"   // pair(0,1) +
+        "r1\t1000\t0\t400\t-\tr2\t1000\t10\t410\t380\t400\n"     // pair(1,2) -
+        "r3\t1000\t20\t320\t+\tr2\t1000\t30\t330\t280\t300\n";   // pair(2,3) +
+    vector<PafEntry> fromPaf = importBuffer(pafBuf, names, 1);
+
+    // In-memory route: the record's own (q=x,t=y) orientation for the same
+    // overlaps (so q/t are the reverse of the PAF lines above).
+    vector<MemOverlap> mem = {
+        {0, 1, 100, 900, 50, 850, 700, 800, true},   // pair(0,1) +
+        {2, 1, 10, 410, 0, 400, 380, 400, false},    // pair(1,2) -
+        {2, 3, 30, 330, 20, 320, 280, 300, true},    // pair(2,3) +
+    };
+    vector<PafEntry> fromMem = importMem(mem);
+
+    REQUIRE(fromPaf.size() == 3);
+    requireSameEntries(fromPaf, fromMem);
 }

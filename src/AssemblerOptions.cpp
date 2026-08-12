@@ -264,16 +264,25 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         value<string>(&commandLineOnlyOptions.overlapsFromPafFile),
         "The name of a PAF file containing overlaps between reads. "
         "If specified, alignment candidates are loaded from this file "
-        "instead of being computed using LowHash."
+        "instead of using the default in-memory hifiasm overlap path."
         )
 
         ("overlapsFromHifiasm",
         bool_switch(&commandLineOnlyOptions.overlapsFromHifiasm)->
         default_value(false),
-        "Generate read overlaps using the bundled hifiasm candidate-overlap "
-        "detector (writes hifiasm.ovlp.paf in the assembly directory) and load "
-        "alignment candidates from it, instead of computing them using LowHash. "
-        "Mutually exclusive with --overlapsFromPafFile.")
+        "Run the bundled hifiasm candidate-overlap detector and ALSO write "
+        "hifiasm.ovlp.paf in the assembly directory, then import candidates "
+        "from that file. This is the file-based variant of the default overlap "
+        "path (which passes overlaps in memory without writing a PAF); use it "
+        "when you want the PAF on disk for inspection. Mutually exclusive with "
+        "--overlapsFromPafFile and --overlapsFromInvertedIndex.")
+
+        ("overlapsFromInvertedIndex",
+        bool_switch(&commandLineOnlyOptions.overlapsFromInvertedIndex)->
+        default_value(false),
+        "Compute read overlaps using dinara's own inverted-index discovery "
+        "instead of the default hifiasm overlap path. Mutually exclusive with "
+        "--overlapsFromPafFile and --overlapsFromHifiasm.")
 
         ("saveBinaryData",
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->

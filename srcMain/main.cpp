@@ -2010,21 +2010,45 @@ void dinara::main::assemble(
     // - PAF: read pairs are imported from an external PAF file, then chained.
     // - Inverted index: read pairs are discovered by shared k-mer lookups,
     //   then chained. This is the default path.
-    string overlapsPafFile = assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile;
-    if(assemblerOptions.commandLineOnlyOptions.overlapsFromHifiasm) {
-        if(!overlapsPafFile.empty()) {
-            throw runtime_error(
-                "--overlapsFromHifiasm and --overlapsFromPafFile are mutually exclusive.");
-        }
-        if(inputFileNames.empty()) {
-            throw runtime_error("--overlapsFromHifiasm requires at least one --input read file.");
-        }
+    // Select the overlap source. Precedence / mutual exclusion:
+    //   --overlapsFromPafFile       : import candidates from an external PAF.
+    //   --overlapsFromHifiasm       : run hifiasm, write hifiasm.ovlp.paf, import it.
+    //   --overlapsFromInvertedIndex : dinara's own inverted-index discovery.
+    //   (none)                      : DEFAULT - run hifiasm and import its
+    //                                 overlaps IN MEMORY (no PAF round-trip).
+    const string overlapsPafFileOpt = assemblerOptions.commandLineOnlyOptions.overlapsFromPafFile;
+    const bool useHifiasmFile       = assemblerOptions.commandLineOnlyOptions.overlapsFromHifiasm;
+    const bool useInvertedIndex     = assemblerOptions.commandLineOnlyOptions.overlapsFromInvertedIndex;
 
-        // Run hifiasm candidate overlap detection on the same input reads.
-        // The current directory is the run directory, so the PAF is written
-        // there as hifiasm.ovlp.paf. hifiasm re-derives read ids by name; the
+    {
+        const int selectors =
+            int(!overlapsPafFileOpt.empty()) + int(useHifiasmFile) + int(useInvertedIndex);
+        if(selectors > 1) {
+            throw runtime_error(
+                "--overlapsFromPafFile, --overlapsFromHifiasm and "
+                "--overlapsFromInvertedIndex are mutually exclusive.");
+        }
+    }
+
+    // Whether we use the hifiasm overlap detector at all (default, or the
+    // file-based variant). Requires input read files.
+    const bool useHifiasm =
+        overlapsPafFileOpt.empty() && !useInvertedIndex;
+
+    if(useHifiasm && inputFileNames.empty()) {
+        throw runtime_error(
+            "The default hifiasm overlap path requires at least one --input "
+            "read file. Pass --overlapsFromPafFile or --overlapsFromInvertedIndex "
+            "to use another overlap source.");
+    }
+
+    string overlapsPafFile = overlapsPafFileOpt;
+
+    if(useHifiasm && useHifiasmFile) {
+        // File-based variant: run hifiasm and write hifiasm.ovlp.paf, then
+        // import it via the PAF path. hifiasm re-derives read ids by name; the
         // names match those dinara loaded from the same input file(s).
-        performanceLog << timestamp << "Generating overlaps with hifiasm from "
+        performanceLog << timestamp << "Generating overlaps with hifiasm (file) from "
             << inputFileNames.size() << " input file(s)." << endl;
 
         vector<const char*> readFiles;
@@ -2051,9 +2075,7 @@ void dinara::main::assemble(
         free(pafPathC);
         performanceLog << timestamp << "hifiasm overlaps written to "
             << overlapsPafFile << endl;
-    }
 
-    if(!overlapsPafFile.empty()) {
         assembler.importAlignmentCandidatesFromPaf(overlapsPafFile, threadCount);
         assembler.chainPafCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
@@ -2061,7 +2083,61 @@ void dinara::main::assemble(
             assemblerOptions.overlapCandidatesOptions,
             threadCount
         );
+
+    } else if(useHifiasm) {
+        // DEFAULT: run hifiasm and import its overlaps directly from memory,
+        // avoiding the PAF file serialize/parse round-trip.
+        performanceLog << timestamp << "Generating overlaps with hifiasm (in memory) from "
+            << inputFileNames.size() << " input file(s)." << endl;
+
+        vector<const char*> readFiles;
+        readFiles.reserve(inputFileNames.size());
+        for(const string& f: inputFileNames) {
+            readFiles.push_back(f.c_str());
+        }
+
+        hifiasm_ovlp_opt_t hifiOpt = {};
+        hifiOpt.threads = int(threadCount);
+
+        hifiasm_overlap_t* ov = nullptr;
+        uint64_t nOv = 0;
+        char* names = nullptr;
+        uint64_t* nameOff = nullptr;
+        uint64_t nReads = 0;
+        const int rc = hifiasm_detect_overlaps_mem(
+            readFiles.data(), int(readFiles.size()),
+            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+        if(rc != 0) {
+            hifiasm_overlaps_mem_free(ov, names, nameOff);
+            throw runtime_error("hifiasm in-memory overlap detection failed (code "
+                + to_string(rc) + ").");
+        }
+        performanceLog << timestamp << "hifiasm produced " << nOv
+            << " overlaps over " << nReads << " reads (in memory)." << endl;
+
+        assembler.importAlignmentCandidatesFromMemory(
+            ov, nOv, names, nameOff, nReads, threadCount);
+        hifiasm_overlaps_mem_free(ov, names, nameOff);
+
+        assembler.chainPafCandidates(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
+            assemblerOptions.overlapCandidatesOptions,
+            threadCount
+        );
+
+    } else if(!overlapsPafFile.empty()) {
+        // External PAF file.
+        assembler.importAlignmentCandidatesFromPaf(overlapsPafFile, threadCount);
+        assembler.chainPafCandidates(
+            assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
+            maxChainLimit,
+            assemblerOptions.overlapCandidatesOptions,
+            threadCount
+        );
+
     } else {
+        // dinara's own inverted-index discovery.
         assembler.chainAlignmentCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
             maxChainLimit,
