@@ -398,6 +398,19 @@ struct ThreadScratchpad {
     vector<ChainInterval> acceptedIntervalsDiff;
     vector<uint32_t> currentChainPath;             ///< Backtracked anchor indices for current chain.
 
+    // ---- PAF interval-anchor path ----
+    // Shared minimizers falling inside a PAF overlap interval, from which the chain
+    // is built directly (longest increasing subsequence) instead of running DP.
+    struct IntervalAnchor {
+        uint32_t posA;      ///< Base position on read A.
+        uint32_t posB;      ///< Forward base position on read B.
+        uint32_t ordinalA;  ///< Marker ordinal on read A.
+        uint32_t ordinalB;  ///< Marker ordinal on read B (forward strand).
+    };
+    vector<IntervalAnchor> intervalAnchors;   ///< Filtered shared minimizers in the PAF window.
+    vector<uint32_t> lisTails;                ///< LIS: index (into intervalAnchors) of the tail of the best subsequence of each length.
+    vector<uint32_t> lisPrev;                 ///< LIS: predecessor index for reconstruction.
+
     /// @brief Reset all vectors without releasing memory (amortized O(1) per read).
     void clear() {
         flatHits.clear();
@@ -422,6 +435,9 @@ struct ThreadScratchpad {
         acceptedIntervalsSame.clear();
         acceptedIntervalsDiff.clear();
         currentChainPath.clear();
+        intervalAnchors.clear();
+        lisTails.clear();
+        lisPrev.clear();
     }
 };
 
@@ -3221,6 +3237,143 @@ void Assembler::chainPafCandidates(
                     if(!mapHitPositionsToMarkerOrdinals(
                         scratch.hitPosB, markersB, scratch.hitOrdinalB, scratch.hitOrderByPosB)) {
                         continue;
+                    }
+
+                    // ============================================================
+                    // PAF INTERVAL PATH
+                    // ============================================================
+                    // Instead of re-running DP over the whole read, use the shared
+                    // minimizers (common markers) that fall inside the overlap interval
+                    // the PAF already agreed on. The chain is the longest subsequence of
+                    // those anchors that is strictly monotone in both reads' marker
+                    // ordinals (increasing on B for same-strand overlaps, decreasing on
+                    // B for reverse-complement overlaps). Alignment coordinates come
+                    // straight from the PAF interval and the score is the PAF block length.
+                    // readIdA < readIdB is guaranteed (canonical pair ordering), so the
+                    // key and the q/t interval assignment match importAlignmentCandidatesFromPaf.
+                    {
+                        const uint64_t pafKey = (uint64_t(readIdA) << 32) | uint64_t(readIdB);
+                        const auto pafIt = pafCandidateIntervals.find(pafKey);
+                        if(pafIt != pafCandidateIntervals.end()) {
+                            const Assembler::PafCandidateInterval& iv = pafIt->second;
+                            const bool sameStrandWanted = pafSameStrand;
+                            const uint32_t kLen = uint32_t(kmerLen);
+
+                            // Collect shared minimizers inside the PAF window that match
+                            // the overlap orientation. A k-mer hit at base position p spans
+                            // [p, p+k); keep it if that span intersects the interval.
+                            scratch.intervalAnchors.clear();
+                            for(size_t k = 0; k < numHits; ++k) {
+                                const auto& h = scratch.flatHits[k];
+                                const uint8_t rev = uint8_t(h.isRcA ^ h.isRcB);
+                                const bool hitSameStrand = (rev == 0);
+                                if(hitSameStrand != sameStrandWanted) continue;
+
+                                const uint32_t oB = scratch.hitOrdinalB[k];
+                                if(oB == std::numeric_limits<uint32_t>::max()) continue;
+
+                                const uint32_t pA = scratch.hitPosA[k];
+                                const uint32_t pB = scratch.hitPosB[k];
+                                // Half-open [start, end) window on each read, with k-mer span.
+                                if(pA + kLen <= iv.qStart || pA >= iv.qEnd) continue;
+                                if(pB + kLen <= iv.tStart || pB >= iv.tEnd) continue;
+
+                                scratch.intervalAnchors.push_back(
+                                    {pA, pB, scratch.hitOrdinalA[k], oB});
+                            }
+
+                            const size_t na = scratch.intervalAnchors.size();
+                            const uint32_t minAnchors =
+                                std::max<uint32_t>(2u, minChainedMarkerCount);
+                            if(na < minAnchors) {
+                                // Too few shared minimizers agree with the PAF interval.
+                                continue;
+                            }
+
+                            // Order anchors by A ordinal, breaking ties on B ordinal so the
+                            // monotone-subsequence search keeps at most one anchor per A ordinal.
+                            auto& anchors = scratch.intervalAnchors;
+                            std::sort(anchors.begin(), anchors.end(),
+                                [](const ThreadScratchpad::IntervalAnchor& a,
+                                   const ThreadScratchpad::IntervalAnchor& b) {
+                                    if(a.ordinalA != b.ordinalA) return a.ordinalA < b.ordinalA;
+                                    return a.ordinalB < b.ordinalB;
+                                });
+
+                            // Longest strictly-monotone chain (O(n^2); n is small per interval).
+                            scratch.lisTails.assign(na, 1);
+                            scratch.lisPrev.assign(na, std::numeric_limits<uint32_t>::max());
+                            uint32_t bestLen = 0;
+                            uint32_t bestEnd = std::numeric_limits<uint32_t>::max();
+                            for(size_t i = 0; i < na; ++i) {
+                                for(size_t j = 0; j < i; ++j) {
+                                    const bool okA = anchors[j].ordinalA < anchors[i].ordinalA;
+                                    if(!okA) continue;
+                                    const bool okB = sameStrandWanted ?
+                                        (anchors[j].ordinalB < anchors[i].ordinalB) :
+                                        (anchors[j].ordinalB > anchors[i].ordinalB);
+                                    if(!okB) continue;
+                                    if(scratch.lisTails[j] + 1 > scratch.lisTails[i]) {
+                                        scratch.lisTails[i] = scratch.lisTails[j] + 1;
+                                        scratch.lisPrev[i] = uint32_t(j);
+                                    }
+                                }
+                                if(scratch.lisTails[i] > bestLen) {
+                                    bestLen = scratch.lisTails[i];
+                                    bestEnd = uint32_t(i);
+                                }
+                            }
+                            if(bestLen < minAnchors) {
+                                continue;
+                            }
+
+                            // Reconstruct the chain.
+                            scratch.currentChainPath.clear();
+                            for(uint32_t cur = bestEnd;
+                                cur != std::numeric_limits<uint32_t>::max();
+                                cur = scratch.lisPrev[cur]) {
+                                scratch.currentChainPath.push_back(cur);
+                            }
+                            std::reverse(scratch.currentChainPath.begin(),
+                                         scratch.currentChainPath.end());
+
+                            Alignment al;
+                            al.ordinals.reserve(scratch.currentChainPath.size());
+                            const uint32_t numMB = uint32_t(markersB.size());
+                            for(uint32_t idxA : scratch.currentChainPath) {
+                                uint32_t oA = anchors[idxA].ordinalA;
+                                uint32_t oB = anchors[idxA].ordinalB;
+                                // Alignment ordinals are stored on strand 0 of each read.
+                                // For reverse-complement overlaps, flip B so both columns are
+                                // strictly increasing (checkStrictlyIncreasing invariant).
+                                if(!sameStrandWanted) {
+                                    oB = numMB - 1 - oB;
+                                }
+                                al.ordinals.push_back({oA, oB});
+                            }
+
+                            // Keep the interval the PAF agreed on, verbatim.
+                            // ts/te are forward-strand coordinates on read B, which is the
+                            // PAF target convention, so no reverse conversion is needed.
+                            al.qs = iv.qStart;
+                            al.qe = iv.qEnd;
+                            al.ts = iv.tStart;
+                            al.te = iv.tEnd;
+
+                            const uint32_t readLenA32 = uint32_t(std::min<uint64_t>(
+                                readLenA, uint64_t(std::numeric_limits<uint32_t>::max())));
+                            const uint8_t overlapType =
+                                uint8_t(getOverlapType(iv.qStart, iv.qEnd, readLenA32));
+
+                            localResults.push_back(PafChainedCandidate{
+                                OrientedReadPair(readIdA, readIdB, sameStrandWanted),
+                                std::move(al),
+                                int32_t(iv.blockLen),
+                                overlapType,
+                                readIdA
+                            });
+                            continue;
+                        }
                     }
 
                     // Hifiasm-style DP chaining for this fixed pair.

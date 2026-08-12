@@ -244,54 +244,39 @@ void Assembler::alignOverlappingOrientedReads(
 
 
 
-// Minimal struct to store overlap info for transitive inference
-struct PafOverlap {
-    ReadId otherId;
-    bool sameStrand;
-    uint32_t start;
-    uint32_t end;
-};
-
 void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
 {
     if (!std::filesystem::exists(pafFilePath)) {
         throw runtime_error("PAF file not found: " + pafFilePath);
     }
 
-    cout << timestamp << "Loading alignment candidates from " << pafFilePath << " with transitive expansion..." << endl;
+    cout << timestamp << "Loading alignment candidates from " << pafFilePath << "..." << endl;
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
-    
-    // Store overlaps per read for geometric checking: overlaps[readId] -> list of intervals
-    vector<vector<PafOverlap>> overlaps(reads->readCount());
-    
-    // Vectors to store direct candidates for later sorting
-    // We'll create thread-local storage for parsing if needed, but parsing is usually I/O bound.
-    // Let's do single-threaded parse, but it's fast.
-    
+
+    // Keep the interval each PAF record agreed on so chainPafCandidates can build the
+    // chain directly from the shared minimizers inside it, instead of re-chaining the
+    // whole read. Transitive expansion is intentionally not performed: only overlaps
+    // actually present in the PAF are chained.
+    pafCandidateIntervals.clear();
+
     std::ifstream pafFile(pafFilePath);
     string line;
     uint64_t lineCount = 0;
-    
+    uint64_t duplicateCount = 0;
+
     while (std::getline(pafFile, line)) {
         std::stringstream ss(line);
         string qName, tName, strandStr;
         uint64_t qLen, qStart, qEnd, tLen, tStart, tEnd, mapQ, alignLen;
-        
+
         // PAF columns:
-        // 1: Query name
-        // 2: Query length
-        // 3: Query start
-        // 4: Query end
-        // 5: Strand (+/-)
-        // 6: Target name
-        // 7: Target length
-        // 8: Target start
-        // 9: Target end
-        // 10: Number of residue matches
-        // 11: Alignment block length
-        
+        // 1: Query name        2: Query length     3: Query start      4: Query end
+        // 5: Strand (+/-)      6: Target name      7: Target length    8: Target start
+        // 9: Target end        10: Residue matches 11: Alignment block length
+        // (12+: optional tags such as cg:Z: CIGAR, ignored here)
+
         if (!(ss >> qName >> qLen >> qStart >> qEnd >> strandStr >> tName >> tLen >> tStart >> tEnd >> mapQ >> alignLen)) {
-            continue; 
+            continue;
         }
 
         if (alignLen < 200) {
@@ -305,130 +290,54 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             if (readId0 == invalid<ReadId> || readId1 == invalid<ReadId>) continue;
             // Ignore palindromic for now
             if (reads->getFlags(readId0).isPalindromic || reads->getFlags(readId1).isPalindromic) continue;
-            if (readId0 == readId1) continue; 
+            if (readId0 == readId1) continue;
 
-            bool isSameStrand = (strandStr == "+");
-            
-            // Store for transitive inference (Geometric Graph)
-            // Q aligns to T.
-            // On Q, the interval is [qStart, qEnd].
-            // On T, the interval is [tStart, tEnd].
-            
-            // Add neighbor T to Q
-            overlaps[readId0].push_back({readId1, isSameStrand, (uint32_t)qStart, (uint32_t)qEnd});
-            // Add neighbor Q to T
-            overlaps[readId1].push_back({readId0, isSameStrand, (uint32_t)tStart, (uint32_t)tEnd});
-            
-            // Store direct candidate
-            if (readId0 > readId1) swap(readId0, readId1);
-            alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
-            
+            const bool isSameStrand = (strandStr == "+");
+
+            // PAF query/target coordinates are both forward-strand on their respective
+            // reads (minimap2/hifiasm convention), regardless of overlap orientation.
+            // Canonicalize so readIds[0] < readIds[1]; swap the intervals with the ids
+            // so q* always refers to the smaller id and t* to the larger id. This matches
+            // the forward-coordinate convention used by Alignment::ts/te.
+            PafCandidateInterval interval;
+            interval.isSameStrand = isSameStrand;
+            interval.blockLen = uint32_t(alignLen);
+            if (readId0 < readId1) {
+                interval.qStart = uint32_t(qStart);
+                interval.qEnd   = uint32_t(qEnd);
+                interval.tStart = uint32_t(tStart);
+                interval.tEnd   = uint32_t(tEnd);
+            } else {
+                swap(readId0, readId1);
+                interval.qStart = uint32_t(tStart);
+                interval.qEnd   = uint32_t(tEnd);
+                interval.tStart = uint32_t(qStart);
+                interval.tEnd   = uint32_t(qEnd);
+            }
+
+            const uint64_t key = (uint64_t(readId0) << 32) | uint64_t(readId1);
+            auto [it, inserted] = pafCandidateIntervals.try_emplace(key, interval);
+            if (inserted) {
+                alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
+            } else {
+                // Duplicate pair (e.g. reciprocal record): keep the longer block.
+                ++duplicateCount;
+                if (interval.blockLen > it->second.blockLen) {
+                    it->second = interval;
+                }
+            }
+
             lineCount++;
-            
+
         } catch (...) {
             continue;
         }
     }
-    cout << timestamp << "Parsed " << lineCount << " PAF lines." << endl;
-
-    // Transitive Expansion with Geometric Filter
-    cout << timestamp << "Generating transitive candidates (Distance 2 with overlap check)..." << endl;
-    
-    uint64_t threadCount = std::thread::hardware_concurrency();
-    vector<vector<OrientedReadPair>> threadNewCandidates(threadCount);
-    
-    const uint64_t batchSize = 200;
-    setupLoadBalancing(reads->readCount(), batchSize);
-
-    vector<std::thread> threads;
-    for (size_t t = 0; t < threadCount; t++) {
-        threads.emplace_back([&, t]() {
-            uint64_t start, end;
-            while (getNextBatch(start, end)) {
-                for (uint64_t r = start; r < end; r++) {
-                    auto& neighbors = overlaps[r]; // Mutable reference, safe as r is exclusive to thread
-                    if (neighbors.size() < 2) continue; 
-                    
-                    // OPTIMIZATION: Sort by start position to enable sliding window
-                    std::sort(neighbors.begin(), neighbors.end(), 
-                        [](const PafOverlap& a, const PafOverlap& b) {
-                            return a.start < b.start;
-                        });
-                    
-                    // Check overlapping pairs using sliding window
-                    for (size_t i = 0; i < neighbors.size(); i++) {
-                        const auto& n1 = neighbors[i];
-                        
-                        // We need overlap > 200.
-                        // Implies: min(n1.end, n2.end) - max(n1.start, n2.start) > 200
-                        // Since sorted by start, n2.start >= n1.start.
-                        // So max(starts) = n2.start.
-                        // Overlap = min(n1.end, n2.end) - n2.start > 200
-                        // We need min(n1.end, n2.end) > n2.start + 200
-                        // Necessary condition: n1.end > n2.start + 200  (since min(...) <= n1.end)
-                        // So if n2.start >= n1.end - 200, we can stop, as n2.start will only increase.
-                        
-                        uint32_t limit = (n1.end > 200) ? n1.end - 200 : 0;
-
-                        for (size_t j = i + 1; j < neighbors.size(); j++) {
-                            const auto& n2 = neighbors[j];
-                            
-                            // Optimization: Early exit
-                            if (n2.start >= limit) break; 
-                            
-                            // Check if distinct neighbors
-                            if (n1.otherId == n2.otherId) continue;
-                            
-                            // Strict overlap calculation
-                            uint32_t overlapStart = n2.start; // Since sorted
-                            uint32_t overlapEnd = std::min(n1.end, n2.end);
-                            
-                            if (overlapEnd > overlapStart + 200) {
-                                // Overlap exists! Transitive candidate identified.
-                                bool impliedSame = (n1.sameStrand == n2.sameStrand);
-                                
-                                ReadId rA = n1.otherId;
-                                ReadId rC = n2.otherId;
-                                if (rA > rC) swap(rA, rC);
-                                
-                                threadNewCandidates[t].push_back(OrientedReadPair(rA, rC, impliedSame));
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        t.join();
-    }
-    
-    // Merge new candidates
-    for (const auto& vec : threadNewCandidates) {
-        for (const auto& c : vec) {
-            alignmentCandidates.candidates.push_back(c);
-        }
-    }
-
-    // Sort and remove duplicates.
-    std::sort(alignmentCandidates.candidates.begin(), alignmentCandidates.candidates.end(),
-        [](const OrientedReadPair& a, const OrientedReadPair& b) {
-            return tie(a.readIds[0], a.readIds[1], a.isSameStrand) <
-                   tie(b.readIds[0], b.readIds[1], b.isSameStrand);
-        });
-    
-    auto it = std::unique(alignmentCandidates.candidates.begin(), alignmentCandidates.candidates.end(),
-        [](const OrientedReadPair& a, const OrientedReadPair& b) {
-            return a.readIds[0] == b.readIds[0] &&
-                   a.readIds[1] == b.readIds[1] &&
-                   a.isSameStrand == b.isSameStrand;
-        });
-    
-    alignmentCandidates.candidates.resize(it - alignmentCandidates.candidates.begin());
+    cout << timestamp << "Parsed " << lineCount << " PAF overlap records ("
+         << duplicateCount << " duplicate pairs merged)." << endl;
 
     alignmentCandidates.unreserve();
-    cout << timestamp << "Total unique candidates (Direct + Transitive): " << alignmentCandidates.candidates.size() << endl;
+    cout << timestamp << "Total PAF candidates: " << alignmentCandidates.candidates.size() << endl;
 }
 
 

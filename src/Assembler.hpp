@@ -44,6 +44,7 @@
 // Standard library.
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 
 namespace dinara {
 
@@ -1237,6 +1238,24 @@ private:
     // They are interpreted with readId0 on strand 0.
 public:
     AlignmentCandidates alignmentCandidates;
+private:
+
+    // PAF-imported overlap intervals, keyed by canonical read pair (readId0<readId1).
+    // Populated by importAlignmentCandidatesFromPaf and consumed by chainPafCandidates
+    // to constrain shared-minimizer collection to the interval hifiasm already agreed on.
+    // Coordinates are half-open base positions on each read; target coordinates are
+    // forward-strand (matching Alignment::ts/te convention).
+public:
+    struct PafCandidateInterval {
+        uint32_t qStart = 0;   // Start on readId0 (query).
+        uint32_t qEnd = 0;     // End on readId0 (query).
+        uint32_t tStart = 0;   // Start on readId1 (target), forward strand.
+        uint32_t tEnd = 0;     // End on readId1 (target), forward strand.
+        uint32_t blockLen = 0; // PAF alignment block length (used as chain score).
+        bool isSameStrand = true;
+    };
+    // Key packs (readId0<<32 | readId1) with readId0<readId1.
+    std::unordered_map<uint64_t, PafCandidateInterval> pafCandidateIntervals;
 private:
 
 public:
