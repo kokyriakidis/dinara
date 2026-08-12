@@ -58,6 +58,7 @@ using namespace dinara;
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <fstream>
 #include <map>
 #include "iostream.hpp"
@@ -1685,6 +1686,84 @@ void dinara::main::setupRunDirectory(
 
 
 
+namespace {
+
+// Shared-read-store bridge to hifiasm.
+//
+// dinara already holds every read in memory (2-bit packed, in class Reads).
+// hifiasm's marker filter build and overlap detection each read the input
+// FASTA/FASTQ files themselves, so running both re-reads the same bytes from
+// disk twice. The store bridge (hifiasm_reads_store_load + the *_from_store
+// entry points) instead loads the reads into hifiasm's read store ONCE from
+// memory, so both stages run with no file I/O.
+//
+// The store carries raw ASCII bases. That matches dinara's in-memory reads
+// only when Reads.representation == 0 (raw); with RLE (representation == 1)
+// the in-memory bases are run-length-encoded and would NOT reproduce the
+// sequences hifiasm expects, so the caller must fall back to the file path.
+//
+// This RAII helper converts dinara's 2-bit reads to ASCII, loads them, and
+// releases the store on scope exit. hifiasm copies the bases into its own
+// store during load, so the temporary ASCII buffers are freed immediately
+// after each read is inserted (only one read's worth is live at a time).
+class HifiasmReadStore {
+public:
+    HifiasmReadStore(const Reads& reads) : loaded(false)
+    {
+        const ReadId n = reads.readCount();
+        readViews.resize(n);
+        // One contiguous ASCII buffer per read, kept alive until after the
+        // load call returns (hifiasm_read_t stores pointers into them).
+        asciiSeqs.resize(n);
+        for(ReadId i = 0; i < n; i++) {
+            const LongBaseSequenceView seq = reads.getRead(i);
+            const uint64_t len = seq.baseCount;
+            std::string& s = asciiSeqs[i];
+            s.resize(len);
+            for(uint64_t j = 0; j < len; j++) {
+                s[j] = seq[j].character();  // 2-bit base -> 'A'/'C'/'G'/'T'
+            }
+            const span<const char> name = reads.getReadName(i);
+
+            hifiasm_read_t& r = readViews[i];
+            r.seq = s.data();
+            r.seq_len = len;
+            r.name = name.data();
+            r.name_len = uint32_t(name.size());
+        }
+        const int rc = hifiasm_reads_store_load(
+            readViews.data(), uint64_t(readViews.size()));
+        if(rc != 0) {
+            throw runtime_error(
+                "Failed to load reads into hifiasm store (code " +
+                to_string(rc) + ").");
+        }
+        loaded = true;
+        // hifiasm has copied the bases into its own 2-bit store; the ASCII
+        // staging buffers are no longer needed.
+        asciiSeqs.clear();
+        asciiSeqs.shrink_to_fit();
+    }
+
+    ~HifiasmReadStore()
+    {
+        if(loaded) {
+            hifiasm_reads_store_release();
+        }
+    }
+
+    HifiasmReadStore(const HifiasmReadStore&) = delete;
+    HifiasmReadStore& operator=(const HifiasmReadStore&) = delete;
+
+private:
+    bool loaded;
+    vector<hifiasm_read_t> readViews;
+    vector<std::string> asciiSeqs;
+};
+
+} // anonymous namespace
+
+
 // This runs the entire assembly, under the following assumptions:
 // - The current directory is the run directory.
 // - The Data directory has already been created and set up, if necessary.
@@ -1772,6 +1851,31 @@ void dinara::main::assemble(
     // of --Reads.handleDuplicates. The default option is "useOneCopy".
     assembler.findDuplicateReads(assemblerOptions.readsOptions.handleDuplicates);
 
+    // Load the reads into hifiasm's in-memory read store ONCE, so both the
+    // marker filter build (no-HPC) and overlap detection (HPC) run against the
+    // same store with no file re-reads. See HifiasmReadStore above.
+    //
+    // Gate:
+    //   - Reads.representation must be 0 (raw). The store carries raw ASCII
+    //     bases; with RLE the in-memory bases are run-length-encoded and would
+    //     not reproduce the sequences hifiasm expects, so we leave the store
+    //     unloaded and the code below falls back to reading the input files.
+    //   - There must be reads loaded (there always are past the check above).
+    // The store is held for the whole marker+overlap section and released when
+    // hifiasmStore goes out of scope at the end of assemble().
+    std::unique_ptr<HifiasmReadStore> hifiasmStore;
+    const bool hifiasmStoreUsable =
+        (assemblerOptions.readsOptions.representation == 0) &&
+        (assembler.getReads().readCount() > 0);
+    if(hifiasmStoreUsable) {
+        performanceLog << timestamp
+            << "Loading " << assembler.getReads().readCount()
+            << " reads into hifiasm in-memory store (no file re-reads)." << endl;
+        hifiasmStore.reset(new HifiasmReadStore(assembler.getReads()));
+        performanceLog << timestamp << "hifiasm read store loaded." << endl;
+    }
+    const bool useHifiasmStore = (hifiasmStore != nullptr);
+
     // Marker generation method selection.
     //
     // The SIMD minimizer path is the main path and is taken by default because
@@ -1809,21 +1913,13 @@ void dinara::main::assemble(
         // skipped so the marker set is exactly the hf + sample_dist sketch
         // output (true parity with the overlap path).
         hifiasm_filter_t* hifiasmMarkerFilter = nullptr;
+        // The filter can be built either from the in-memory store (preferred,
+        // no file I/O) or, when the store is not usable (e.g. RLE reads), from
+        // the input files. The store path needs no input files.
         const bool wantHifiasmMarkerFilter =
             assemblerOptions.kmersOptions.useHifiasmMinimizers &&
-            !inputFileNames.empty();
+            (useHifiasmStore || !inputFileNames.empty());
         if(wantHifiasmMarkerFilter) {
-            performanceLog << timestamp
-                << "Building hifiasm overlap-path minimizer filter (no-HPC, k=w="
-                << assemblerOptions.kmersOptions.k << ") over "
-                << inputFileNames.size() << " input file(s)." << endl;
-
-            vector<const char*> markerReadFiles;
-            markerReadFiles.reserve(inputFileNames.size());
-            for(const string& f: inputFileNames) {
-                markerReadFiles.push_back(f.c_str());
-            }
-
             hifiasm_filter_opt_t filterOpt = {};
             filterOpt.threads = int(threadCount);
             filterOpt.k_mer_length = assemblerOptions.kmersOptions.k;
@@ -1831,8 +1927,27 @@ void dinara::main::assemble(
             filterOpt.is_hpc = 0;        // dinara markers are no-HPC
             filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
 
-            hifiasmMarkerFilter = hifiasm_build_filter(
-                markerReadFiles.data(), int(markerReadFiles.size()), &filterOpt);
+            if(useHifiasmStore) {
+                performanceLog << timestamp
+                    << "Building hifiasm overlap-path minimizer filter (no-HPC, "
+                    << "k=w=" << assemblerOptions.kmersOptions.k
+                    << ") from in-memory read store." << endl;
+                hifiasmMarkerFilter = hifiasm_build_filter_from_store(&filterOpt);
+            } else {
+                performanceLog << timestamp
+                    << "Building hifiasm overlap-path minimizer filter (no-HPC, "
+                    << "k=w=" << assemblerOptions.kmersOptions.k << ") over "
+                    << inputFileNames.size() << " input file(s)." << endl;
+
+                vector<const char*> markerReadFiles;
+                markerReadFiles.reserve(inputFileNames.size());
+                for(const string& f: inputFileNames) {
+                    markerReadFiles.push_back(f.c_str());
+                }
+                hifiasmMarkerFilter = hifiasm_build_filter(
+                    markerReadFiles.data(), int(markerReadFiles.size()),
+                    &filterOpt);
+            }
             if(hifiasmMarkerFilter == nullptr) {
                 throw runtime_error(
                     "Failed to build hifiasm minimizer filter for markers.");
@@ -2035,7 +2150,9 @@ void dinara::main::assemble(
     const bool useHifiasm =
         overlapsPafFileOpt.empty() && !useInvertedIndex;
 
-    if(useHifiasm && inputFileNames.empty()) {
+    // The default in-memory path can run from the store (no input files needed);
+    // the file-based variant (--overlapsFromHifiasm) still requires input files.
+    if(useHifiasm && inputFileNames.empty() && !(useHifiasmStore && !useHifiasmFile)) {
         throw runtime_error(
             "The default hifiasm overlap path requires at least one --input "
             "read file. Pass --overlapsFromPafFile or --overlapsFromInvertedIndex "
@@ -2086,16 +2203,11 @@ void dinara::main::assemble(
 
     } else if(useHifiasm) {
         // DEFAULT: run hifiasm and import its overlaps directly from memory,
-        // avoiding the PAF file serialize/parse round-trip.
-        performanceLog << timestamp << "Generating overlaps with hifiasm (in memory) from "
-            << inputFileNames.size() << " input file(s)." << endl;
-
-        vector<const char*> readFiles;
-        readFiles.reserve(inputFileNames.size());
-        for(const string& f: inputFileNames) {
-            readFiles.push_back(f.c_str());
-        }
-
+        // avoiding the PAF file serialize/parse round-trip. When the in-memory
+        // read store is loaded (raw reads) the overlaps are detected straight
+        // from it with no file re-reads; otherwise hifiasm reads the input
+        // files. Either way the overlaps come back in memory (HPC overlap
+        // preset), keyed by read name.
         hifiasm_ovlp_opt_t hifiOpt = {};
         hifiOpt.threads = int(threadCount);
 
@@ -2104,9 +2216,27 @@ void dinara::main::assemble(
         char* names = nullptr;
         uint64_t* nameOff = nullptr;
         uint64_t nReads = 0;
-        const int rc = hifiasm_detect_overlaps_mem(
-            readFiles.data(), int(readFiles.size()),
-            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+        int rc;
+        if(useHifiasmStore) {
+            performanceLog << timestamp
+                << "Generating overlaps with hifiasm (in memory) from the "
+                << "loaded read store." << endl;
+            rc = hifiasm_detect_overlaps_from_store(
+                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+        } else {
+            performanceLog << timestamp
+                << "Generating overlaps with hifiasm (in memory) from "
+                << inputFileNames.size() << " input file(s)." << endl;
+
+            vector<const char*> readFiles;
+            readFiles.reserve(inputFileNames.size());
+            for(const string& f: inputFileNames) {
+                readFiles.push_back(f.c_str());
+            }
+            rc = hifiasm_detect_overlaps_mem(
+                readFiles.data(), int(readFiles.size()),
+                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+        }
         if(rc != 0) {
             hifiasm_overlaps_mem_free(ov, names, nameOff);
             throw runtime_error("hifiasm in-memory overlap detection failed (code "
