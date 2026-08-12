@@ -267,6 +267,14 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         "instead of being computed using LowHash."
         )
 
+        ("overlapsFromHifiasm",
+        bool_switch(&commandLineOnlyOptions.overlapsFromHifiasm)->
+        default_value(false),
+        "Generate read overlaps using the bundled hifiasm candidate-overlap "
+        "detector (writes hifiasm.ovlp.paf in the assembly directory) and load "
+        "alignment candidates from it, instead of computing them using LowHash. "
+        "Mutually exclusive with --overlapsFromPafFile.")
+
         ("saveBinaryData",
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->
         default_value(false),

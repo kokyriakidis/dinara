@@ -191,6 +191,13 @@ message(STATUS "CURL link flags: ${CURL_LINK_FLAGS}")
 # Snarl finder (vendored from vg, stripped of protobuf/SnarlManager).
 add_subdirectory(external/snarls)
 
+# hifiasm candidate-overlap detector (submodule). Provides the static library
+# hifiasm_overlaps exposing hifiasm_overlaps.h; used by the optional
+# --overlapsFromHifiasm path to generate read overlaps as PAF. Build only the
+# library, not its CLI executable.
+set(HIFIASM_OVERLAPS_BUILD_EXE OFF CACHE BOOL "" FORCE)
+add_subdirectory(external/hifiasmCandidates)
+
 # Add the subdirectories we need.
 if(BUILD_EXECUTABLE)
     add_subdirectory(Executable)

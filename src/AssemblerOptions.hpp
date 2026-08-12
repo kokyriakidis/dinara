@@ -107,6 +107,7 @@ public:
     uint16_t port;
     string alignmentsPafFile;
     string overlapsFromPafFile;
+    bool overlapsFromHifiasm;  // Generate overlaps via the hifiasm library, then use the PAF path.
     bool saveBinaryData;
     string referenceFileName;  // Reference FASTA for --command svanchors.
     string bamFileName;        // Optional BAM for SA tag parsing in svanchors.

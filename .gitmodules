@@ -1,0 +1,3 @@
+[submodule "external/hifiasmCandidates"]
+	path = external/hifiasmCandidates
+	url = https://github.com/kokyriakidis/hifiasmCandidates

@@ -1,8 +1,10 @@
 build/
 tests/build_tests/
-# Ignore external deps except snarls vendored files.
+# Ignore external deps except snarls vendored files and the
+# hifiasmCandidates submodule (overlap detection library).
 external/*
 !external/snarls/
+!external/hifiasmCandidates/
 external/snarls/*
 !external/snarls/CMakeLists.txt
 !external/snarls/README.md
