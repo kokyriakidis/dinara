@@ -211,7 +211,7 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         value<string>(&commandLineOnlyOptions.command)->
         default_value("assemble"),
         "Command to run. Must be one of: "
-        "assemble, saveBinaryData, cleanupBinaryData, explore, svanchors, createBashCompletionScript")
+        "assemble, saveBinaryData, cleanupBinaryData, explore, createBashCompletionScript")
 
         ("memoryMode",
         value<string>(&commandLineOnlyOptions.memoryMode)->
@@ -279,18 +279,6 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->
         default_value(false),
         "Save binary data (Mode 3 assembly only).")
-
-        ("reference",
-        value<string>(&commandLineOnlyOptions.referenceFileName),
-        "Reference FASTA for the target subregion. "
-        "Required for --command svanchors. "
-        "The reference is loaded as read 0; short reads from --input follow.")
-
-        ("bam",
-        value<string>(&commandLineOnlyOptions.bamFileName),
-        "Optional BAM file with aligned short reads for --command svanchors. "
-        "SA tags from supplementary alignments are parsed to extract "
-        "split-read SV evidence.")
         ;
 
 }
@@ -440,13 +428,6 @@ void AssemblerOptions::addConfigurableOptions()
         "Minimum fraction of read length that must be covered by the marker span "
         "(lastMarkerPos + k - firstMarkerPos). Reads below this threshold have all "
         "markers removed. Set to 0 to disable.")
-
-        ("Kmers.minimizerW",
-        value<int>(&kmersOptions.minimizerW)->
-        default_value(1),
-        "Minimizer window size for --command svanchors. "
-        "w=1 selects every k-mer position (no subsampling). "
-        "Larger values subsample: density ~ 2/w.")
 
         ("MinHash.version",
         value<int>(&minHashOptions.version)->
@@ -610,7 +591,7 @@ void AssemblerOptions::addConfigurableOptions()
         value<int>(&overlapCandidatesOptions.chainingMode)->
         default_value(0),
         "Chaining scoring mode: 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty), "
-        "1 = minimap2-sr (fixed bandwidth, log gap penalty). Mode 1 is used by --command svanchors.")
+        "1 = minimap2-sr (fixed bandwidth, log gap penalty).")
 
         ("OverlapCandidates.minimap2Bw",
         value<int32_t>(&overlapCandidatesOptions.minimap2Bw)->
@@ -1772,7 +1753,6 @@ void KmersOptions::write(ostream& s) const
     s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
     s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
-    s << "minimizerW = " << minimizerW << "\n";
 }
 
 

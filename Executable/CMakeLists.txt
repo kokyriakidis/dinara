@@ -113,12 +113,15 @@ endif()
 # translation unit that called into libshasta2 (AssemblerShasta2Anchors.cpp)
 # is excluded from the build above.
 
-# Find theseus library (the kokyriakidis fork). Still used by
-# AssemblerSvAnchors.cpp (multi-segment TheseusMSA constructor). The per-window
-# MSA test now uses abPOA instead (AssemblerAbpoaMultiSegmentMSA.cpp).
+# Find theseus library (the kokyriakidis fork). No translation unit currently
+# built links theseus symbols: the theseus-using MSA prototypes
+# (AssemblerTheseus*MSA.cpp, AssemblerMultiSegmentMSA.cpp,
+# AssemblerDirectOverlapMSA.cpp, AssemblerPhasingMSA.cpp) are excluded above,
+# and the former svanchors TU was removed. Retained for when those prototypes
+# are re-enabled; kept optional so the build works without it.
 find_library(THESEUS_LIB theseus)
 if(THESEUS_LIB)
-    message(STATUS "theseus found (fork API used by AssemblerSvAnchors).")
+    message(STATUS "theseus found (fork API used by the excluded MSA prototypes).")
 else()
     message(WARNING "theseus library not found. Run InstallPrerequisites.")
     set(THESEUS_LIB "")

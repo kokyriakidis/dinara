@@ -109,8 +109,6 @@ public:
     string overlapsFromPafFile;
     bool overlapsFromHifiasm;  // Generate overlaps via the hifiasm library, then use the PAF path.
     bool saveBinaryData;
-    string referenceFileName;  // Reference FASTA for --command svanchors.
-    string bamFileName;        // Optional BAM for SA tag parsing in svanchors.
 };
 
 
@@ -193,10 +191,6 @@ public:
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.
     double minMarkerSpanFraction;
-
-    // Minimizer window size for --command svanchors.
-    // w=1 selects every k-mer position (no subsampling).
-    int minimizerW;
 
     void write(ostream&) const;
 };
