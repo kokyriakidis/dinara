@@ -3092,6 +3092,9 @@ void Assembler::chainPafCandidates(
     // ============================================================
     // Mirror the same pre-EC behavior as discovery chaining: per query read,
     // keep only the best overlap to each partner read by (score desc, overlapLen asc).
+    // The grouping is per (query, partner, strand): a pair overlapping in both
+    // orientations keeps its best same-strand and best reverse overlap separately,
+    // consistent with the strand-aware candidates produced at import.
     //
     // This is intentionally done BEFORE max_n_chain filtering so the read-level
     // cap is not wasted on duplicate chains to the same partner.
@@ -3108,6 +3111,14 @@ void Assembler::chainPafCandidates(
                 if(partnerA != partnerB) {
                     return partnerA < partnerB;
                 }
+                // Group by strand as well: a pair may overlap in both orientations
+                // (e.g. inverted repeats), and we keep the best chain per
+                // (query, partner, strand) rather than collapsing the two. This
+                // matches the discovery path (which chains strands independently)
+                // and the downstream PairKey{partner, strandBucket} dedup.
+                if(a.candidate.isSameStrand != b.candidate.isSameStrand) {
+                    return a.candidate.isSameStrand > b.candidate.isSameStrand;
+                }
                 if(a.score != b.score) {
                     return a.score > b.score;
                 }
@@ -3119,9 +3130,6 @@ void Assembler::chainPafCandidates(
                                                              : (uint64_t(b.alignment.te) - uint64_t(b.alignment.ts));
                 if(spanA != spanB) {
                     return spanA < spanB;
-                }
-                if(a.candidate.isSameStrand != b.candidate.isSameStrand) {
-                    return a.candidate.isSameStrand < b.candidate.isSameStrand;
                 }
                 if(a.candidate.readIds[0] != b.candidate.readIds[0]) {
                     return a.candidate.readIds[0] < b.candidate.readIds[0];
@@ -3137,15 +3145,21 @@ void Assembler::chainPafCandidates(
             const ReadId qid = mergedResults[i].queryReadId;
             const ReadId partnerI =
                 (mergedResults[i].candidate.readIds[0] == qid) ? mergedResults[i].candidate.readIds[1] : mergedResults[i].candidate.readIds[0];
+            const bool sameStrandI = mergedResults[i].candidate.isSameStrand;
             while(j < mergedResults.size() && mergedResults[j].queryReadId == qid) {
                 const ReadId partnerJ =
                     (mergedResults[j].candidate.readIds[0] == qid) ? mergedResults[j].candidate.readIds[1] : mergedResults[j].candidate.readIds[0];
                 if(partnerJ != partnerI) {
                     break;
                 }
+                // Keep same-strand and reverse overlaps to the same partner separate.
+                if(mergedResults[j].candidate.isSameStrand != sameStrandI) {
+                    break;
+                }
                 ++j;
             }
-            // Because of the sort order, mergedResults[i] is the best for this (query, partner).
+            // Because of the sort order, mergedResults[i] is the best for this
+            // (query, partner, strand).
             deduped.push_back(std::move(mergedResults[i]));
             i = j;
         }
