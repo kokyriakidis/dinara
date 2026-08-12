@@ -1788,13 +1788,64 @@ void dinara::main::assemble(
         // Use SIMD-accelerated minimizers instead of closed syncmers.
         // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
         // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+        // Optionally build hifiasm's overlap-path minimizer filter over the
+        // input reads so markers match the seeds hifiasm uses for overlaps: a
+        // no-HPC high-occurrence k-mer filter plus distance subsampling. Built
+        // once here and shared read-only across all marker threads; the handle
+        // is a standalone hash of k-mer values (no read store), so it is safe
+        // to share and outlives this call until we destroy it below.
+        //
+        // Only meaningful on the hifiasm minimizer path. When active, the
+        // redundant downstream marker frequency prune (applyKmerCountFilter) is
+        // skipped so the marker set is exactly the hf + sample_dist sketch
+        // output (true parity with the overlap path).
+        hifiasm_filter_t* hifiasmMarkerFilter = nullptr;
+        const bool wantHifiasmMarkerFilter =
+            assemblerOptions.kmersOptions.useHifiasmMinimizers &&
+            !inputFileNames.empty();
+        if(wantHifiasmMarkerFilter) {
+            performanceLog << timestamp
+                << "Building hifiasm overlap-path minimizer filter (no-HPC, k=w="
+                << assemblerOptions.kmersOptions.k << ") over "
+                << inputFileNames.size() << " input file(s)." << endl;
+
+            vector<const char*> markerReadFiles;
+            markerReadFiles.reserve(inputFileNames.size());
+            for(const string& f: inputFileNames) {
+                markerReadFiles.push_back(f.c_str());
+            }
+
+            hifiasm_filter_opt_t filterOpt = {};
+            filterOpt.threads = int(threadCount);
+            filterOpt.k_mer_length = assemblerOptions.kmersOptions.k;
+            filterOpt.mz_win = assemblerOptions.kmersOptions.k; // w == k
+            filterOpt.is_hpc = 0;        // dinara markers are no-HPC
+            filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
+
+            hifiasmMarkerFilter = hifiasm_build_filter(
+                markerReadFiles.data(), int(markerReadFiles.size()), &filterOpt);
+            if(hifiasmMarkerFilter == nullptr) {
+                throw runtime_error(
+                    "Failed to build hifiasm minimizer filter for markers.");
+            }
+            performanceLog << timestamp
+                << "hifiasm minimizer filter built." << endl;
+        }
+
         assembler.findMarkersSimdMinimizers(
             threadCount,
             assemblerOptions.kmersOptions.k,
             assemblerOptions.kmersOptions.k,  // Using kmer length as window size w
-            assemblerOptions.kmersOptions.useHifiasmMinimizers);
+            assemblerOptions.kmersOptions.useHifiasmMinimizers,
+            hifiasmMarkerFilter,
+            assemblerOptions.kmersOptions.hifiasmMarkerSampleDist);
 
-        // Compute histogram using the pre-calculated KmerIds.
+        // Whether the overlap-path filter was actually applied to the markers.
+        const bool hifiasmMarkerFilterApplied = (hifiasmMarkerFilter != nullptr);
+
+        // Compute histogram using the pre-calculated KmerIds. Still needed even
+        // when the hf filter is active: it fills coverageHet/coverageHom, which
+        // phasing and the chaining-frequency cutoff below depend on.
         assembler.countKmersFromMarkerKmerIds(threadCount);
         
         // Retrieve peak and set thresholds.
@@ -1843,11 +1894,29 @@ void dinara::main::assemble(
         // positions whose matching k-mer id passes.
         const bool filterRepeatKmers = true;
         const bool filterLowComplexity = true;
-        assembler.applyKmerCountFilter(
-            minFreq, maxFreq, threadCount, removePalindromicKmers,
-            filterRepeatKmers, filterLowComplexity);
-        
+        if(hifiasmMarkerFilterApplied) {
+            // The hifiasm overlap-path filter (high-occurrence k-mer filter +
+            // distance subsampling) already selected the markers, exactly as
+            // hifiasm selects overlap seeds. Running applyKmerCountFilter on top
+            // would prune a second, different way and break that parity, so it
+            // is intentionally skipped here. coverageHet/coverageHom from
+            // countKmersFromMarkerKmerIds above are still available for phasing
+            // and the chaining-frequency cutoff.
+            cout << "Skipping downstream marker frequency filter: markers already "
+                 << "filtered by hifiasm's overlap-path minimizer filter." << endl;
+        } else {
+            assembler.applyKmerCountFilter(
+                minFreq, maxFreq, threadCount, removePalindromicKmers,
+                filterRepeatKmers, filterLowComplexity);
+        }
+
         // writeReadMarkerGapDiagnostic("afterFrequencyFilter", ReadId(3729));
+
+        // The marker filter handle is no longer needed once markers are built.
+        if(hifiasmMarkerFilter != nullptr) {
+            hifiasm_filter_destroy(hifiasmMarkerFilter);
+            hifiasmMarkerFilter = nullptr;
+        }
 
         // Initialize KmerChecker for HttpServer diagnostics (optional).
         cout << "Initializing KmerChecker for diagnostics." << endl;

@@ -291,7 +291,13 @@ public:
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
     void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
-    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm = true);
+    // hifiasmFilter (a hifiasm_filter_t*, passed as void* to avoid the C bridge
+    // header here) and hifiasmSampleDist enable hifiasm's overlap-path minimizer
+    // filters on the hifiasm path; both are ignored when useHifiasm is false or
+    // hifiasmFilter is null. The caller owns hifiasmFilter.
+    void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
+        bool useHifiasm = true,
+        const void* hifiasmFilter = nullptr, int hifiasmSampleDist = 0);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -2590,6 +2596,14 @@ private:
          int k;
          int w; // window size for minimizers
          bool useHifiasm = false; // use hifiasm's no-HPC sketcher as position source
+         // Optional hifiasm overlap-path minimizer filter. When non-null, the
+         // hifiasm sketch applies this high-occurrence k-mer filter plus
+         // distance subsampling so markers match hifiasm's overlap seeds. Held
+         // as void* to keep the C bridge header out of this C++ header; the
+         // marker .cpp casts it back to hifiasm_filter_t*. Not owned here (the
+         // driver in findMarkersSimdMinimizers owns and frees it).
+         const void* hifiasmFilter = nullptr;
+         int hifiasmSampleDist = 0; // subsampling distance; <=0 disables it
     };
     FindMarkersSimdMinimizersData findMarkersSimdMinimizersData;
 

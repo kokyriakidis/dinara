@@ -321,6 +321,8 @@ static size_t getMinimizerMarkersForRead(
     bool useHifiasm,
     SimdSketcher* sketcher,
     hifiasm_sketch_ctx_t* hifiasmCtx,
+    const hifiasm_filter_t* hifiasmFilter,
+    int hifiasmSampleDist,
     const shared_ptr<KmerChecker>& kmerChecker,
     string& readSequence,
     std::vector<uint32_t>& positionBuffer,
@@ -350,9 +352,17 @@ static size_t getMinimizerMarkersForRead(
         // KmerId, so the marker/index representation is unchanged.
         const hifiasm_minimizer_t* mz = nullptr;
         int n = 0;
-        const int rc = hifiasm_sketch_minimizers_ctx(
-            hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
-            /*is_hpc*/ 0, &mz, &n);
+        // When a filter is supplied, use the overlap-parity variant: it applies
+        // hifiasm's high-occurrence k-mer filter (rarest-k-mer window selection)
+        // and distance subsampling, matching the seeds hifiasm uses for overlap
+        // detection. Otherwise fall back to the plain unfiltered sketch.
+        const int rc = hifiasmFilter ?
+            hifiasm_sketch_minimizers_ctx_filtered(
+                hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
+                /*is_hpc*/ 0, hifiasmFilter, hifiasmSampleDist, &mz, &n) :
+            hifiasm_sketch_minimizers_ctx(
+                hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
+                /*is_hpc*/ 0, &mz, &n);
         if(rc != 0) {
             // Treat a sketch failure as "no markers" rather than aborting the
             // whole run; the read simply contributes nothing.
@@ -415,13 +425,21 @@ static size_t getMinimizerMarkersForRead(
     return validCount;
 }
 
-void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bool useHifiasm)
+void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
+    bool useHifiasm, const void* hifiasmFilter, int hifiasmSampleDist)
 {
     reads->checkReadsAreOpen();
 
+    // The hifiasm overlap-path filter only applies on the hifiasm sketch path.
+    const bool useFilter = useHifiasm && (hifiasmFilter != nullptr);
+
     performanceLog << timestamp << "Finding markers using "
         << (useHifiasm ? "hifiasm (no-HPC)" : "SIMD") << " minimizers (k=" << k
-        << ", w=" << w << ") in " << reads->readCount() << " reads." << endl;
+        << ", w=" << w << ")"
+        << (useFilter ? " with overlap-path filter (sampleDist=" : "")
+        << (useFilter ? std::to_string(hifiasmSampleDist) : "")
+        << (useFilter ? ")" : "")
+        << " in " << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
     // Store parameters.
@@ -429,6 +447,8 @@ void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w, bo
     findMarkersSimdMinimizersData.k = k;
     findMarkersSimdMinimizersData.w = w;
     findMarkersSimdMinimizersData.useHifiasm = useHifiasm;
+    findMarkersSimdMinimizersData.hifiasmFilter = useFilter ? hifiasmFilter : nullptr;
+    findMarkersSimdMinimizersData.hifiasmSampleDist = useFilter ? hifiasmSampleDist : 0;
 
     // Create the markers and markerKmerIds data structures.
     markers->createNew(largeDataName("Markers"), largeDataPageSize);
@@ -471,6 +491,9 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
     const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
+    const hifiasm_filter_t* hifiasmFilter =
+        static_cast<const hifiasm_filter_t*>(findMarkersSimdMinimizersData.hifiasmFilter);
+    const int hifiasmSampleDist = findMarkersSimdMinimizersData.hifiasmSampleDist;
     // Allocate only the backend actually used on this path: the hifiasm sketch
     // context or the simd sketcher (each is per-thread; neither is thread-safe).
     SimdSketcher* sketcher = useHifiasm ? nullptr : simd_sketcher_new(
@@ -483,7 +506,9 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     while(getNextBatch(begin, end)) {
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const size_t count = getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx, kmerChecker, readSequence, positionBuffer, nullptr);
+                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx,
+                hifiasmFilter, hifiasmSampleDist,
+                kmerChecker, readSequence, positionBuffer, nullptr);
 
             const uint64_t count64 = count;
             this->markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
@@ -501,6 +526,9 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
     const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
+    const hifiasm_filter_t* hifiasmFilter =
+        static_cast<const hifiasm_filter_t*>(findMarkersSimdMinimizersData.hifiasmFilter);
+    const int hifiasmSampleDist = findMarkersSimdMinimizersData.hifiasmSampleDist;
     SimdSketcher* sketcher = useHifiasm ? nullptr : simd_sketcher_new(
         static_cast<uint8_t>(k), static_cast<uint8_t>(w));
     hifiasm_sketch_ctx_t* hifiasmCtx = useHifiasm ? hifiasm_sketch_ctx_init() : nullptr;
@@ -513,7 +541,9 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
         for(ReadId readId = ReadId(begin); readId != ReadId(end); ++readId) {
             const LongBaseSequenceView read = reads->getRead(readId);
             getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx, kmerChecker, readSequence, positionBuffer, &markerBuffer);
+                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx,
+                hifiasmFilter, hifiasmSampleDist,
+                kmerChecker, readSequence, positionBuffer, &markerBuffer);
 
             if(markerBuffer.empty()) continue;
 

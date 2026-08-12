@@ -423,6 +423,17 @@ void AssemblerOptions::addConfigurableOptions()
         "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
         "simd-minimizers instead.")
 
+        ("Kmers.hifiasmMarkerSampleDist",
+        value<int>(&kmersOptions.hifiasmMarkerSampleDist)->
+        default_value(500),
+        "When Kmers.useHifiasmMinimizers is true, apply hifiasm's overlap-path "
+        "minimizer filters (high-occurrence k-mer filter built over the reads, "
+        "plus distance subsampling) so markers match hifiasm's overlap seeds. "
+        "This is the subsampling distance in bases; hifiasm's overlap default is "
+        "500. Set to 0 to disable subsampling (the frequency filter still "
+        "applies). When active, the redundant downstream marker frequency filter "
+        "is skipped for true parity with the overlap path.")
+
         ("Kmers.minMarkerSpanFraction",
         value<double>(&kmersOptions.minMarkerSpanFraction)->
         default_value(0.5),
@@ -1759,6 +1770,7 @@ void KmersOptions::write(ostream& s) const
     s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
     s << "syncmerS = " << syncmerS << "\n";
     s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
+    s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
     s << "minimizerW = " << minimizerW << "\n";
 }

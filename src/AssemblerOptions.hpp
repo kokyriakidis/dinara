@@ -176,6 +176,19 @@ public:
     // to benchmark hifiasm's seed selection against simd-minimizers.
     bool useHifiasmMinimizers;
 
+    // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer
+    // filters so markers match the seeds hifiasm uses for overlap detection:
+    // a high-occurrence k-mer filter (built over the input reads, no-HPC) plus
+    // distance subsampling. This is the sample distance (in bases) for the
+    // subsampling stage; hifiasm's overlap default is 500. Set to 0 to disable
+    // subsampling (the frequency filter still applies). Only consulted when
+    // useHifiasmMinimizers is true.
+    //
+    // When the filter is active the redundant downstream marker frequency prune
+    // (applyKmerCountFilter) is skipped, so the marker set is exactly what the
+    // hf + sample_dist sketch produces (true parity with the overlap path).
+    int hifiasmMarkerSampleDist;
+
     // Minimum fraction of read length that must be covered by the marker span
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.
