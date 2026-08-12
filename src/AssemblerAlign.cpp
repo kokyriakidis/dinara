@@ -320,7 +320,11 @@ void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath)
             if (inserted) {
                 alignmentCandidates.candidates.push_back(OrientedReadPair(readId0, readId1, isSameStrand));
             } else {
-                // Duplicate pair (e.g. reciprocal record): keep the longer block.
+                // Multiple records for the same read pair collapse to one candidate.
+                // This covers reciprocal A->B / B->A records as well as several
+                // A->B lines (e.g. repeat-induced multi-mappings or split overlaps).
+                // Keep the record with the largest alignment block length (PAF col 11),
+                // i.e. the longest overlap.
                 ++duplicateCount;
                 if (interval.blockLen > it->second.blockLen) {
                     it->second = interval;
