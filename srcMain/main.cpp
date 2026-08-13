@@ -1688,6 +1688,42 @@ void dinara::main::setupRunDirectory(
 
 namespace {
 
+// ===========================================================================
+// DESIGN NOTE: why markers are no-HPC while overlaps are HPC (do NOT "unify").
+//
+// This split is intentional. It looks like an inconsistency at first glance
+// ("why don't markers use the exact k-mers hifiasm overlapped with?"), so this
+// note exists to prevent it being "fixed" later into a regression.
+//
+// hifiasm finds OVERLAPS in homopolymer-compressed (HPC) space: runs like
+// AAAAA are collapsed to A before seeding. That is what makes overlap detection
+// robust to homopolymer-length errors, the dominant HiFi/ONT error mode - two
+// reads that differ only in a run length still share the collapsed seed.
+//
+// dinara MARKERS are exact-match anchors in RAW space: two reads "share a
+// marker" only when the raw k-mer is byte-identical. So markers must be sketched
+// no-HPC. If we instead took the HPC minimizer POSITIONS and read raw k-mers
+// there, reads differing by a single homopolymer length would get different raw
+// k-mers (frame-shifted after the run) and FAIL to match - precisely on the
+// read pairs hifiasm paired. That would seed dinara's anchoring with markers
+// engineered NOT to match across the errors the assembler must see through.
+//
+// What we CAN and DO share is the selection methodology, not the k-mer space:
+//   - same k (HIFIASM_OVLP_K), same window, same distance subsampling
+//     (HIFIASM_OVLP_SAMPLE_DIST / REWIN), same high-occurrence cutoff policy;
+//   - the raw minimizer START position as the shared coordinate (select at
+//     k=51, encode dinara's k=50 there; the 50-mer is the 51-mer's prefix).
+//
+// Consequence to keep in mind: the marker high-occurrence filter is built
+// no-HPC, so it is a DIFFERENT frequency table than the HPC overlap filter and
+// removes a different specific set of k-mers. This is correct - markers need a
+// no-HPC table - but it means "markers pass the same filter as overlaps" is
+// true in METHOD, not in the literal identity of removed k-mers.
+//
+// Only revisit this split if dinara markers themselves move into HPC space (a
+// large change touching read representation, coordinates, and alignment).
+// ===========================================================================
+//
 // ---------------------------------------------------------------------------
 // Marker-selection configuration (single source of truth).
 //
