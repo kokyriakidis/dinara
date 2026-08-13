@@ -12,6 +12,7 @@
 #include "ProjectedAlignment.hpp"
 #include "AlignedEvidenceStore.hpp"
 #include "Reads.hpp"
+#include "HifiasmCigarImport.hpp"
 #include "hifiasmCoordinateTransforms.hpp"
 #include "overlapClassification.hpp"
 #include "span.hpp"
@@ -446,18 +447,69 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             if(collectProjectedTiming) {
                 tProjStart = steady_clock::now();
             }
-            const ProjectedAlignment projectedAlignment(
+
+            // Reuse hifiasm's base alignment when available: instead of
+            // recomputing the alignment with A*PA2 per candidate, reframe
+            // hifiasm's CIGAR into dinara's read0/read1 canonical frame and walk
+            // it clipped to the marker interval. Falls back to A*PA2 (Method
+            // QuickRawSparse) when no CIGAR was imported (PAF/raw path) or it
+            // does not span the interval.
+            bool usedHifiasmCigar = false;
+            ProjectedAlignment projectedAlignment(
                 markerK,
                 orientedReadIds,
                 sequenceViews,
                 alignment,
                 markerSpans,
-                ProjectedAlignment::Method::QuickRawSparse,
+                hifiasmImportedCigarStore.empty()
+                    ? ProjectedAlignment::Method::QuickRawSparse
+                    : ProjectedAlignment::Method::None,
                 dpMatchScore,
                 dpMismatchScore,
                 dpGapOpen1,
                 dpGapExtend1,
                 &cigarStore);
+
+            if(!hifiasmImportedCigarStore.empty()) {
+                // Candidate readIds are canonical (readIds[0] < readIds[1]); the
+                // pair key and strand match the imported-CIGAR store keys.
+                const uint64_t pairKey =
+                    (uint64_t(candidate.readIds[0]) << 32) | uint64_t(candidate.readIds[1]);
+                const HifiasmImportedCigarStore::Record* rec =
+                    hifiasmImportedCigarStore.find(pairKey, candidate.isSameStrand);
+                if(rec != nullptr && rec->cigarTokenCount > 0) {
+                    // Marker interval on read0 (forward coords), matching the
+                    // cigarRead0Start/End constructQuickRawSparse would compute.
+                    const uint32_t kHalf = markerK / 2;
+                    const auto lastIdx = alignment.ordinals.size() - 1;
+                    const uint32_t read0Begin =
+                        markerSpans[0][alignment.ordinals[0][0]].position + kHalf;
+                    const uint32_t read0End =
+                        markerSpans[0][alignment.ordinals[lastIdx][0]].position + kHalf;
+
+                    // Reframe the native hifiasm CIGAR into read0/read1 canonical
+                    // frame. read lengths are needed for the reverse-strand /
+                    // id-swap cases.
+                    const uint32_t qLen =
+                        uint32_t(reads->getRead(ReadId(rec->readIdQ)).baseCount);
+                    const uint32_t tLen =
+                        uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
+                    const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
+                        hifiasmImportedCigarStore.tokensOf(*rec),
+                        rec->readIdQ, rec->readIdT,
+                        rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
+                        qLen, tLen, rec->isSameStrand);
+
+                    usedHifiasmCigar = projectedAlignment.constructFromHifiasmCigar(
+                        span<const CigarToken>(norm.tokens.data(), norm.tokens.size()),
+                        norm.read0Start, norm.read1Start,
+                        read0Begin, read0End);
+                }
+                if(!usedHifiasmCigar) {
+                    // No usable CIGAR: recompute with A*PA2.
+                    projectedAlignment.constructQuickRawSparse();
+                }
+            }
             if(collectProjectedTiming) {
                 data.threadProjectedAlignmentTime[threadId] += seconds(steady_clock::now() - tProjStart);
             }

@@ -177,11 +177,30 @@ add_custom_command(TARGET test_paf_import POST_BUILD
     VERBATIM
 )
 
+# ============================================================================
+# HIFIASM CIGAR IMPORT UNIT TEST
+# ============================================================================
+# Validates normalizeHifiasmCigar in src/HifiasmCigarImport.hpp: reframing the
+# hifiasm alignment-frame CIGAR into dinara's canonical read0/read1 frame for
+# all four query/target-id-order x strand cases. Pure logic over the
+# header-only OverlapCigarStore, so only DINARA_ASSERT.cpp is needed.
+add_executable(test_hifiasm_cigar_import
+    test_hifiasm_cigar_import.cpp
+    ${DINARA_ROOT}/src/DINARA_ASSERT.cpp
+    $<TARGET_OBJECTS:catch_main>
+)
+target_link_libraries(test_hifiasm_cigar_import pthread)
+add_custom_command(TARGET test_hifiasm_cigar_import POST_BUILD
+    COMMAND chmod +x $<TARGET_FILE:test_hifiasm_cigar_import>
+    VERBATIM
+)
+
 # Enable CTest
 enable_testing()
 add_test(NAME IntegrationTests COMMAND test_integration)
 add_test(NAME LongMarkersTests COMMAND test_long_markers)
 add_test(NAME PafImportTests COMMAND test_paf_import)
+add_test(NAME HifiasmCigarImportTests COMMAND test_hifiasm_cigar_import)
 
 # CI/dev environments can have LD_LIBRARY_PATH pointing at /usr/local/lib first.
 # Force our curated dependency builds (in ${DINARA_BUILD_DIR}/lib) to take precedence.

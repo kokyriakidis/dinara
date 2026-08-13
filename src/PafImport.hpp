@@ -56,9 +56,15 @@ struct PafRecord {
 
 // A merged candidate entry: the canonical key plus its interval.
 // key packs (readId0 << 32) | readId1 with readId0 < readId1.
+//
+// sourceIndex optionally identifies the record this entry came from, so a
+// caller can recover per-record data (e.g. the hifiasm CIGAR) for the entry
+// that survives dedup. It is not used for keying, ordering, or dedup and is
+// left as uint64_t(-1) by the PAF-file path, which has no such side data.
 struct PafEntry {
     uint64_t key = 0;
     PafCandidateInterval iv;
+    uint64_t sourceIndex = uint64_t(-1);
 };
 
 // Both orientations a read pair may overlap in. A pair can legitimately appear

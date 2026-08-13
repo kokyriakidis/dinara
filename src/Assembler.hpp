@@ -29,6 +29,7 @@
 #include "ReadId.hpp"
 #include "AlignedEvidenceStore.hpp"
 #include "OverlapCigarStore.hpp"
+#include "HifiasmImportedCigarStore.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
 #include "mode3-Anchor.hpp"
@@ -1301,12 +1302,20 @@ public:
     // Import candidates directly from hifiasm's in-memory overlaps (no PAF file).
     // overlaps/names/nameOffsets come from hifiasm_detect_overlaps_mem(); read
     // ids are resolved by name. threadCount == 0 means "use all hardware threads".
+    //
+    // cigar/cigarLen are hifiasm's packed uint16_t CIGAR token arena (from the
+    // same call); each overlap references its slice via overlap.cigar_offset /
+    // cigar_len. For every overlap that survives dedup, the CIGAR is copied into
+    // hifiasmImportedCigarStore so computeBaseAlignmentsAndStore can reuse it.
+    // Pass cigar == nullptr to skip CIGAR import (falls back to recomputation).
     void importAlignmentCandidatesFromMemory(
         const hifiasm_overlap_t* overlaps,
         uint64_t overlapCount,
         const char* names,
         const uint64_t* nameOffsets,
         uint64_t readCountFromHifiasm,
+        const uint16_t* cigar,
+        uint64_t cigarLen,
         uint64_t threadCount = 0);
 
     // Chain pre-imported PAF candidates using the inverted index.
@@ -2184,6 +2193,13 @@ public:
     // Token arena; each overlap's (cigarOffset, cigarTokenCount) in AlignmentInfo
     // points directly into this arena.
     OverlapCigarStore overlapCigarStore;
+
+    // Native (alignment-frame) hifiasm CIGARs for imported overlaps, keyed by
+    // canonical pair key + strand. Populated by importAlignmentCandidatesFromMemory
+    // and consumed by computeBaseAlignmentsAndStore to reuse hifiasm's base
+    // alignment instead of recomputing it. Empty when candidates came from a PAF
+    // file or the raw candidate path (no base-level CIGAR available).
+    HifiasmImportedCigarStore hifiasmImportedCigarStore;
 
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
 

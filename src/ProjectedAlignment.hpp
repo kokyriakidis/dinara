@@ -17,6 +17,8 @@ an Alignment in marker space to base space.
 #include "vector.hpp"
 #include <astarpa/astarpa.h>
 
+#include "OverlapCigarStore.hpp"
+
 namespace dinara {
     class ProjectedAlignment;
     class ProjectedAlignmentSegment;
@@ -143,6 +145,9 @@ public:
         All,        // Do both RLE and raw alignments, store all segments.
         QuickRaw,   // Only do raw alignments, only store segments where the two raw sequences differ.
         QuickRawSparse, // Only do raw alignments, store sparse diffs (no full alignment trace).
+        None,       // Construct nothing; caller fills the object explicitly
+                    // (e.g. constructFromHifiasmCigar). Used to reuse hifiasm's
+                    // base alignment instead of recomputing it.
     };
 
     ProjectedAlignment(
@@ -171,6 +176,27 @@ public:
     void constructAll();
     void constructQuickRaw();
     void constructQuickRawSparse();
+
+    // Fill the sparse diffs, statistics and CIGAR from a pre-computed hifiasm
+    // CIGAR (already normalized into dinara's read0/read1 canonical frame),
+    // clipped to the marker interval [read0Begin, read0End) on read0. This
+    // reproduces exactly what constructQuickRawSparse would have written, but
+    // walks hifiasm's tokens instead of re-running A*PA2 per segment.
+    //
+    //   normalizedTokens : CIGAR in read0/read1 canonical frame (op I consumes
+    //                      read0, D consumes read1)
+    //   read0Anchor      : read0 forward position the tokens start at
+    //   read1Anchor      : read1 alignment-orientation position the tokens start at
+    //   read0Begin/End   : marker interval on read0 (forward coords) to keep
+    //
+    // Returns false (leaving the object untouched) when the CIGAR does not span
+    // the marker interval, so the caller can fall back to recomputation.
+    bool constructFromHifiasmCigar(
+        span<const CigarToken> normalizedTokens,
+        uint32_t read0Anchor,
+        uint32_t read1Anchor,
+        uint32_t read0Begin,
+        uint32_t read0End);
 
 
 

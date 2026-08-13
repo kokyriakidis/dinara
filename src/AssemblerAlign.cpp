@@ -460,6 +460,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const char* names,
     const uint64_t* nameOffsets,
     uint64_t readCountFromHifiasm,
+    const uint16_t* cigar,
+    uint64_t cigarLen,
     uint64_t threadCount)
 {
     cout << timestamp << "Importing " << overlapCount
@@ -468,6 +470,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
 
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
     pafCandidateIntervals.clear();
+    hifiasmImportedCigarStore.clear();
 
     if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
     if(threadCount == 0) threadCount = 1;
@@ -508,11 +511,15 @@ void Assembler::importAlignmentCandidatesFromMemory(
                     !reads->getFlags(readId0).isPalindromic &&
                     !reads->getFlags(readId1).isPalindromic;
                 if(!valid) continue;
-                out.push_back(makePafEntry(
+                PafEntry entry = makePafEntry(
                     readId0, readId1,
                     o.q_start, o.q_end,
                     o.t_start, o.t_end,
-                    o.block_len, o.is_same_strand != 0));
+                    o.block_len, o.is_same_strand != 0);
+                // Remember which overlap this entry came from so the CIGAR of
+                // the entry that survives dedup can be recovered below.
+                entry.sourceIndex = i;
+                out.push_back(entry);
                 ++kept;
             }
             threadKept[ti] = kept;
@@ -536,6 +543,33 @@ void Assembler::importAlignmentCandidatesFromMemory(
     }
 
     const uint64_t duplicateCount = publishPafEntries(entries);
+
+    // publishPafEntries deduped `entries` in place, so it now holds exactly the
+    // overlaps that became candidates (one per key+strand, the longest). Copy
+    // each survivor's hifiasm CIGAR into the imported-CIGAR store, keyed the same
+    // way as pafCandidateIntervals, so computeBaseAlignmentsAndStore can reuse
+    // hifiasm's base alignment instead of recomputing it. Stored in the native
+    // (query,target) alignment frame; reframing to read0/read1 happens at use.
+    if(cigar != nullptr) {
+        uint64_t cigarOverlaps = 0;
+        hifiasmImportedCigarStore.reserve(entries.size(), cigarLen);
+        for(const PafEntry& e : entries) {
+            if(e.sourceIndex == uint64_t(-1)) continue;
+            const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
+            if(o.cigar_len == 0) continue;
+            if(o.cigar_offset + o.cigar_len > cigarLen) continue; // defensive
+            const ReadId readId0 = hifiToDinara[o.q_id];
+            const ReadId readId1 = hifiToDinara[o.t_id];
+            hifiasmImportedCigarStore.add(
+                e.key, o.is_same_strand != 0,
+                span<const uint16_t>(cigar + o.cigar_offset, size_t(o.cigar_len)),
+                uint32_t(readId0), uint32_t(readId1),
+                o.q_start, o.q_end, o.t_start, o.t_end);
+            ++cigarOverlaps;
+        }
+        cout << timestamp << "Imported hifiasm CIGARs for " << cigarOverlaps
+             << " overlaps (" << cigarLen << " tokens)." << endl;
+    }
 
     const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(
         steady_clock::now() - tBegin).count());

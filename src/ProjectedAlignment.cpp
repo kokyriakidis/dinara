@@ -147,6 +147,9 @@ ProjectedAlignment::ProjectedAlignment(
         case Method::QuickRawSparse:
             constructQuickRawSparse();
             break;
+        case Method::None:
+            // Caller fills the object explicitly (constructFromHifiasmCigar).
+            break;
         default:
             DINARA_ASSERT(0);
     }
@@ -500,6 +503,212 @@ void ProjectedAlignment::constructQuickRawSparse()
         DINARA_ASSERT(cigarConsumed0 == totalLength[0]);
         DINARA_ASSERT(cigarConsumed1 == totalLength[1]);
     }
+}
+
+
+
+bool ProjectedAlignment::constructFromHifiasmCigar(
+    span<const CigarToken> normalizedTokens,
+    uint32_t read0Anchor,
+    uint32_t read1Anchor,
+    uint32_t read0Begin,
+    uint32_t read0End)
+{
+    // The hifiasm CIGAR must cover the marker interval on read0; otherwise the
+    // caller should fall back to recomputation.
+    if(normalizedTokens.empty()) return false;
+    if(read0Begin < read0Anchor || read0End < read0Begin) return false;
+    {
+        // read0 span covered by the tokens = sum of query-consuming ops.
+        uint64_t read0Covered = 0;
+        for(const CigarToken& t : normalizedTokens) {
+            if(opConsumesQuery(t.op())) read0Covered += t.len();
+        }
+        if(uint64_t(read0End) > uint64_t(read0Anchor) + read0Covered) return false;
+    }
+
+    sparseMismatches.clear();
+    sparseIndels.clear();
+
+    totalLength = {0, 0};
+    totalEditDistance = 0;
+    mismatchCount = 0;
+    nonHomopolymerErrorCount = 0;
+    totalIndelBaseCount = 0;
+    totalGapEventCount = 0;
+    totalDpScore = 0;
+    hasLargeIndel = false;
+
+    const bool storeCigar = (cigarStore != nullptr);
+    if(storeCigar) {
+        cigarOffset = cigarStore->beginAlignment();
+    }
+
+    cigarRead0Start = read0Begin;
+    cigarRead0End   = read0End;
+    // read1 boundaries are resolved from the walk (the read1 position aligned to
+    // read0Begin / read0End), mirroring how constructQuickRawSparse derives them
+    // from the first/last aligned marker pair.
+    cigarRead1Start = read1Anchor;
+    cigarRead1End   = read1Anchor;
+    bool haveRead1Start = false;
+
+    const int64_t match = dpMatchScore;
+    const int64_t mismatch = dpMismatchScore;
+    auto gapPenalty = [gapOpen1 = dpGapOpen1, gapExtend1 = dpGapExtend1](uint64_t length) -> int64_t {
+        return gapOpen1 + gapExtend1 * int64_t(length);
+    };
+
+    const uint32_t read0Len = uint32_t(sequences[0].baseCount);
+    const uint32_t read1Len = uint32_t(sequences[1].baseCount);
+
+    // Is the base at oriented position `pos` on read `which` inside a homopolymer
+    // run? Mirrors ifIsHomopolymerRepeat (threshold 3), read from getBase so it
+    // works directly in the oriented frame the sparse diffs use.
+    auto isHomopolymer = [&](uint64_t which, uint32_t pos, uint32_t readLen) -> bool {
+        if(readLen == 0 || pos >= readLen) return false;
+        const int64_t threshold = 3;
+        int64_t beg = int64_t(pos) - threshold; if(beg < 0) beg = 0;
+        int64_t end = int64_t(pos) + threshold; if(end >= int64_t(readLen)) end = int64_t(readLen) - 1;
+        const uint8_t center = getBase(which, pos).value;
+        for(int64_t p = beg; p <= end; ++p) {
+            if(p == int64_t(pos)) continue;
+            if(getBase(which, uint32_t(p)).value == center) return true;
+        }
+        return false;
+    };
+
+    // Coalesce runs and walk clipped to [read0Begin, read0End) on read0,
+    // replicating OverlapCigarStore::walkRange. op match(0)/mismatch(1) consume
+    // both reads; ins(2) consumes read0 (query-only); del(3) consumes read1.
+    // Emission mirrors constructQuickRawSparse exactly, including the A*PA2 op
+    // letter stored in sparseIndel.op: query-only gaps are 'D', target-only 'I'.
+    uint64_t xk = read0Anchor;   // read0 forward position
+    uint64_t yk = read1Anchor;   // read1 alignment-orientation position
+
+    // Track read1 boundary aligned to read0End.
+    auto noteBoundaries = [&](uint64_t x, uint64_t y) {
+        if(!haveRead1Start && x >= read0Begin) {
+            cigarRead1Start = uint32_t(y);
+            haveRead1Start = true;
+        }
+    };
+
+    size_t i = 0;
+    while(i < normalizedTokens.size()) {
+        const uint8_t op = normalizedTokens[i].op();
+        uint32_t totalLen = normalizedTokens[i].len();
+        size_t peek = i + 1;
+        while(peek < normalizedTokens.size() && normalizedTokens[peek].op() == op) {
+            totalLen += normalizedTokens[peek].len();
+            ++peek;
+        }
+        i = peek;
+
+        const uint64_t xkEnd = xk + (opConsumesQuery(op)  ? totalLen : 0);
+        const uint64_t ykEnd = yk + (opConsumesTarget(op) ? totalLen : 0);
+
+        if(!opConsumesQuery(op)) {
+            // Deletion (read1-only). Emitted iff its read0 anchor is in range.
+            if(xk >= read0Begin && xk < read0End) {
+                noteBoundaries(xk, yk);
+                sparseIndels.push_back(ProjectedAlignmentSparseIndel{
+                    uint32_t(xk), uint32_t(yk), totalLen, 'I' });
+                if(storeCigar) cigarStore->pushDeletion(totalLen);
+                const bool hp = isHomopolymer(0, uint32_t(xk), read0Len) ||
+                                isHomopolymer(1, uint32_t(yk), read1Len);
+                totalLength[1] += totalLen;
+                totalIndelBaseCount += totalLen;
+                ++totalGapEventCount;
+                totalEditDistance += int64_t(totalLen);
+                nonHomopolymerErrorCount += uint64_t(totalLen) - (hp ? 1ULL : 0ULL);
+                totalDpScore -= gapPenalty(uint64_t(totalLen));
+                if(totalLen >= 6) hasLargeIndel = true;
+                cigarRead1End = uint32_t(ykEnd);
+            }
+        } else if(xkEnd > read0Begin && xk < read0End) {
+            // Match/mismatch or insertion overlapping the range: clip to it.
+            const uint64_t clipStart = (xk < read0Begin) ? uint64_t(read0Begin) : xk;
+            const uint64_t clipEnd   = (xkEnd > read0End) ? uint64_t(read0End) : xkEnd;
+            const uint32_t clipLen   = uint32_t(clipEnd - clipStart);
+            const uint64_t skipBases = clipStart - xk;
+            const uint64_t adjYk = yk + (opConsumesTarget(op) ? skipBases : 0);
+            noteBoundaries(clipStart, adjYk);
+
+            if(op == CigarOpIns) {
+                // Insertion (read0-only). SAM/PAF 'I'; A*PA2 letter 'D'.
+                sparseIndels.push_back(ProjectedAlignmentSparseIndel{
+                    uint32_t(clipStart), uint32_t(adjYk), clipLen, 'D' });
+                if(storeCigar) cigarStore->pushInsertion(clipLen);
+                const bool hp = isHomopolymer(0, uint32_t(clipStart), read0Len) ||
+                                isHomopolymer(1, uint32_t(adjYk), read1Len);
+                totalLength[0] += clipLen;
+                totalIndelBaseCount += clipLen;
+                ++totalGapEventCount;
+                totalEditDistance += int64_t(clipLen);
+                nonHomopolymerErrorCount += uint64_t(clipLen) - (hp ? 1ULL : 0ULL);
+                totalDpScore -= gapPenalty(uint64_t(clipLen));
+                if(clipLen >= 6) hasLargeIndel = true;
+                cigarRead1End = uint32_t(adjYk);
+            } else {
+                // Aligned columns (op is match or mismatch): trust the bases,
+                // not the op label, exactly like constructQuickRawSparse's
+                // M-block. Emit a sparse mismatch per differing column and
+                // accumulate match/mismatch runs for the CIGAR store.
+                uint64_t mismatchHere = 0;
+                uint32_t runStart = 0;
+                bool runIsMismatch = false;
+                for(uint32_t kk = 0; kk < clipLen; ++kk) {
+                    const uint8_t b0 = getBase(0, uint32_t(clipStart + kk)).value;
+                    const uint8_t b1 = getBase(1, uint32_t(adjYk + kk)).value;
+                    const bool isMismatch = (b0 != b1);
+                    if(isMismatch) {
+                        sparseMismatches.push_back(ProjectedAlignmentSparseMismatch{
+                            uint32_t(clipStart + kk), uint32_t(adjYk + kk), b0, b1 });
+                        ++mismatchHere;
+                        if(!isHomopolymer(0, uint32_t(clipStart + kk), read0Len) &&
+                           !isHomopolymer(1, uint32_t(adjYk + kk), read1Len)) {
+                            ++nonHomopolymerErrorCount;
+                        }
+                    }
+                    if(storeCigar) {
+                        if(kk == 0) { runIsMismatch = isMismatch; runStart = 0; }
+                        else if(isMismatch != runIsMismatch) {
+                            cigarStore->pushOp(runIsMismatch ? 1 : 0, kk - runStart);
+                            runIsMismatch = isMismatch; runStart = kk;
+                        }
+                    }
+                }
+                if(storeCigar && clipLen > 0) {
+                    cigarStore->pushOp(runIsMismatch ? 1 : 0, clipLen - runStart);
+                }
+                mismatchCount += mismatchHere;
+                totalEditDistance += int64_t(mismatchHere);
+                totalLength[0] += clipLen;
+                totalLength[1] += clipLen;
+                totalDpScore += match * int64_t(uint64_t(clipLen) - mismatchHere)
+                              + mismatch * int64_t(mismatchHere);
+                cigarRead1End = uint32_t(adjYk + clipLen);
+            }
+        }
+
+        if(xkEnd >= read0End && opConsumesQuery(op)) break;
+        xk = xkEnd;
+        yk = ykEnd;
+    }
+
+    if(storeCigar && cigarOffset != uint32_t(-1)) {
+        cigarTokenCount = cigarStore->tokensSince(cigarOffset);
+        uint64_t consumed0 = 0, consumed1 = 0;
+        cigarStore->forEachOp(cigarOffset, cigarTokenCount, [&](uint8_t op, uint32_t len) {
+            if(opConsumesQuery(op))  consumed0 += len;
+            if(opConsumesTarget(op)) consumed1 += len;
+        });
+        DINARA_ASSERT(consumed0 == totalLength[0]);
+        DINARA_ASSERT(consumed1 == totalLength[1]);
+    }
+
+    return true;
 }
 
 

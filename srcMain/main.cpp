@@ -2368,13 +2368,15 @@ void dinara::main::assemble(
         char* names = nullptr;
         uint64_t* nameOff = nullptr;
         uint64_t nReads = 0;
+        uint16_t* cigar = nullptr;
+        uint64_t cigarLen = 0;
         int rc;
         if(useHifiasmStore) {
             performanceLog << timestamp
                 << "Generating overlaps with hifiasm (in memory) from the "
                 << "loaded read store." << endl;
             rc = hifiasm_detect_overlaps_from_store(
-                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, &cigar, &cigarLen);
         } else {
             performanceLog << timestamp
                 << "Generating overlaps with hifiasm (in memory) from "
@@ -2387,10 +2389,10 @@ void dinara::main::assemble(
             }
             rc = hifiasm_detect_overlaps_mem(
                 readFiles.data(), int(readFiles.size()),
-                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads);
+                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, &cigar, &cigarLen);
         }
         if(rc != 0) {
-            hifiasm_overlaps_mem_free(ov, names, nameOff);
+            hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
             throw runtime_error("hifiasm in-memory overlap detection failed (code "
                 + to_string(rc) + ").");
         }
@@ -2398,8 +2400,8 @@ void dinara::main::assemble(
             << " overlaps over " << nReads << " reads (in memory)." << endl;
 
         assembler.importAlignmentCandidatesFromMemory(
-            ov, nOv, names, nameOff, nReads, threadCount);
-        hifiasm_overlaps_mem_free(ov, names, nameOff);
+            ov, nOv, names, nameOff, nReads, cigar, cigarLen, threadCount);
+        hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
 
         assembler.chainPafCandidates(
             assemblerOptions.overlapCandidatesOptions.driftRateTolerance,
