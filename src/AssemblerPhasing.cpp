@@ -314,20 +314,15 @@ static void detectSnpSites(
                             scratch.mismatchRecords.push_back({qpos, tpos});
                         }
                     }
-                } else if (op == 2 || op == 3) {
-                    // Record query positions consumed by indels.
-                    // op=2 (insertion): yk advances, xk stays.
-                    //   queryIsRead0 → no query consumed (target insertion).
-                    //   !queryIsRead0 → query (yk) consumed.
-                    // op=3 (deletion): xk advances, yk stays.
-                    //   queryIsRead0 → query (xk) consumed.
-                    //   !queryIsRead0 → no query consumed (target deletion).
-                    bool queryConsumed =
-                        (op == 3 && ov.queryIsRead0) ||
-                        (op == 2 && !ov.queryIsRead0);
+                } else if (op == CigarOpIns || op == CigarOpDel) {
+                    // Record query positions consumed by indels. The query read
+                    // (xk if queryIsRead0, else yk) is consumed by this indel
+                    // iff the op consumes that read's sequence.
+                    const bool queryConsumed = ov.queryIsRead0
+                        ? opConsumesQuery(op) : opConsumesTarget(op);
                     if (queryConsumed) {
                         // Query positions in CIGAR coordinates.
-                        const uint32_t rawStart = (op == 3)
+                        const uint32_t rawStart = ov.queryIsRead0
                             ? uint32_t(xk) : uint32_t(yk);
                         const uint32_t rawEnd = std::min(rawStart + len, queryLen);
                         if (rawStart < rawEnd) {
@@ -1485,14 +1480,15 @@ static void phaseLargeIndels(
                 // Map to query position (oriented coordinates).
                 uint32_t qpos = ov.queryIsRead0 ? uint32_t(xk) : uint32_t(yk);
 
-                if (op == 2 || op == 3) { // insertion or deletion
+                if (op == CigarOpIns || op == CigarOpDel) { // insertion or deletion
                     if (indelRunStart == UINT32_MAX) {
                         indelRunStart = qpos;
                     }
-                    // Compute how many query bases this op spans.
-                    // When queryIsRead0: query=xk, op3 (del) advances xk, op2 (ins) doesn't.
-                    // When !queryIsRead0: query=yk, op2 (ins) advances yk, op3 (del) doesn't.
-                    const bool queryAdvances = ov.queryIsRead0 ? (op == 3) : (op == 2);
+                    // How many query bases this op spans: the query read
+                    // (xk if queryIsRead0, else yk) advances iff the op consumes
+                    // that read's sequence.
+                    const bool queryAdvances = ov.queryIsRead0
+                        ? opConsumesQuery(op) : opConsumesTarget(op);
                     indelRunEnd = qpos + (queryAdvances ? len : 0);
                     if (indelRunEnd <= indelRunStart) {
                         indelRunEnd = indelRunStart + 1;

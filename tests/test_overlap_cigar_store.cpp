@@ -27,10 +27,10 @@ static std::pair<uint64_t, uint64_t> consumedBases(
             case 0: // match
             case 1: // mismatch
                 c0 += len; c1 += len; break;
-            case 2: // insertion (extra in read1)
-                c1 += len; break;
-            case 3: // deletion (extra in read0)
+            case 2: // insertion (extra in read0/query)
                 c0 += len; break;
+            case 3: // deletion (extra in read1/target)
+                c1 += len; break;
         }
     });
     return {c0, c1};
@@ -89,19 +89,20 @@ TEST_CASE("Segment case 1: len0=0, len1=0 — no tokens emitted", "[CigarStore]"
 }
 
 // ============================================================================
-// Case 2: len0 > 0, len1 = 0 — deletion
+// Case 2: len0 > 0, len1 = 0 — insertion (query-only, SAM/PAF convention)
 // ============================================================================
 
-TEST_CASE("Segment case 2: len0>0, len1=0 — deletion", "[CigarStore]") {
+TEST_CASE("Segment case 2: len0>0, len1=0 — insertion", "[CigarStore]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
 
+    // read0/query has bases with no read1/target counterpart → insertion.
     uint32_t len0 = 42;
-    store.pushDeletion(len0);
+    store.pushInsertion(len0);
 
     auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
-    REQUIRE(ops[0].first == 3);  // deletion
+    REQUIRE(ops[0].first == 2);  // insertion (op2, query-only)
     REQUIRE(ops[0].second == 42);
 
     auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
@@ -110,19 +111,20 @@ TEST_CASE("Segment case 2: len0>0, len1=0 — deletion", "[CigarStore]") {
 }
 
 // ============================================================================
-// Case 3: len0 = 0, len1 > 0 — insertion
+// Case 3: len0 = 0, len1 > 0 — deletion (target-only, SAM/PAF convention)
 // ============================================================================
 
-TEST_CASE("Segment case 3: len0=0, len1>0 — insertion", "[CigarStore]") {
+TEST_CASE("Segment case 3: len0=0, len1>0 — deletion", "[CigarStore]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
 
+    // read1/target has bases with no read0/query counterpart → deletion.
     uint32_t len1 = 37;
-    store.pushInsertion(len1);
+    store.pushDeletion(len1);
 
     auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 1);
-    REQUIRE(ops[0].first == 2);  // insertion
+    REQUIRE(ops[0].first == 3);  // deletion (op3, target-only)
     REQUIRE(ops[0].second == 37);
 
     auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
@@ -198,11 +200,11 @@ TEST_CASE("Segment case 6: different lengths, with indels", "[CigarStore]") {
     REQUIRE(ops[2] == std::make_pair(uint8_t(3), uint32_t(3)));
     REQUIRE(ops[3] == std::make_pair(uint8_t(0), uint32_t(45)));
 
-    // read0 consumes: 50 (match) + 3 (del) + 45 (match) = 98
-    // read1 consumes: 50 (match) + 2 (ins) + 45 (match) = 97
+    // read0/query consumes: 50 (match) + 2 (ins) + 45 (match) = 97
+    // read1/target consumes: 50 (match) + 3 (del) + 45 (match) = 98
     auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
-    REQUIRE(c0 == 98);
-    REQUIRE(c1 == 97);
+    REQUIRE(c0 == 97);
+    REQUIRE(c1 == 98);
 }
 
 // ============================================================================
@@ -245,21 +247,22 @@ TEST_CASE("Multi-segment stitching: identical + aligned + identical", "[CigarSto
     REQUIRE(ops[5] == std::make_pair(uint8_t(2), uint32_t(3)));
     REQUIRE(ops[6] == std::make_pair(uint8_t(0), uint32_t(397)));
 
-    // Total: read0 = 530+1+39+1+29+397 = 997, read1 = 997+3 = 1000
+    // ins(3) now consumes read0/query (SAM/PAF convention):
+    // read0 = 530+1+39+1+29+3+397 = 1000, read1 = 1000-3 = 997
     auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
-    REQUIRE(c0 == 997);
-    REQUIRE(c1 == 1000);
+    REQUIRE(c0 == 1000);
+    REQUIRE(c1 == 997);
 }
 
-TEST_CASE("Multi-segment: deletion segment between two match segments", "[CigarStore]") {
+TEST_CASE("Multi-segment: indel segment between two match segments", "[CigarStore]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
 
     // Segment 0: identical, 200 bases
     store.pushMatch(200);
 
-    // Segment 1: empty on read1 side (len0=5, len1=0) → deletion
-    store.pushDeletion(5);
+    // Segment 1: empty on read1 side (len0=5, len1=0) → insertion (query-only)
+    store.pushInsertion(5);
 
     // Segment 2: identical, 200 bases
     store.pushMatch(200);
@@ -267,9 +270,10 @@ TEST_CASE("Multi-segment: deletion segment between two match segments", "[CigarS
     auto ops = collectOps(store, off, store.tokensSince(off));
     REQUIRE(ops.size() == 3);
     REQUIRE(ops[0] == std::make_pair(uint8_t(0), uint32_t(200)));
-    REQUIRE(ops[1] == std::make_pair(uint8_t(3), uint32_t(5)));
+    REQUIRE(ops[1] == std::make_pair(uint8_t(2), uint32_t(5)));
     REQUIRE(ops[2] == std::make_pair(uint8_t(0), uint32_t(200)));
 
+    // read0/query consumes the 5 inserted bases; read1/target does not.
     auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
     REQUIRE(c0 == 405);
     REQUIRE(c1 == 400);
@@ -524,17 +528,17 @@ TEST_CASE("forEachOpWithPositions: match + ins + match", "[CigarStore][Positions
     REQUIRE(std::get<2>(ops[0]) == 100);
     REQUIRE(std::get<3>(ops[0]) == 200);
 
-    // ins(3) at r0=150, r1=250 (read0 didn't advance)
+    // ins(3) at r0=150, r1=250 (SAM/PAF: insertion consumes read0/query)
     REQUIRE(std::get<0>(ops[1]) == 2);
     REQUIRE(std::get<1>(ops[1]) == 3);
     REQUIRE(std::get<2>(ops[1]) == 150);
     REQUIRE(std::get<3>(ops[1]) == 250);
 
-    // match(50) at r0=150, r1=253
+    // match(50) at r0=153, r1=250 (read0 advanced past the insertion)
     REQUIRE(std::get<0>(ops[2]) == 0);
     REQUIRE(std::get<1>(ops[2]) == 50);
-    REQUIRE(std::get<2>(ops[2]) == 150);
-    REQUIRE(std::get<3>(ops[2]) == 253);
+    REQUIRE(std::get<2>(ops[2]) == 153);
+    REQUIRE(std::get<3>(ops[2]) == 250);
 }
 
 TEST_CASE("forEachOpWithPositions: match + del + match", "[CigarStore][Positions]") {
@@ -554,17 +558,17 @@ TEST_CASE("forEachOpWithPositions: match + del + match", "[CigarStore][Positions
     REQUIRE(std::get<2>(ops[0]) == 0);
     REQUIRE(std::get<3>(ops[0]) == 0);
 
-    // del(5) at r0=40, r1=40 (read1 doesn't advance)
+    // del(5) at r0=40, r1=40 (SAM/PAF: deletion consumes read1/target)
     REQUIRE(std::get<0>(ops[1]) == 3);
     REQUIRE(std::get<1>(ops[1]) == 5);
     REQUIRE(std::get<2>(ops[1]) == 40);
     REQUIRE(std::get<3>(ops[1]) == 40);
 
-    // match(40) at r0=45, r1=40
+    // match(40) at r0=40, r1=45 (read1 advanced past the deletion)
     REQUIRE(std::get<0>(ops[2]) == 0);
     REQUIRE(std::get<1>(ops[2]) == 40);
-    REQUIRE(std::get<2>(ops[2]) == 45);
-    REQUIRE(std::get<3>(ops[2]) == 40);
+    REQUIRE(std::get<2>(ops[2]) == 40);
+    REQUIRE(std::get<3>(ops[2]) == 45);
 }
 
 // ============================================================================
@@ -582,14 +586,14 @@ TEST_CASE("queryToTarget: positions in match region", "[CigarStore][CoordMap]") 
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 1000, 5000, 1099) == 5099);
 }
 
-TEST_CASE("queryToTarget: position in deletion returns -1", "[CigarStore][CoordMap]") {
+TEST_CASE("queryToTarget: position in insertion returns -1", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
     store.pushMatch(50);
-    store.pushDeletion(10);
+    store.pushInsertion(10);  // query-only: these query bases have no target
     store.pushMatch(50);
 
-    // Position 55 is inside the deletion (read0 positions 50..59).
+    // Position 55 is inside the insertion (read0/query positions 50..59).
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 55) == uint64_t(-1));
     // Position 60 is in the second match block.
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 60) == 50);
@@ -597,16 +601,16 @@ TEST_CASE("queryToTarget: position in deletion returns -1", "[CigarStore][CoordM
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 70) == 60);
 }
 
-TEST_CASE("queryToTarget: insertion shifts target positions", "[CigarStore][CoordMap]") {
+TEST_CASE("queryToTarget: deletion shifts target positions", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
     store.pushMatch(50);
-    store.pushInsertion(5);
+    store.pushDeletion(5);   // target-only: shifts target ahead of query
     store.pushMatch(50);
 
-    // Before insertion: 1:1 mapping.
+    // Before deletion: 1:1 mapping.
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 25) == 25);
-    // After insertion: target is shifted by 5.
+    // After deletion: target is shifted by 5.
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 50) == 55);
     REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 75) == 80);
 }
@@ -621,28 +625,28 @@ TEST_CASE("targetToQuery: positions in match region", "[CigarStore][CoordMap]") 
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 99) == 99);
 }
 
-TEST_CASE("targetToQuery: position in insertion returns -1", "[CigarStore][CoordMap]") {
+TEST_CASE("targetToQuery: position in deletion returns -1", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
     store.pushMatch(50);
-    store.pushInsertion(10);
+    store.pushDeletion(10);  // target-only: these target bases have no query
     store.pushMatch(50);
 
-    // Position 55 is inside the insertion (read1 positions 50..59).
+    // Position 55 is inside the deletion (read1/target positions 50..59).
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 55) == uint64_t(-1));
     // Position 60 is in the second match block.
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 60) == 50);
 }
 
-TEST_CASE("targetToQuery: deletion shifts query positions", "[CigarStore][CoordMap]") {
+TEST_CASE("targetToQuery: insertion shifts query positions", "[CigarStore][CoordMap]") {
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
     store.pushMatch(50);
-    store.pushDeletion(5);
+    store.pushInsertion(5);  // query-only: shifts query ahead of target
     store.pushMatch(50);
 
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 25) == 25);
-    // After deletion: query is shifted by 5.
+    // After insertion: query is shifted by 5.
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 50) == 55);
     REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 75) == 80);
 }
@@ -735,30 +739,32 @@ TEST_CASE("walkRange: insertion within range is reported", "[CigarStore][WalkRan
     store.pushInsertion(5);
     store.pushMatch(50);
 
-    // Walk [40, 60) — should see tail of first match, the insertion, and
-    // start of second match.
+    // Walk query range [40, 60) — insertion consumes query (SAM/PAF), so it
+    // has query width: tail of first match, the insertion, then a shorter
+    // tail of the second match once the query budget is spent by the insertion.
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
     store.walkRange(off, store.tokensSince(off), 0, 0, 40, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
     REQUIRE(ops.size() == 3);
-    // match [40, 50), len=10
+    // match [40, 50) query, len=10, r1=40
     REQUIRE(std::get<0>(ops[0]) == 0);
     REQUIRE(std::get<1>(ops[0]) == 10);
     REQUIRE(std::get<2>(ops[0]) == 40);
+    REQUIRE(std::get<3>(ops[0]) == 40);
 
-    // insertion at r0=50, r1=50, len=5
+    // insertion at r0=50, r1=50, len=5 (advances query 50->55, target stays)
     REQUIRE(std::get<0>(ops[1]) == 2);
     REQUIRE(std::get<1>(ops[1]) == 5);
     REQUIRE(std::get<2>(ops[1]) == 50);
     REQUIRE(std::get<3>(ops[1]) == 50);
 
-    // match [50, 60), len=10, r1=55 (shifted by insertion)
+    // match [55, 60) query, len=5, r1=50 (target resumes where insertion left it)
     REQUIRE(std::get<0>(ops[2]) == 0);
-    REQUIRE(std::get<1>(ops[2]) == 10);
-    REQUIRE(std::get<2>(ops[2]) == 50);
-    REQUIRE(std::get<3>(ops[2]) == 55);
+    REQUIRE(std::get<1>(ops[2]) == 5);
+    REQUIRE(std::get<2>(ops[2]) == 55);
+    REQUIRE(std::get<3>(ops[2]) == 50);
 }
 
 TEST_CASE("walkRange: deletion within range", "[CigarStore][WalkRange]") {
@@ -768,30 +774,32 @@ TEST_CASE("walkRange: deletion within range", "[CigarStore][WalkRange]") {
     store.pushDeletion(5);
     store.pushMatch(50);
 
-    // Walk [45, 60) — tail of first match, deletion, start of second match.
+    // Walk query range [45, 60). Deletion consumes target only (SAM/PAF), so it
+    // has zero query width: tail of first match, the deletion (emitted at its
+    // query anchor), then the full second match within the query budget.
     std::vector<std::tuple<uint8_t, uint32_t, uint64_t, uint64_t>> ops;
     store.walkRange(off, store.tokensSince(off), 0, 0, 45, 60, [&](uint8_t op, uint32_t len, uint64_t r0, uint64_t r1) {
         ops.emplace_back(op, len, r0, r1);
     });
 
     REQUIRE(ops.size() == 3);
-    // match [45, 50), len=5
+    // match [45, 50) query, len=5, r1=45
     REQUIRE(std::get<0>(ops[0]) == 0);
     REQUIRE(std::get<1>(ops[0]) == 5);
     REQUIRE(std::get<2>(ops[0]) == 45);
     REQUIRE(std::get<3>(ops[0]) == 45);
 
-    // deletion [50, 55), len=5, r1 stays at 50
+    // deletion at r0=50, r1=50, len=5 (query anchor 50, advances target 50->55)
     REQUIRE(std::get<0>(ops[1]) == 3);
     REQUIRE(std::get<1>(ops[1]) == 5);
     REQUIRE(std::get<2>(ops[1]) == 50);
     REQUIRE(std::get<3>(ops[1]) == 50);
 
-    // match [55, 60), len=5, r1=50
+    // match [50, 60) query, len=10, r1=55 (target shifted past the deletion)
     REQUIRE(std::get<0>(ops[2]) == 0);
-    REQUIRE(std::get<1>(ops[2]) == 5);
-    REQUIRE(std::get<2>(ops[2]) == 55);
-    REQUIRE(std::get<3>(ops[2]) == 50);
+    REQUIRE(std::get<1>(ops[2]) == 10);
+    REQUIRE(std::get<2>(ops[2]) == 50);
+    REQUIRE(std::get<3>(ops[2]) == 55);
 }
 
 // ============================================================================
@@ -1034,21 +1042,23 @@ TEST_CASE("Realistic overlap: 10 segments with mixed cases", "[CigarStore]") {
     store.pushMatch(1200);
     expected0 += 1200; expected1 += 1200;
 
-    // Seg 3: 2bp insertion in 500 bases (len0=500, len1=502)
+    // Seg 3: 2bp insertion in 500 bases. SAM/PAF: insertion consumes the
+    // query (read0) only, so len0=502, len1=500.
     store.pushMatch(250);
     store.pushInsertion(2);
     store.pushMatch(250);
-    expected0 += 500; expected1 += 502;
+    expected0 += 502; expected1 += 500;
 
     // Seg 4: identical, 900 bases
     store.pushMatch(900);
     expected0 += 900; expected1 += 900;
 
-    // Seg 5: 3bp deletion (len0=403, len1=400)
+    // Seg 5: 3bp deletion. SAM/PAF: deletion consumes the target (read1)
+    // only, so len0=400, len1=403.
     store.pushMatch(200);
     store.pushDeletion(3);
     store.pushMatch(200);
-    expected0 += 403; expected1 += 400;
+    expected0 += 400; expected1 += 403;
 
     // Seg 6: empty segment (len0=0, len1=0) — nothing emitted
 
@@ -1056,8 +1066,8 @@ TEST_CASE("Realistic overlap: 10 segments with mixed cases", "[CigarStore]") {
     store.pushMatch(700);
     expected0 += 700; expected1 += 700;
 
-    // Seg 8: len0=3, len1=0 — pure deletion
-    store.pushDeletion(3);
+    // Seg 8: len0=3, len1=0 — query-only extra → insertion (op2)
+    store.pushInsertion(3);
     expected0 += 3; expected1 += 0;
 
     // Seg 9: identical, 500 bases
@@ -1069,6 +1079,82 @@ TEST_CASE("Realistic overlap: 10 segments with mixed cases", "[CigarStore]") {
     REQUIRE(c1 == expected1);
 
     // Verify total makes sense.
-    REQUIRE(expected0 == 5606);
-    REQUIRE(expected1 == 5602);
+    REQUIRE(expected0 == 5605);
+    REQUIRE(expected1 == 5603);
+}
+
+// ============================================================================
+// hifiasm / SAM convention invariants
+// ============================================================================
+//
+// These pin the op semantics so tokens can flow between hifiasm's bit_extz_t
+// CIGAR and this store with no remapping. hifiasm's authoritative walker
+// (cigar_check in Levenshtein_distance.h) advances the query (p) on op2 and the
+// target (t) on op3 -- the standard SAM/PAF convention. If any of these fail,
+// the store has drifted from hifiasm and a raw token passthrough would silently
+// swap insertions and deletions.
+
+TEST_CASE("Convention: op codes match SAM/PAF (hifiasm bit_extz_t)", "[CigarStore][Convention]") {
+    REQUIRE(CigarOpMatch    == 0);
+    REQUIRE(CigarOpMismatch == 1);
+    REQUIRE(CigarOpIns      == 2);
+    REQUIRE(CigarOpDel      == 3);
+}
+
+TEST_CASE("Convention: op query/target consumption matches hifiasm", "[CigarStore][Convention]") {
+    // Match and mismatch consume both reads.
+    REQUIRE(opConsumesQuery(CigarOpMatch));
+    REQUIRE(opConsumesTarget(CigarOpMatch));
+    REQUIRE(opConsumesQuery(CigarOpMismatch));
+    REQUIRE(opConsumesTarget(CigarOpMismatch));
+
+    // Insertion (op2) consumes the query (read0) only -- hifiasm op2 advances p.
+    REQUIRE(opConsumesQuery(CigarOpIns));
+    REQUIRE_FALSE(opConsumesTarget(CigarOpIns));
+
+    // Deletion (op3) consumes the target (read1) only -- hifiasm op3 advances t.
+    REQUIRE_FALSE(opConsumesQuery(CigarOpDel));
+    REQUIRE(opConsumesTarget(CigarOpDel));
+}
+
+TEST_CASE("Convention: pushInsertion/pushDeletion emit SAM/PAF op codes", "[CigarStore][Convention]") {
+    OverlapCigarStore store;
+    uint32_t off = store.beginAlignment();
+    store.pushInsertion(4);
+    store.pushDeletion(7);
+    auto ops = collectOps(store, off, store.tokensSince(off));
+    REQUIRE(ops.size() == 2);
+    REQUIRE(ops[0].first == CigarOpIns); // 2
+    REQUIRE(ops[1].first == CigarOpDel); // 3
+
+    // Insertion consumes query only; deletion consumes target only.
+    auto [c0, c1] = consumedBases(store, off, store.tokensSince(off));
+    REQUIRE(c0 == 4); // query: 4 inserted bases
+    REQUIRE(c1 == 7); // target: 7 deleted bases
+}
+
+TEST_CASE("Convention: raw hifiasm token span matches coordinates", "[CigarStore][Convention]") {
+    // A CIGAR taken straight from hifiasm PAF output (cg:Z:), e.g. an overlap
+    // with q span 12 and t span 11. Tokens are pushed with NO remapping, exactly
+    // as a hifiasm passthrough would: 5= 1I 4= 1D 2= means
+    //   query = 5 + 1(ins) + 4 + 2 = 12
+    //   target = 5 + 4 + 1(del) + 2 = 12 ... plus the extra checked below.
+    OverlapCigarStore store;
+    uint32_t off = store.beginAlignment();
+    store.pushMatch(5);
+    store.pushInsertion(1); // hifiasm 'I' = query-only
+    store.pushMatch(4);
+    store.pushDeletion(1);  // hifiasm 'D' = target-only
+    store.pushMatch(2);
+
+    auto [q, t] = consumedBases(store, off, store.tokensSince(off));
+    REQUIRE(q == 5 + 1 + 4 + 2); // 12: matches + insertion
+    REQUIRE(t == 5 + 4 + 1 + 2); // 12: matches + deletion
+
+    // queryToTarget / targetToQuery agree with the walked coordinates.
+    // Query position inside the insertion has no target counterpart.
+    REQUIRE(store.queryToTarget(off, store.tokensSince(off), 0, 0, 5) == uint64_t(-1));
+    // Target position inside the deletion has no query counterpart.
+    // Deletion sits at target offset 5+4 = 9.
+    REQUIRE(store.targetToQuery(off, store.tokensSince(off), 0, 0, 9) == uint64_t(-1));
 }

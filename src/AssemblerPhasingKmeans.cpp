@@ -385,10 +385,14 @@ static void kmParseCigars(
                         }
                         scratch.digars.push_back({bbPos, KmVarType::Snp, altBase, 1, {}});
                     }
-                } else if (op == 2 || op == 3) { // Ins/Del
-                    bool bbConsumed = (op==3 && qIsR0) || (op==2 && !qIsR0);
+                } else if (op == CigarOpIns || op == CigarOpDel) { // Ins/Del
+                    // Backbone read (xk if qIsR0, else yk) consumed by this indel
+                    // iff the op consumes that read's sequence → deletion on the
+                    // backbone; otherwise an insertion at a backbone position.
+                    const bool bbConsumed = qIsR0 ? opConsumesQuery(op)
+                                                  : opConsumesTarget(op);
                     if (bbConsumed) {
-                        uint32_t raw = (op==3) ? uint32_t(xk) : uint32_t(yk);
+                        uint32_t raw = qIsR0 ? uint32_t(xk) : uint32_t(yk);
                         uint32_t rawE = (raw + len < backboneLen) ? raw + len : backboneLen;
                         uint32_t s, e;
                         if (needsRc) { s = backboneLen - rawE; e = backboneLen - raw; }

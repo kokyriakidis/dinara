@@ -316,14 +316,13 @@ static void cwParseCigarForOverlap(
         ad.qs, cwCigarRead1Start(assembler, ad),
         [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
             // Update coverage range for backbone-consuming ops.
-            // Op 0/1 (match/mismatch): both reads consumed.
-            // Op 3: only read0 (xk) consumed — backbone-consuming iff bbIsRead0.
-            // Op 2: only read1 (yk) consumed — backbone-consuming iff !bbIsRead0.
-            if (op == 0 || op == 1) {
+            // Match/mismatch consume both reads; an indel consumes exactly one.
+            // The backbone read (xk if bbIsRead0, else yk) is consumed when the
+            // op consumes that read's sequence (query for read0, target for read1).
+            const bool bbConsumed = bbIsRead0 ? opConsumesQuery(op)
+                                              : opConsumesTarget(op);
+            if (bbConsumed) {
                 uint32_t bbRaw = bbIsRead0 ? uint32_t(xk) : uint32_t(yk);
-                updateCovRange(bbRaw, len);
-            } else if ((op == 3 && bbIsRead0) || (op == 2 && !bbIsRead0)) {
-                uint32_t bbRaw = (op == 3) ? uint32_t(xk) : uint32_t(yk);
                 updateCovRange(bbRaw, len);
             }
 
@@ -361,11 +360,15 @@ static void cwParseCigarForOverlap(
 
                     variants.push_back({bbPos, KmVarType::Snp, altBase, 1, {}});
                 }
-            } else if (op == 2 || op == 3) { // Ins/Del
-                bool bbConsumed = (op == 3 && bbIsRead0) || (op == 2 && !bbIsRead0);
-                if (bbConsumed) {
+            } else if (op == CigarOpIns || op == CigarOpDel) { // Ins/Del
+                // Backbone read is consumed by this indel iff the op consumes
+                // that read's sequence. If so it is a deletion relative to the
+                // backbone; otherwise it is an insertion at a backbone position.
+                const bool bbIndelConsumed = bbIsRead0 ? opConsumesQuery(op)
+                                                       : opConsumesTarget(op);
+                if (bbIndelConsumed) {
                     // Deletion on backbone
-                    uint32_t raw = (op == 3) ? uint32_t(xk) : uint32_t(yk);
+                    uint32_t raw = bbIsRead0 ? uint32_t(xk) : uint32_t(yk);
                     uint32_t rawE = min(raw + len, backboneLen);
                     uint32_t s, e;
                     if (needsRc) { s = backboneLen - rawE; e = backboneLen - raw; }
@@ -382,7 +385,9 @@ static void cwParseCigarForOverlap(
                         deletionRanges.push_back({s, e});
                     }
                 } else {
-                    // Insertion at backbone position
+                    // Insertion at backbone position. The backbone read is NOT
+                    // consumed, so its position is the insertion anchor; the
+                    // inserted bases come from the other (target) read.
                     uint32_t anchor = bbIsRead0 ? uint32_t(xk) : uint32_t(yk);
                     if (needsRc) anchor = backboneLen - anchor;
                     if (mirrorBb) anchor = backboneLen - 1 - anchor;

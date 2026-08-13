@@ -285,8 +285,9 @@ TEST_CASE("CIGAR walk: indels advance only one coordinate",
           "[phasing][coordinates][indels]")
 {
     // CIGAR: match(10), insertion(3), match(10), deletion(5), match(10)
-    // Insertion: yk advances by 3, xk stays.
-    // Deletion: xk advances by 5, yk stays.
+    // SAM/PAF convention:
+    //   Insertion: xk (query) advances by 3, yk stays.
+    //   Deletion:  yk (target) advances by 5, xk stays.
     OverlapCigarStore store;
     uint32_t off = store.beginAlignment();
     store.pushMatch(10);
@@ -305,19 +306,20 @@ TEST_CASE("CIGAR walk: indels advance only one coordinate",
 
     REQUIRE(events.size() == 5);
 
-    // After match(10): xk=110, yk=210
+    // Event positions are the op's start coordinates.
+    // match(10) at xk=100,yk=200 → ends xk=110, yk=210
     CHECK(events[1].xk == 110); CHECK(events[1].yk == 210);
-    // After insertion(3): xk=110 (unchanged), yk=213
-    CHECK(events[2].xk == 110); CHECK(events[2].yk == 213);
-    // After match(10): xk=120, yk=223
-    CHECK(events[3].xk == 120); CHECK(events[3].yk == 223);
-    // After deletion(5): xk=125 (advanced), yk=223 (unchanged)
-    CHECK(events[4].xk == 125); CHECK(events[4].yk == 223);
-    // Final: xk=135, yk=233
+    // insertion(3) at xk=110,yk=210 → xk advances to 113, yk unchanged
+    CHECK(events[2].xk == 113); CHECK(events[2].yk == 210);
+    // match(10) at xk=113,yk=210 → ends xk=123, yk=220
+    CHECK(events[3].xk == 123); CHECK(events[3].yk == 220);
+    // deletion(5) at xk=123,yk=220 → yk advances to 225, xk unchanged
+    CHECK(events[4].xk == 123); CHECK(events[4].yk == 225);
+    // Final: match(10) at xk=123,yk=225 → xk=133, yk=235
     uint64_t finalXk = events[4].xk + events[4].len;
     uint64_t finalYk = events[4].yk + events[4].len;
-    CHECK(finalXk == 135);
-    CHECK(finalYk == 233);
+    CHECK(finalXk == 133);
+    CHECK(finalYk == 235);
 }
 // ============================================================================
 // Integration test: full pipeline, verify CIGAR bases match read sequences
@@ -760,8 +762,8 @@ TEST_CASE("Integration: ad.ts stores marker-based forward coords, RC conversion 
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
                 if (yk < minYk) minYk = yk;
                 uint64_t ykEnd = yk;
-                if (op == 0 || op == 1) ykEnd += len;
-                else if (op == 2) ykEnd += len; // insertion advances yk
+                // Target (yk) advances on match/mismatch and deletion (op3).
+                if (opConsumesTarget(op)) ykEnd += len;
                 if (ykEnd > maxYk) maxYk = ykEnd;
             });
 
@@ -778,8 +780,7 @@ TEST_CASE("Integration: ad.ts stores marker-based forward coords, RC conversion 
             [&](uint8_t op, uint32_t len, uint64_t xk, uint64_t yk) {
                 if (yk < wrongMinYk) wrongMinYk = yk;
                 uint64_t ykEnd = yk;
-                if (op == 0 || op == 1) ykEnd += len;
-                else if (op == 2) ykEnd += len;
+                if (opConsumesTarget(op)) ykEnd += len;
                 if (ykEnd > wrongMaxYk) wrongMaxYk = ykEnd;
             });
 

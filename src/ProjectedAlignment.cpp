@@ -340,10 +340,12 @@ void ProjectedAlignment::constructQuickRawSparse()
         totalLength[1] += len1;
 
         // Empty segments: emit indel for CIGAR consistency if needed.
+        // read0 is the query, read1 is the target (SAM/PAF convention):
+        // query-only bases are an insertion, target-only bases a deletion.
         if(len0 == 0 || len1 == 0) {
             if(storeCigar) {
-                if(len0 > 0) cigarStore->pushDeletion(len0);
-                else if(len1 > 0) cigarStore->pushInsertion(len1);
+                if(len0 > 0) cigarStore->pushInsertion(len0);
+                else if(len1 > 0) cigarStore->pushDeletion(len1);
             }
             continue;
         }
@@ -438,7 +440,9 @@ void ProjectedAlignment::constructQuickRawSparse()
                     uint32_t(begin1 + uint32_t(position1)),
                     uint32_t(currentVal), 'D'
                 });
-                if(storeCigar) cigarStore->pushDeletion(uint32_t(currentVal));
+                // A*PA2 'D' consumes read0/query, which in SAM/PAF terms is an
+                // insertion (query bases absent from the target).
+                if(storeCigar) cigarStore->pushInsertion(uint32_t(currentVal));
                 const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
                                 ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position0 += currentVal;
@@ -454,7 +458,9 @@ void ProjectedAlignment::constructQuickRawSparse()
                     uint32_t(begin1 + uint32_t(position1)),
                     uint32_t(currentVal), 'I'
                 });
-                if(storeCigar) cigarStore->pushInsertion(uint32_t(currentVal));
+                // A*PA2 'I' consumes read1/target, which in SAM/PAF terms is a
+                // deletion (target bases absent from the query).
+                if(storeCigar) cigarStore->pushDeletion(uint32_t(currentVal));
                 const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
                                 ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position1 += currentVal;

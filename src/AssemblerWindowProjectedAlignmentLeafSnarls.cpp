@@ -267,9 +267,13 @@ bool buildSparseEvidenceFromCigar(
                         snps.push_back(SparseSnp{bbPos, base, readPos});
                     }
                 }
-            } else if (op == 2 || op == 3) {
-                const bool insInTarget = (op == 2 && bbIsRead0) || (op == 3 && !bbIsRead0);
-                if (!insInTarget) { // deletion in target: backbone-consuming
+            } else if (op == CigarOpIns || op == CigarOpDel) {
+                // Backbone read (xk if bbIsRead0, else yk) consumed by this indel
+                // iff the op consumes that read's sequence → deletion on the
+                // backbone. Otherwise it is an insertion relative to the backbone.
+                const bool bbConsumed = bbIsRead0 ? opConsumesQuery(op)
+                                                  : opConsumesTarget(op);
+                if (bbConsumed) { // deletion on backbone: backbone-consuming
                     const uint32_t bbRawStart = bbIsRead0 ? xk : yk;
                     const uint32_t bbRawEnd = std::min(bbRawStart + len, backboneLen);
                     const auto [bbLo, bbHi] = bbTransformRange(bbRawStart, bbRawEnd);
