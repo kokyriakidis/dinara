@@ -299,9 +299,15 @@ public:
     // header here) and hifiasmSampleDist enable hifiasm's overlap-path minimizer
     // filters on the hifiasm path; both are ignored when useHifiasm is false or
     // hifiasmFilter is null. The caller owns hifiasmFilter.
+    // k/w are the marker-encoding k-mer length and window dinara stores. On the
+    // hifiasm path, sketchK/sketchW select the k/w hifiasm uses to PICK
+    // minimizer positions (its tuned k=w=51); dinara then encodes its own
+    // k-mer at each picked position. Pass sketchK/sketchW <= 0 to reuse k/w
+    // (the previous behavior). Ignored on the simd path.
     void findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
         bool useHifiasm = true,
-        const void* hifiasmFilter = nullptr, int hifiasmSampleDist = 0);
+        const void* hifiasmFilter = nullptr, int hifiasmSampleDist = 0,
+        int sketchK = 0, int sketchW = 0);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 
@@ -2616,8 +2622,16 @@ private:
     void findMarkersSimdMinimizersPass2(size_t threadId);
     class FindMarkersSimdMinimizersData {
     public:
-         int k;
-         int w; // window size for minimizers
+         int k; // marker-encoding k: the k-mer length dinara stores/indexes
+         int w; // window size for minimizers (marker path / simd backend)
+         // Position-selection k/w used by hifiasm's no-HPC sketcher. hifiasm is
+         // tuned for k=w=51, so we let it pick minimizer POSITIONS at 51 and
+         // then encode dinara's k-mer (k above, e.g. 50) at those same
+         // positions: the 50-mer at offset p is the prefix of the 51-mer at p,
+         // so the position is identical and no realignment is needed. Ignored on
+         // the non-hifiasm (simd) path, which sketches at k/w directly.
+         int sketchK = 0; // <=0 -> fall back to k
+         int sketchW = 0; // <=0 -> fall back to w
          bool useHifiasm = false; // use hifiasm's no-HPC sketcher as position source
          // Optional hifiasm overlap-path minimizer filter. When non-null, the
          // hifiasm sketch applies this high-occurrence k-mer filter plus

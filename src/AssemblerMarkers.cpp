@@ -316,8 +316,10 @@ void Assembler::findMarkersSimdClosedSyncmersPass2(size_t /* threadId */)
 static size_t getMinimizerMarkersForRead(
     ReadId readId,
     const Reads& reads,
-    int k,
-    int w,
+    int k,          // marker-encoding k-mer length (what dinara stores/indexes)
+    int w,          // window for the simd backend
+    int sketchK,    // hifiasm position-selection k (its tuned 51)
+    int sketchW,    // hifiasm position-selection w (its tuned 51)
     bool useHifiasm,
     SimdSketcher* sketcher,
     hifiasm_sketch_ctx_t* hifiasmCtx,
@@ -332,7 +334,11 @@ static size_t getMinimizerMarkersForRead(
     const LongBaseSequenceView read = reads.getRead(readId);
     const uint64_t baseCount = read.baseCount;
 
-    if(baseCount < uint64_t(k)) {
+    // A read must be long enough for BOTH the encoding k-mer and, on the
+    // hifiasm path, the (longer) selection k-mer. Using the max avoids sketching
+    // a read that can't host a full selection k-mer.
+    const int minLen = useHifiasm ? std::max(k, sketchK) : k;
+    if(baseCount < uint64_t(minLen)) {
         return 0;
     }
 
@@ -347,9 +353,14 @@ static size_t getMinimizerMarkersForRead(
         // hifiasm sketcher (no-HPC) via a reusable per-thread context, so
         // steady-state sketching does no per-read heap allocation. The context
         // returns START positions already sorted and deduplicated, so the
-        // std::sort/std::unique below is skipped on this path. We take only the
-        // positions and let the shared tail re-extract the real canonical
-        // KmerId, so the marker/index representation is unchanged.
+        // std::sort/std::unique below is skipped on this path.
+        //
+        // Position selection runs at hifiasm's tuned sketchK/sketchW (=51), the
+        // same k/w it uses to seed overlaps, so marker seeds match overlap
+        // seeds. dinara then encodes its own k-mer (length k, e.g. 50) at each
+        // returned position in the shared tail below: a 51-mer at offset p has
+        // dinara's 50-mer as its prefix, so the position is identical and no
+        // realignment is needed.
         const hifiasm_minimizer_t* mz = nullptr;
         int n = 0;
         // When a filter is supplied, use the overlap-parity variant: it applies
@@ -358,10 +369,10 @@ static size_t getMinimizerMarkersForRead(
         // detection. Otherwise fall back to the plain unfiltered sketch.
         const int rc = hifiasmFilter ?
             hifiasm_sketch_minimizers_ctx_filtered(
-                hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
+                hifiasmCtx, readSequence.c_str(), int(baseCount), sketchW, sketchK,
                 /*is_hpc*/ 0, hifiasmFilter, hifiasmSampleDist, &mz, &n) :
             hifiasm_sketch_minimizers_ctx(
-                hifiasmCtx, readSequence.c_str(), int(baseCount), w, k,
+                hifiasmCtx, readSequence.c_str(), int(baseCount), sketchW, sketchK,
                 /*is_hpc*/ 0, &mz, &n);
         if(rc != 0) {
             // Treat a sketch failure as "no markers" rather than aborting the
@@ -426,26 +437,37 @@ static size_t getMinimizerMarkersForRead(
 }
 
 void Assembler::findMarkersSimdMinimizers(uint64_t threadCount, int k, int w,
-    bool useHifiasm, const void* hifiasmFilter, int hifiasmSampleDist)
+    bool useHifiasm, const void* hifiasmFilter, int hifiasmSampleDist,
+    int sketchK, int sketchW)
 {
     reads->checkReadsAreOpen();
 
     // The hifiasm overlap-path filter only applies on the hifiasm sketch path.
     const bool useFilter = useHifiasm && (hifiasmFilter != nullptr);
 
+    // Effective position-selection k/w on the hifiasm path (fall back to k/w).
+    const int effSketchK = (useHifiasm && sketchK > 0) ? sketchK : k;
+    const int effSketchW = (useHifiasm && sketchW > 0) ? sketchW : w;
+
     performanceLog << timestamp << "Finding markers using "
         << (useHifiasm ? "hifiasm (no-HPC)" : "SIMD") << " minimizers (k=" << k
         << ", w=" << w << ")"
+        << (useHifiasm && (effSketchK != k || effSketchW != w) ?
+            " selecting positions at hifiasm k=w=" + std::to_string(effSketchK) : "")
         << (useFilter ? " with overlap-path filter (sampleDist=" : "")
         << (useFilter ? std::to_string(hifiasmSampleDist) : "")
         << (useFilter ? ")" : "")
         << " in " << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
-    // Store parameters.
+    // Store parameters. assemblerInfo->k is the marker-encoding k (what the rest
+    // of the pipeline indexes with); the selection k/w only affect which
+    // positions the hifiasm sketch picks.
     assemblerInfo->k = k;
     findMarkersSimdMinimizersData.k = k;
     findMarkersSimdMinimizersData.w = w;
+    findMarkersSimdMinimizersData.sketchK = effSketchK;
+    findMarkersSimdMinimizersData.sketchW = effSketchW;
     findMarkersSimdMinimizersData.useHifiasm = useHifiasm;
     findMarkersSimdMinimizersData.hifiasmFilter = useFilter ? hifiasmFilter : nullptr;
     findMarkersSimdMinimizersData.hifiasmSampleDist = useFilter ? hifiasmSampleDist : 0;
@@ -508,6 +530,11 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
     const int k = findMarkersSimdMinimizersData.k;
     const int w = findMarkersSimdMinimizersData.w;
     const bool useHifiasm = findMarkersSimdMinimizersData.useHifiasm;
+    // Position-selection k/w for the hifiasm sketch (fall back to k/w).
+    const int sketchK = findMarkersSimdMinimizersData.sketchK > 0 ?
+        findMarkersSimdMinimizersData.sketchK : k;
+    const int sketchW = findMarkersSimdMinimizersData.sketchW > 0 ?
+        findMarkersSimdMinimizersData.sketchW : w;
     const hifiasm_filter_t* hifiasmFilter =
         static_cast<const hifiasm_filter_t*>(findMarkersSimdMinimizersData.hifiasmFilter);
     const int hifiasmSampleDist = findMarkersSimdMinimizersData.hifiasmSampleDist;
@@ -528,8 +555,8 @@ void Assembler::findMarkersSimdMinimizersPass1(size_t /* threadId */)
             std::vector<std::pair<uint32_t, KmerId>>& staged =
                 findMarkersSimdMinimizersData.stagedMarkers[readId];
             getMinimizerMarkersForRead(
-                readId, *reads, k, w, useHifiasm, sketcher, hifiasmCtx,
-                hifiasmFilter, hifiasmSampleDist,
+                readId, *reads, k, w, sketchK, sketchW, useHifiasm, sketcher,
+                hifiasmCtx, hifiasmFilter, hifiasmSampleDist,
                 kmerChecker, readSequence, positionBuffer, &staged);
 
             const uint64_t count64 = staged.size();
