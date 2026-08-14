@@ -27,7 +27,6 @@
 #include "OrientedUnitigId.hpp"
 
 #include "ReadId.hpp"
-#include "AlignedEvidenceStore.hpp"
 #include "OverlapCigarStore.hpp"
 #include "HifiasmImportedCigarStore.hpp"
 #include "dinaraTypes.hpp"
@@ -369,228 +368,6 @@ public:
         uint64_t threadCount
     );
 
-    class GlobalMismatchSiteClusters {
-    public:
-        // Unique nodes, each a (readId, position) pair in read forward coordinates.
-        vector< pair<ReadId, uint32_t> > nodes;
-
-        // Cluster representatives (indices into nodes).
-        vector<uint64_t> clusterRepresentatives;
-
-        // Cluster membership in CSR-like form:
-        // members for cluster k are clusterMembers[clusterMemberOffsets[k] .. clusterMemberOffsets[k+1]).
-        vector<uint64_t> clusterMemberOffsets;
-        vector<uint64_t> clusterMembers;
-
-        // Allele counts for each cluster, in Base value order (A,C,G,T => 0..3).
-        vector< array<uint32_t, 4> > alleleCounts;
-
-        // If alleleCounts have been updated using transitive (match-including) coverage.
-        // Same length as alleleCounts.
-        vector<uint8_t> alleleCountsAreTransitive;
-
-        // If alleleCountsAreTransitive[clusterId]=1, this stores the number of reads/positions
-        // that contributed to the transitive site count for that cluster.
-        // Same length as alleleCounts.
-        vector<uint32_t> transitiveSiteMemberCounts;
-    };
-
-    // Cluster mismatching (SNP) read positions into transitive "global sites".
-    // This computes ProjectedAlignment for each stored overlap and unions the paired mismatch
-    // positions (read0,pos0) <-> (read1,pos1) into connected components.
-    GlobalMismatchSiteClusters clusterMismatchingPositionsIntoGlobalHetSites(
-        const AlignOptions& alignOptions,
-        uint64_t threadCount,
-        bool includeDeletedAlignments = false,
-        bool readGraphOnly = false
-    ) const;
-
-    // Like clusterMismatchingPositionsIntoGlobalHetSites, but only explores the connected component
-    // reachable from the given seed read using alignmentTable, optionally with exploration limits.
-    // Intended for fast debugging/printing (for example, sites involving read 0).
-    GlobalMismatchSiteClusters clusterMismatchingPositionsIntoGlobalHetSitesReachableFromRead(
-        ReadId seedReadId,
-        const AlignOptions& alignOptions,
-        uint64_t threadCount,
-        uint64_t maxReadsToProcess = 0,
-        uint64_t maxAlignmentsToProcess = 0,
-        bool includeDeletedAlignments = false,
-        bool readGraphOnly = false
-    ) const;
-
-    class TransitiveHetSiteCoverage {
-    public:
-        // Members as (readId, position) in forward coordinates. This can include reads
-        // that match at the site (no mismatch token), discovered transitively using overlaps.
-        vector< pair<ReadId, uint32_t> > members;
-
-        // Allele counts over members, in Base value order (A,C,G,T => 0..3).
-        array<uint32_t, 4> alleleCounts{0, 0, 0, 0};
-
-        // Debug/performance counters.
-        uint64_t alignmentsScanned = 0;
-        uint64_t mappingHoles = 0;       // positions falling in deletions
-        uint64_t mappingConflicts = 0;   // same read mapped to different positions
-        bool hitNodeLimit = false;
-        bool hitAlignmentLimit = false;
-    };
-
-    // Starting from a (readId, position) site seed, traverse overlaps transitively and
-    // map the position across reads using only the sparse indel evidence (plus stored anchors).
-    // This can be used to accumulate per-site allele counts across reads that do not directly
-    // mismatch each other (simulating reference mapping in a de novo setting).
-    TransitiveHetSiteCoverage gatherTransitiveHetSiteCoverage(
-        ReadId seedReadId,
-        uint32_t seedPosition,
-        const AlignOptions& alignOptions,
-        uint64_t maxNodesToVisit = 0,
-        uint64_t maxAlignmentsToScan = 0,
-        bool includeDeletedAlignments = false
-    ) const;
-
-    class GlobalHetSiteAlleleMembers {
-    public:
-        class Member {
-        public:
-            ReadId readId = invalidReadId;
-            uint32_t position = 0;
-        };
-
-        // All members, grouped by (siteId, allele) where allele is in Base order A,C,G,T.
-        vector<Member> members;
-
-        // Offsets per site:
-        // offsets[siteId] = {beginA, beginC, beginG, beginT, end}.
-        vector< array<uint64_t, 5> > offsets;
-
-        // Debug/performance counters.
-        uint64_t propagatedAssignments = 0; // total unique (siteId,readId) assignments
-        uint64_t mappingHoles = 0;          // positions falling in deletions
-        uint64_t mappingConflicts = 0;      // same (siteId,readId) mapped to different positions
-    };
-
-    class GlobalHetSiteOrientedAlleleMembers {
-    public:
-        class Member {
-        public:
-            OrientedReadId orientedReadId;
-            uint32_t position = 0; // Position on orientedReadId, 0-based.
-        };
-
-        // All members, grouped by (siteId, allele) where allele is in Base order A,C,G,T
-        // in the oriented coordinate frame.
-        vector<Member> members;
-
-        // Offsets per site:
-        // offsets[siteId] = {beginA, beginC, beginG, beginT, end}.
-        vector< array<uint64_t, 5> > offsets;
-    };
-
-    // Compute full per-allele member lists for mismatch-defined global sites using only read-graph overlaps.
-    // This starts from mismatch cluster members as seeds and propagates site positions transitively across
-    // readGraph edges (alignmentData.info.isInReadGraph), mapping positions with sparse indels + marker anchors.
-    // If seedReadId is specified, only sites containing that read are seeded and each such site is seeded from
-    // a single position on that read (minimum observed position in the mismatch cluster).
-    GlobalHetSiteAlleleMembers computeGlobalHetSiteAlleleMembersUsingReadGraph(
-        const GlobalMismatchSiteClusters& clusters,
-        const AlignOptions& alignOptions,
-        uint64_t maxPendingTasks = 0,
-        bool includeDeletedAlignments = false,
-        ReadId seedReadId = invalidReadId
-    ) const;
-
-    class GlobalHetSitePositionVerificationStats {
-    public:
-        uint32_t siteId = 0;
-        uint64_t expectedMembers = 0;
-        uint64_t reachedMembers = 0;
-        uint64_t checkedMappings = 0;
-        uint64_t mismatchedPositions = 0;
-        uint64_t mappingHoles = 0;
-        uint64_t mappingFailures = 0;
-        bool hitNodeLimit = false;
-        bool hitAlignmentLimit = false;
-    };
-
-    // Debug/diagnostic: verify that the per-read positions assigned to a given siteId are reachable
-    // and consistent via readGraph-only overlaps, starting from the mismatch seeds of that site.
-    GlobalHetSitePositionVerificationStats debugVerifyGlobalHetSitePositionsUsingReadGraph(
-        const GlobalMismatchSiteClusters& clusters,
-        const GlobalHetSiteAlleleMembers& members,
-        uint32_t siteId,
-        const AlignOptions& alignOptions,
-        uint64_t maxNodesToVisit = 0,
-        uint64_t maxAlignmentsToScan = 0,
-        bool includeDeletedAlignments = false
-    ) const;
-
-    class GlobalHetSiteReadIndex {
-    public:
-        class ReadSite {
-        public:
-            uint32_t siteId = 0;
-            uint32_t readPosition = 0;
-            uint8_t allele = 0; // Base value: A,C,G,T => 0..3
-        };
-
-        // Per-site propagated support counts in forward coordinates.
-        // Indexed by siteId, in Base order A,C,G,T.
-        vector< array<uint32_t, 4> > siteAlleleCounts;
-
-        // Per-site pass flag after filtering.
-        vector<uint8_t> sitePassesFilter;
-
-        // Per-read, sorted by readPosition then siteId.
-        // Contains only filtered, per-read-consistent site memberships.
-        vector< vector<ReadSite> > sitesByRead;
-
-        // Summary counters.
-        uint64_t keptSiteCount = 0;
-        uint64_t droppedAmbiguousReadSiteCount = 0;
-        uint64_t droppedInvalidReadSiteCount = 0;
-    };
-
-    // Build a read-centric index of filtered global het sites from propagated members.
-    // Site filter: keep sites with at least minAllelesWithMinSupport alleles having support
-    // >= minAlleleSupport. Read-site filter: for a given (read,site), keep only if all
-    // candidate entries agree on both position and allele; otherwise drop that read-site.
-    GlobalHetSiteReadIndex buildFilteredGlobalHetSiteReadIndex(
-        const GlobalHetSiteAlleleMembers& members,
-        uint32_t minAlleleSupport = 3,
-        uint32_t minAllelesWithMinSupport = 2
-    ) const;
-
-    // Return a strand assignment (0/1) for reads reachable from a seed read using readGraph-only overlaps.
-    // For each kept overlap between reads r0 and r1, we enforce:
-    //   strand[r1] = strand[r0] XOR (isSameStrand ? 0 : 1).
-    // Unreachable reads get -1. Conflicts are counted when an already-assigned read is implied to
-    // have the opposite strand via a different path (can happen in repetitive regions).
-    vector<int8_t> computeReadGraphStrandsFromSeed(
-        ReadId seedReadId,
-        uint64_t& conflicts,
-        bool includeDeletedAlignments = false
-    ) const;
-
-    // Convert forward-coordinate allele members to an oriented coordinate frame using a read->strand assignment.
-    // For strand==1, positions are flipped as (len-1)-pos and alleles are complemented.
-    GlobalHetSiteOrientedAlleleMembers orientGlobalHetSiteAlleleMembers(
-        const GlobalHetSiteAlleleMembers& forwardMembers,
-        const vector<int8_t>& strandByRead
-    ) const;
-
-    // Update per-cluster allele counts using transitive site coverage (includes matching reads).
-    // This does not change cluster membership (clusters are still defined by mismatch connectivity),
-    // it only updates clusters.alleleCounts based on the transitive mapper.
-    void updateGlobalMismatchSiteClusterAlleleCountsWithTransitiveCoverage(
-        GlobalMismatchSiteClusters& clusters,
-        const AlignOptions& alignOptions,
-        uint64_t maxNodesToVisitPerSite = 0,
-        uint64_t maxAlignmentsToScanPerSite = 0,
-        ReadId restrictToClustersInvolvingRead = invalidReadId,
-        uint64_t maxClustersToUpdate = 0,
-        bool includeDeletedAlignments = false
-    ) const;
-
     // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
     void performPhasing(uint64_t threadCount);
     void accessAlignmentData();
@@ -834,7 +611,7 @@ public:
     // Detects clean het sites from CIGAR walks, phases overlaps via k-means,
     // identifies noisy regions for future targeted MSA refinement.
     // isOnt: enables ONT-specific Fisher exact strand bias filter.
-    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false, bool useEvidenceStore = false);
+    void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false);
 
     // POA-based overlap phasing using Theseus MSA on anchor windows.
     // Requires shasta2Anchors and shasta2Journeys to be populated.
@@ -856,8 +633,7 @@ public:
     // Debug: aggregate SNP sites for one read; print only positions where both
     // ref and alt alleles have at least minSupport supporting alignments.
     void debugDumpSnpSitesForRead(uint64_t readId, uint32_t minSupport = 3);
-    // Experimental global-site based phasing/EC pass.
-    void performGlobalSiteECParity(uint64_t threadCount);
+
 
 
     void computeReadIdsSortedByName();
@@ -1727,10 +1503,6 @@ private:
         // Thread-local packed CIGAR stores (hifiasm-style uint16_t tokens).
         // One store per thread to avoid locking.
         vector<OverlapCigarStore> threadCigarStores;
-
-        // Thread-local Evidence Stores (APES/TASSD)
-        // One store per thread to avoid locking.
-        vector<AlignedEvidenceStore> threadEvidenceStores;
     };
     ComputeAlignmentsData computeAlignmentsData;
 
@@ -2185,8 +1957,6 @@ public:
         bool allowInconsistentAlignmentEdges);
 
 
-
-    AlignedEvidenceStore alignedEvidenceStore;
 
     // Per-overlap packed CIGARs (hifiasm-style uint16_t tokens).
     // Populated during computeBaseAlignmentsAndStore.

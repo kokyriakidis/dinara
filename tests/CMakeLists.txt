@@ -70,6 +70,10 @@ list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.c
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
+# AssemblerHifiasmEC.cpp excluded: it was the only consumer of the removed
+# AlignedEvidenceStore. Overlap phasing now runs off OverlapCigarStore; the
+# hifiasm EC parity path is unused and kept in-tree for reference only.
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerHifiasmEC\\.cpp$")
 
 # Find required libraries
 find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)

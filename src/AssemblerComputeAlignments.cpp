@@ -10,7 +10,6 @@
 #include "compressAlignment.hpp"
 #include "performanceLog.hpp"
 #include "ProjectedAlignment.hpp"
-#include "AlignedEvidenceStore.hpp"
 #include "Reads.hpp"
 #include "HifiasmCigarImport.hpp"
 #include "hifiasmCoordinateTransforms.hpp"
@@ -72,10 +71,6 @@ void Assembler::computeBaseAlignmentsAndStore(
         v.clear();
     }
     data.threadCompressedAlignments.resize(threadCount);
-    data.threadEvidenceStores.resize(threadCount);
-    for(auto& store : data.threadEvidenceStores) {
-        store.clear();
-    }
     data.threadCigarStores.resize(threadCount);
     for(auto& store : data.threadCigarStores) {
         store.clear();
@@ -109,41 +104,15 @@ void Assembler::computeBaseAlignmentsAndStore(
 
     // Pre-size global containers to avoid repeated remaps/reallocations.
     uint64_t totalAlignments = 0;
-    uint64_t totalEvidenceIndex = 0;
-    uint64_t totalSnp0 = 0;
-    uint64_t totalIndel0 = 0;
-    uint64_t totalSnp1 = 0;
-    uint64_t totalIndel1 = 0;
-    uint64_t totalSnpCheckpoints0 = 0;
-    uint64_t totalSnpCheckpoints1 = 0;
     uint64_t totalCigarTokens = 0;
     for(size_t threadId=0; threadId<threadCount; threadId++) {
         totalAlignments += data.threadAlignmentData[threadId].size();
-        const AlignedEvidenceStore& localStore = data.threadEvidenceStores[threadId];
-        totalEvidenceIndex += localStore.index.size();
-        totalSnp0 += localStore.snpStream0.size();
-        totalIndel0 += localStore.indelStream0.size();
-        totalSnp1 += localStore.snpStream1.size();
-        totalIndel1 += localStore.indelStream1.size();
-        totalSnpCheckpoints0 += localStore.snpCheckpoints0.size();
-        totalSnpCheckpoints1 += localStore.snpCheckpoints1.size();
         const OverlapCigarStore& localCigarStore = data.threadCigarStores[threadId];
         totalCigarTokens += localCigarStore.tokenCount();
     }
 
     alignmentData.createNew(largeDataName("AlignmentData"), largeDataPageSize, 0, totalAlignments);
     compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
-
-    alignedEvidenceStore.clear();
-    alignedEvidenceStore.reserve(
-        totalEvidenceIndex,
-        totalSnp0,
-        totalSnpCheckpoints0,
-        totalIndel0,
-        totalSnp1,
-        totalSnpCheckpoints1,
-        totalIndel1
-    );
 
     overlapCigarStore.clear();
     overlapCigarStore.reserve(totalCigarTokens);
@@ -178,53 +147,6 @@ void Assembler::computeBaseAlignmentsAndStore(
             );
         }
 
-        // Merge AlignedEvidenceStore (APES/TASSD)
-        AlignedEvidenceStore& localStore = data.threadEvidenceStores[threadId];
-        
-        // Append Indexes (Adjusting offsets based on global stream sizes)
-        uint64_t globalSnpOffset0 = alignedEvidenceStore.snpStream0.size();
-        uint64_t globalSnpCheckpointOffset0 = alignedEvidenceStore.snpCheckpoints0.size();
-        uint64_t globalIndelOffset0 = alignedEvidenceStore.indelStream0.size();
-        uint64_t globalSnpOffset1 = alignedEvidenceStore.snpStream1.size();
-        uint64_t globalSnpCheckpointOffset1 = alignedEvidenceStore.snpCheckpoints1.size();
-        uint64_t globalIndelOffset1 = alignedEvidenceStore.indelStream1.size();
-        
-        const size_t localIndexSize = localStore.index.size();
-        const size_t globalIndexBegin = alignedEvidenceStore.index.size();
-        alignedEvidenceStore.index.resize(globalIndexBegin + localIndexSize);
-        for(size_t i = 0; i < localIndexSize; ++i) {
-            auto entry = localStore.index[i];
-            entry.snpOffset0 += globalSnpOffset0;
-            entry.indelOffset0 += globalIndelOffset0;
-            entry.snpCheckpointOffset0 += globalSnpCheckpointOffset0;
-            entry.snpOffset1 += globalSnpOffset1;
-            entry.indelOffset1 += globalIndelOffset1;
-            entry.snpCheckpointOffset1 += globalSnpCheckpointOffset1;
-            alignedEvidenceStore.index[globalIndexBegin + i] = entry;
-        }
-
-        // Append Streams
-        alignedEvidenceStore.snpStream0.insert(
-            alignedEvidenceStore.snpStream0.end(),
-            localStore.snpStream0.begin(),
-            localStore.snpStream0.end()
-        );
-        alignedEvidenceStore.snpCheckpoints0.insert(
-            alignedEvidenceStore.snpCheckpoints0.end(),
-            localStore.snpCheckpoints0.begin(),
-            localStore.snpCheckpoints0.end()
-        );
-        alignedEvidenceStore.indelStream0.insert(
-            alignedEvidenceStore.indelStream0.end(),
-            localStore.indelStream0.begin(),
-            localStore.indelStream0.end()
-        );
-        
-        alignedEvidenceStore.snpStream1.insert(alignedEvidenceStore.snpStream1.end(), localStore.snpStream1.begin(), localStore.snpStream1.end());
-        alignedEvidenceStore.snpCheckpoints1.insert(alignedEvidenceStore.snpCheckpoints1.end(), localStore.snpCheckpoints1.begin(), localStore.snpCheckpoints1.end());
-        alignedEvidenceStore.indelStream1.insert(alignedEvidenceStore.indelStream1.end(), localStore.indelStream1.begin(), localStore.indelStream1.end());
-
-        localStore.clear();
     }
 
     // Release unused allocated memory.
@@ -236,40 +158,13 @@ void Assembler::computeBaseAlignmentsAndStore(
     performanceLog << timestamp << "Creating alignment table." << endl;
     computeAlignmentTable();
 
-    // Report memory usage for both storage mechanisms.
+    // Report CIGAR store memory usage.
     {
         const size_t cigarTotalBytes = overlapCigarStore.memoryUsage();
-
-        const size_t evidSnp0 = alignedEvidenceStore.snpStream0.size() * sizeof(SnpEvidence);
-        const size_t evidSnp1 = alignedEvidenceStore.snpStream1.size() * sizeof(SnpEvidence);
-        const size_t evidIndel0 = alignedEvidenceStore.indelStream0.size() * sizeof(IndelEvidence);
-        const size_t evidIndel1 = alignedEvidenceStore.indelStream1.size() * sizeof(IndelEvidence);
-        const size_t evidCkpt0 = alignedEvidenceStore.snpCheckpoints0.size() * sizeof(SnpCheckpoint);
-        const size_t evidCkpt1 = alignedEvidenceStore.snpCheckpoints1.size() * sizeof(SnpCheckpoint);
-        const size_t evidIdx = alignedEvidenceStore.index.size() * sizeof(AlignedEvidenceStore::IndexEntry);
-        const size_t evidTotalBytes = evidSnp0 + evidSnp1 + evidIndel0 + evidIndel1 + evidCkpt0 + evidCkpt1 + evidIdx;
-
-        auto kb = [](size_t b) { return b / 1024.0; };
         auto mb = [](size_t b) { return b / (1024.0 * 1024.0); };
-
-        cout << timestamp << "AlignedEvidenceStore: "
-             << alignedEvidenceStore.index.size() << " alignments, "
-             << mb(evidTotalBytes) << " MB total"
-             << " (snp0=" << kb(evidSnp0) << " KB"
-             << ", snp1=" << kb(evidSnp1) << " KB"
-             << ", indel0=" << kb(evidIndel0) << " KB"
-             << ", indel1=" << kb(evidIndel1) << " KB"
-             << ", ckpt0=" << kb(evidCkpt0) << " KB"
-             << ", ckpt1=" << kb(evidCkpt1) << " KB"
-             << ", index=" << kb(evidIdx) << " KB)." << endl;
-
         cout << timestamp << "OverlapCigarStore: "
              << overlapCigarStore.tokenCount() << " tokens, "
              << mb(cigarTotalBytes) << " MB." << endl;
-
-        cout << timestamp << "Memory ratio (CigarStore / EvidenceStore): "
-             << (evidTotalBytes > 0 ? double(cigarTotalBytes) / double(evidTotalBytes) : 0.0)
-             << "x." << endl;
     }
 
     const auto tEnd = steady_clock::now();
@@ -311,7 +206,6 @@ void Assembler::computeAlignmentDataFromChainedCandidatesOnly(
         0,
         candidateCount);
     compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
-    alignedEvidenceStore.clear();
 
     string compressedAlignment;
     uint64_t skippedEmpty = 0;
@@ -408,7 +302,6 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
         largeDataName("Thread" + to_string(threadId) + "-CompressedAlignments"),
         largeDataPageSize);
 
-    AlignedEvidenceStore& store = data.threadEvidenceStores[threadId];
     OverlapCigarStore& cigarStore = data.threadCigarStores[threadId];
     string compressedAlignment;
     array<OrientedReadId, 2> orientedReadIds;
@@ -578,87 +471,12 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
             thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
 
-            // --- Populate AlignedEvidenceStore (APES/TASSD) ---
-            // Evidence is stored in dual streams (Target-View and Query-View)
-            // ensuring Canonical Coordinate Monotonicity.
-            const LongBaseSequenceView tView = sequenceViews[1];
-            const bool tRev = orientedReadIds[1].getStrand();
-            DINARA_ASSERT(tView.baseCount <= uint64_t(SnpEvidence::POS_MASK) + 1ULL);
-            const uint32_t tRawLen = uint32_t(tView.baseCount);
-
-            thisAlignmentData.info.alignmentId = store.beginAlignment();
+            // Per-overlap CIGAR is stored in the OverlapCigarStore arena.
+            // alignmentId is kept as the running alignment index (later shifted
+            // to a global index during the merge below).
+            thisAlignmentData.info.alignmentId = threadAlignmentData.size();
             thisAlignmentData.info.cigarOffset     = projectedAlignment.cigarOffset;
             thisAlignmentData.info.cigarTokenCount = projectedAlignment.cigarTokenCount;
-
-            static const uint8_t complementBase[4] = {3, 2, 1, 0};
-
-            // Stream 1 (Query-view): positions are in read0 forward coordinates.
-            {
-                for(const auto& m : projectedAlignment.sparseMismatches) {
-                    store.addSnp1(m.position0, m.base1);
-                }
-
-                for(const auto& indel : projectedAlignment.sparseIndels) {
-                    if(indel.op == 'I') {
-                        store.addIndel1(indel.position0, indel.length, 0);
-                    } else if(indel.op == 'D') {
-                        store.addIndel1(indel.position0, indel.length, 1);
-                    } else {
-                        DINARA_ASSERT(0);
-                    }
-                }
-            }
-
-            // Stream 0 (Target-view): positions are in read1 forward coordinates.
-            {
-                if(!tRev) {
-                    for(const auto& m : projectedAlignment.sparseMismatches) {
-                        store.addSnp0(m.position1, m.base0);
-                    }
-
-                    for(const auto& indel : projectedAlignment.sparseIndels) {
-                        if(indel.op == 'I') {
-                            store.addIndel0(indel.position1, indel.length, 1);
-                        } else if(indel.op == 'D') {
-                            store.addIndel0(indel.position1, indel.length, 0);
-                        } else {
-                            DINARA_ASSERT(0);
-                        }
-                    }
-
-                } else {
-                    // Reverse in the alignment: emit in increasing canonical coordinates.
-                    for(auto it = projectedAlignment.sparseMismatches.rbegin();
-                        it != projectedAlignment.sparseMismatches.rend(); ++it) {
-
-                        const uint32_t posOriented = it->position1;
-                        DINARA_ASSERT(posOriented < tRawLen);
-                        const uint32_t pos = (tRawLen - 1U) - posOriented;
-                        DINARA_ASSERT(it->base0 < 4);
-                        // Complement read0 base into read1's forward frame.
-                        store.addSnp0(pos, complementBase[it->base0]);
-                    }
-
-                    for(auto it = projectedAlignment.sparseIndels.rbegin();
-                        it != projectedAlignment.sparseIndels.rend(); ++it) {
-
-                        const uint32_t posOriented = it->position1;
-                        if(it->op == 'I') {
-                            const uint32_t pos = tRawLen - (posOriented + it->length);
-                            store.addIndel0(pos, it->length, 1);
-                        } else if(it->op == 'D') {
-                            // Gap in sequence1 (read1): sparseIndel.position1 is a boundary
-                            // in read1 oriented coordinates. Convert boundary b -> len-b in
-                            // read1 forward coordinates.
-                            DINARA_ASSERT(posOriented <= tRawLen);
-                            const uint32_t pos = tRawLen - posOriented;
-                            store.addIndel0(pos, it->length, 0);
-                        } else {
-                            DINARA_ASSERT(0);
-                        }
-                    }
-                }
-            }
 
             threadAlignmentData.push_back(thisAlignmentData);
             

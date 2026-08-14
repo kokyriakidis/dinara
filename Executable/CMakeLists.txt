@@ -64,6 +64,13 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 # shasta2::handleFailedAssertion, is provided locally by src/Shasta2Assert.cpp.
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerShasta2Anchors\\.cpp$")
 
+# AssemblerHifiasmEC.cpp excluded: it was the only consumer of the removed
+# AlignedEvidenceStore (SNP/indel evidence streams). The overlap-phasing
+# pipeline now runs entirely off OverlapCigarStore, so the hifiasm EC parity
+# path is unused. The file is retained in-tree for reference until/if the EC
+# path is reworked on top of the CIGAR store.
+list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerHifiasmEC\\.cpp$")
+
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
 include_directories(../src ../src/edlib/include ../src/ksw2)

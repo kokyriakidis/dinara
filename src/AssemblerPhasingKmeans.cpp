@@ -2,7 +2,6 @@
 /// @brief K-means overlap phasing adapted from pgphase/longcallD.
 
 #include "Assembler.hpp"
-#include "AlignedEvidenceStore.hpp"
 #include "PhasingKmeansAlign.hpp"
 #include "PhasingKmeansTypes.hpp"
 #include "Alignment.hpp"
@@ -458,137 +457,6 @@ static void kmParseCigars(
         }
         noisy.flush();
         scratch.digarEnd[oi] = dEnd;
-        scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
-    }
-}
-
-// ============================================================================
-// Step 2 (alt): Parse digars from AlignedEvidenceStore instead of raw CIGARs.
-//
-// The evidence store has pre-extracted SNP and indel streams built during
-// alignment computation. SNP positions and alt bases are stored directly;
-// indel positions and lengths are stored as 64-bit records. Both streams
-// are already in the target read's forward coordinates (RC handled at
-// construction time), so no coordinate flipping is needed here.
-//
-// We merge the two streams in backbone-position order so the noisy region
-// sliding window sees events in the same order as the CIGAR path.
-// ============================================================================
-
-static void kmParseFromEvidenceStore(
-    const Assembler& assembler, ReadId backboneReadId,
-    uint32_t backboneLen, KmScratchpad& scratch, const KmPhasingOptions& opts)
-{
-    const auto& evidenceStore = assembler.alignedEvidenceStore;
-    const uint32_t numOv = uint32_t(scratch.overlaps.size());
-
-    scratch.digars.clear();
-    scratch.digarBegin.resize(numOv);
-    scratch.digarEnd.resize(numOv);
-    scratch.overlapNoisyRegions.clear();
-    scratch.overlapNoisyBegin.resize(numOv);
-    scratch.overlapNoisyEnd.resize(numOv);
-
-    const int noisyWin = opts.isOnt ? 25 : 100;
-    const int noisyMaxS = int(opts.noisyRegMaxXgaps);
-
-    // Temporary buffer for merging SNPs + indels in position order.
-    struct MergedEvent {
-        uint32_t bbPos;
-        KmVarType type;
-        uint8_t altBase;   // only for SNPs
-        uint16_t len;      // refLen for DEL, altLen for INS, 1 for SNP
-    };
-    vector<MergedEvent> merged;
-
-    for (uint32_t oi = 0; oi < numOv; oi++) {
-        scratch.digarBegin[oi] = uint32_t(scratch.digars.size());
-        scratch.overlapNoisyBegin[oi] = uint32_t(scratch.overlapNoisyRegions.size());
-        const auto& ov = scratch.overlaps[oi];
-        const auto& ad = assembler.alignmentData[ov.alignmentId];
-        const size_t evidenceId = ad.info.alignmentId;
-        if (evidenceId == invalid<size_t>) {
-            scratch.digarEnd[oi] = uint32_t(scratch.digars.size());
-            scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
-            continue;
-        }
-
-        const bool qIsR0 = (ov.queryIsRead0 != 0);
-
-        // Determine backbone coordinate range for this overlap.
-        const uint32_t bbStart = ov.qs;
-        const uint32_t bbEnd   = ov.qe;
-
-        merged.clear();
-
-        // Collect SNPs from the appropriate stream.
-        // When backbone=read0: Stream 1 has read0 positions + read1 bases.
-        //   Same-strand: read1's forward base. RC: read1's oriented (RC) base.
-        //   Both are correct — the base is in the alignment frame.
-        // When backbone=read1: Stream 0 has read1 positions + read0 bases.
-        //   Same-strand: read0's forward base (= alignment frame base).
-        //   RC: complement(read0's forward base) — already in backbone's frame.
-        // No additional complement needed in either case.
-        auto addSnp = [&](uint32_t pos, uint8_t base) {
-            if (pos >= backboneLen) return;
-            merged.push_back({pos, KmVarType::Snp, base, 1});
-        };
-        if (qIsR0) {
-            evidenceStore.forEachSnp1InRange(uint32_t(evidenceId), bbStart, bbEnd, addSnp);
-        } else {
-            evidenceStore.forEachSnp0InRange(uint32_t(evidenceId), bbStart, bbEnd, addSnp);
-        }
-
-        // Collect indels from the appropriate stream.
-        // In the evidence store, isDeletion() means "the other read has a gap at
-        // these positions" — i.e., the target read is missing bases here.
-        // From the digar perspective: target has a deletion → KmVarType::Deletion.
-        // isInsertion() means "the other read has extra bases" — target has an
-        // insertion → KmVarType::Insertion.
-        span<const IndelEvidence> indels;
-        if (qIsR0) {
-            indels = evidenceStore.getIndels1(uint32_t(evidenceId));
-        } else {
-            indels = evidenceStore.getIndels0(uint32_t(evidenceId));
-        }
-        for (const auto& ie : indels) {
-            uint32_t pos = ie.pos();
-            if (pos >= backboneLen) continue;
-            // Filter to backbone range.
-            if (ie.isDeletion()) {
-                uint32_t endPos = pos + ie.len();
-                if (endPos > backboneLen) endPos = backboneLen;
-                // Only include if overlapping the backbone range.
-                if (endPos <= bbStart || pos >= bbEnd) continue;
-                merged.push_back({pos, KmVarType::Deletion, 0, uint16_t(endPos - pos)});
-            } else if (ie.isInsertion()) {
-                if (pos < bbStart || pos >= bbEnd) continue;
-                merged.push_back({pos, KmVarType::Insertion, 0, uint16_t(ie.len())});
-            }
-        }
-
-        // Sort merged events by backbone position for noisy region detection.
-        sort(merged.begin(), merged.end(),
-            [](const MergedEvent& a, const MergedEvent& b) { return a.bbPos < b.bbPos; });
-
-        // Feed noisy region builder and emit digars.
-        int maxSites = max(1, int(merged.size()) * 2 + 8);
-        KmNoisyBuilder noisy(maxSites, noisyMaxS, noisyWin, scratch.overlapNoisyRegions);
-
-        for (const auto& ev : merged) {
-            scratch.digars.push_back({ev.bbPos, ev.type, ev.altBase, ev.len, {}});
-            if (ev.type == KmVarType::Snp) {
-                noisy.observe(ev.bbPos, 1, 1);
-            } else if (ev.type == KmVarType::Deletion) {
-                noisy.observe(ev.bbPos, ev.len, int(ev.len));
-            } else {
-                noisy.observe(ev.bbPos, 0, int(ev.len));
-            }
-        }
-        noisy.flush();
-
-        // Digars are already sorted (merged was sorted by bbPos).
-        scratch.digarEnd[oi] = uint32_t(scratch.digars.size());
         scratch.overlapNoisyEnd[oi] = uint32_t(scratch.overlapNoisyRegions.size());
     }
 }
@@ -1839,13 +1707,10 @@ void dinara::kmRefineCis(
 // Public entry point
 // ============================================================================
 
-void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEvidenceStore)
+void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
 {
     cout << timestamp << "=== K-means Overlap Phasing ===" << endl;
-    if (useEvidenceStore)
-        cout << timestamp << "Using AlignedEvidenceStore (pre-parsed SNP/indel streams)." << endl;
-    else
-        cout << timestamp << "Using OverlapCigarStore (raw CIGAR parsing)." << endl;
+    cout << timestamp << "Using OverlapCigarStore (raw CIGAR parsing)." << endl;
     const uint64_t readCount = getReads().readCount();
     cout << timestamp << "Read count: " << readCount << endl;
     if (readCount == 0) { cout << timestamp << "No reads." << endl; return; }
@@ -1929,10 +1794,7 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt, bool useEv
                               << " lowComplexity=" << scratch.lowComplexity.size() << " intervals" << endl;
 
                 t0 = clk::now();
-                if (useEvidenceStore)
-                    kmParseFromEvidenceStore(*this, readId, bbLen, scratch, opts);
-                else
-                    kmParseCigars(*this, readId, bbLen, scratch, opts);
+                kmParseCigars(*this, readId, bbLen, scratch, opts);
                 t1 = clk::now(); tt.detect += us(t0,t1);
                 if (dbg) cout << "DEBUG read " << rid << ": " << scratch.digars.size() << " digars, "
                               << scratch.overlapNoisyRegions.size() << " per-overlap noisy regions" << endl;

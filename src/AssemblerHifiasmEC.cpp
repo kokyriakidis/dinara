@@ -1,4 +1,13 @@
 /*
+NOTE: This translation unit is NOT part of the build. It was the only consumer
+of the removed AlignedEvidenceStore (SNP/indel evidence streams), and it still
+#includes "AlignedEvidenceStore.hpp", which no longer exists. Overlap phasing now
+runs entirely off OverlapCigarStore. The file is retained in-tree for reference
+and is excluded from both the Executable and tests builds (see the corresponding
+list(FILTER ... EXCLUDE ...) in Executable/CMakeLists.txt and tests/CMakeLists.txt).
+To rebuild this EC/parity path, its evidence reads must first be reworked on top
+of OverlapCigarStore.
+
 Dinara hifiasm-parity error-correction (Parity EC).
 
 This translation unit implements a per-read pipeline modeled after hifiasm’s phasing-based
