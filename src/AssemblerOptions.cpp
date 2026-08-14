@@ -266,30 +266,6 @@ void AssemblerOptions::addCommandLineOnlyOptions()
         "candidate graph. Experimental."
         )
 
-        ("overlapsFromPafFile",
-        value<string>(&commandLineOnlyOptions.overlapsFromPafFile),
-        "The name of a PAF file containing overlaps between reads. "
-        "If specified, alignment candidates are loaded from this file "
-        "instead of using the default in-memory hifiasm overlap path."
-        )
-
-        ("overlapsFromHifiasm",
-        bool_switch(&commandLineOnlyOptions.overlapsFromHifiasm)->
-        default_value(false),
-        "Run the bundled hifiasm candidate-overlap detector and ALSO write "
-        "hifiasm.ovlp.paf in the assembly directory, then import candidates "
-        "from that file. This is the file-based variant of the default overlap "
-        "path (which passes overlaps in memory without writing a PAF); use it "
-        "when you want the PAF on disk for inspection. Mutually exclusive with "
-        "--overlapsFromPafFile and --overlapsFromInvertedIndex.")
-
-        ("overlapsFromInvertedIndex",
-        bool_switch(&commandLineOnlyOptions.overlapsFromInvertedIndex)->
-        default_value(false),
-        "Compute read overlaps using dinara's own inverted-index discovery "
-        "instead of the default hifiasm overlap path. Mutually exclusive with "
-        "--overlapsFromPafFile and --overlapsFromHifiasm.")
-
         ("saveBinaryData",
         bool_switch(&commandLineOnlyOptions.saveBinaryData)->
         default_value(false),
@@ -557,124 +533,6 @@ void AssemblerOptions::addConfigurableOptions()
         ("OverlapCandidates.maxEndExtension",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
         "Deprecated alias for OverlapCandidates.maxEndFuzz.")
-
-        ("OverlapCandidates.invertedIndexMaxKmerCount",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMaxKmerCount)->
-        default_value(2000),
-        "Hard cutoff: k-mers occurring more than this many times are excluded from markers. "
-        "Hifiasm default: 2000 (max_kmer_cnt). K-mers between 5*coverageHet and this threshold "
-        "are kept but downsampled during chaining.")
-
-        ("OverlapCandidates.invertedIndexWeightExponent",
-        value<double>(&overlapCandidatesOptions.invertedIndexWeightExponent)->
-        default_value(1.1),
-        "InvertedIndex chaining: exponent used in the frequency weight LUT (pow(w, exponent)).")
-
-        ("OverlapCandidates.invertedIndexLowFreqMultiplier",
-        value<double>(&overlapCandidatesOptions.invertedIndexLowFreqMultiplier)->
-        default_value(0.333),
-        "InvertedIndex chaining: low-frequency threshold multiplier (lowFreq = coverageHet * multiplier).")
-
-        ("OverlapCandidates.invertedIndexHighFreqMultiplier",
-        value<double>(&overlapCandidatesOptions.invertedIndexHighFreqMultiplier)->
-        default_value(1.667),
-        "InvertedIndex chaining: high-frequency threshold multiplier (highFreq = coverageHet * multiplier).")
-
-        ("OverlapCandidates.invertedIndexRareKmerWeight",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexRareKmerWeight)->
-        default_value(2),
-        "InvertedIndex chaining: weight assigned to rare/informative kmers.")
-
-        ("OverlapCandidates.invertedIndexDownsampleHighFrequencyMarkers",
-        value<bool>(&overlapCandidatesOptions.invertedIndexDownsampleHighFrequencyMarkers)->
-        default_value(true),
-        "InvertedIndex chaining: if true, downsample high-frequency marker streaks before hit collection.")
-
-        ("OverlapCandidates.invertedIndexHighFrequencySampleDistance",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexHighFrequencySampleDistance)->
-        default_value(500),
-        "InvertedIndex chaining: sample distance used to derive per-streak retention count for high-frequency markers.")
-
-        ("OverlapCandidates.invertedIndexMaxHighFrequencyPerStreak",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMaxHighFrequencyPerStreak)->
-        default_value(16),
-        "InvertedIndex chaining: hard cap on retained high-frequency markers per streak (hifiasm MAX_MAX_HIGH_OCC equivalent).")
-
-        ("OverlapCandidates.invertedIndexHighFactor",
-        value<double>(&overlapCandidatesOptions.invertedIndexHighFactor)->
-        default_value(5.0),
-        "Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain). Default 5.0.")
-
-        ("OverlapCandidates.invertedIndexMinNChain",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMinNChain)->
-        default_value(100),
-        "Hifiasm MIN_N_CHAIN: minimum value for max_n_chain. Default 100.")
-
-        ("OverlapCandidates.invertedIndexNonRedundantOverlapFraction",
-        value<double>(&overlapCandidatesOptions.invertedIndexNonRedundantOverlapFraction)->
-        default_value(1.0),
-        "InvertedIndex chaining: reject candidates whose query interval overlaps an already-accepted interval by more than this fraction. Default 1.0 (disabled) matches hifiasm r484 commented-out state.")
-
-        ("OverlapCandidates.chainingMode",
-        value<int>(&overlapCandidatesOptions.chainingMode)->
-        default_value(0),
-        "Chaining scoring mode: 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty), "
-        "1 = minimap2-sr (fixed bandwidth, log gap penalty).")
-
-        ("OverlapCandidates.minimap2Bw",
-        value<int32_t>(&overlapCandidatesOptions.minimap2Bw)->
-        default_value(100),
-        "Fixed bandwidth for minimap2-sr chaining mode (minimap2 -r). Only used when chainingMode=1.")
-
-        ("OverlapCandidates.minimap2MaxGap",
-        value<int32_t>(&overlapCandidatesOptions.minimap2MaxGap)->
-        default_value(5000),
-        "Max gap for minimap2-sr chaining mode (minimap2 -g). Only used when chainingMode=1.")
-
-        ("OverlapCandidates.minimap2MinChainScore",
-        value<int32_t>(&overlapCandidatesOptions.minimap2MinChainScore)->
-        default_value(25),
-        "Min chain score for minimap2-sr chaining mode (minimap2 -m). Only used when chainingMode=1.")
-
-        ("OverlapCandidates.invertedIndexLchainIsAccurate",
-        value<bool>(&overlapCandidatesOptions.invertedIndexLchainIsAccurate)->
-        default_value(true),
-        "InvertedIndex chaining: hifiasm set_lchain_dp_op is_accurate flag (true matches ONT ecovlp defaults).")
-
-        ("OverlapCandidates.invertedIndexUseEcScoring",
-        value<bool>(&overlapCandidatesOptions.invertedIndexUseEcScoring)->
-        default_value(true),
-        "InvertedIndex chaining: use hifiasm comput_sc_ch_ec long-gap penalty behavior.")
-
-        ("OverlapCandidates.invertedIndexEnableMcopyFast",
-        value<bool>(&overlapCandidatesOptions.invertedIndexEnableMcopyFast)->
-        default_value(true),
-        "InvertedIndex chaining: enable hifiasm-like mcopy-fast chain endpoint selection (keeps multiple score-competitive peaks).")
-
-        ("OverlapCandidates.invertedIndexMcopyNum",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyNum)->
-        default_value(3),
-        "InvertedIndex chaining: maximum number of score-competitive chain peaks retained per read pair.")
-
-        ("OverlapCandidates.invertedIndexMcopyRate",
-        value<double>(&overlapCandidatesOptions.invertedIndexMcopyRate)->
-        default_value(0.70),
-        "InvertedIndex chaining: retain chains with score >= bestScore * rate in mcopy-fast selection.")
-
-        ("OverlapCandidates.invertedIndexMcopyKhitCutoff",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyKhitCutoff)->
-        default_value(32),
-        "InvertedIndex chaining: minimum chain occurrence count required for secondary mcopy-fast chains.")
-
-        ("OverlapCandidates.invertedIndexMcopyOcvWindow",
-        value<uint32_t>(&overlapCandidatesOptions.invertedIndexMcopyOcvWindow)->
-        default_value(3072),
-        "InvertedIndex chaining: COV_W-like window size for containing-overlap overload control.")
-
-        ("OverlapCandidates.invertedIndexMcopyOcvWeakKeepRatio",
-        value<double>(&overlapCandidatesOptions.invertedIndexMcopyOcvWeakKeepRatio)->
-        default_value(0.70),
-        "InvertedIndex chaining: keep weak containing overlaps only if the non-saturated window-overlap fraction is >= this value.")
 
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
@@ -1822,29 +1680,7 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minChainMarkerCount = " << minChainMarkerCount << "\n";
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
-    s << "invertedIndexMaxKmerCount = " << invertedIndexMaxKmerCount << "\n";
-    s << "invertedIndexWeightExponent = " << invertedIndexWeightExponent << "\n";
-    s << "invertedIndexLowFreqMultiplier = " << invertedIndexLowFreqMultiplier << "\n";
-    s << "invertedIndexHighFreqMultiplier = " << invertedIndexHighFreqMultiplier << "\n";
-    s << "invertedIndexRareKmerWeight = " << invertedIndexRareKmerWeight << "\n";
-    s << "invertedIndexDownsampleHighFrequencyMarkers = " << convertBoolToPythonString(invertedIndexDownsampleHighFrequencyMarkers) << "\n";
-    s << "invertedIndexHighFrequencySampleDistance = " << invertedIndexHighFrequencySampleDistance << "\n";
-    s << "invertedIndexMaxHighFrequencyPerStreak = " << invertedIndexMaxHighFrequencyPerStreak << "\n";
-    s << "invertedIndexHighFactor = " << invertedIndexHighFactor << "\n";
-    s << "invertedIndexMinNChain = " << invertedIndexMinNChain << "\n";
-    s << "invertedIndexNonRedundantOverlapFraction = " << invertedIndexNonRedundantOverlapFraction << "\n";
-    s << "chainingMode = " << chainingMode << "\n";
-    s << "minimap2Bw = " << minimap2Bw << "\n";
-    s << "minimap2MaxGap = " << minimap2MaxGap << "\n";
-    s << "minimap2MinChainScore = " << minimap2MinChainScore << "\n";
-    s << "invertedIndexLchainIsAccurate = " << convertBoolToPythonString(invertedIndexLchainIsAccurate) << "\n";
-    s << "invertedIndexUseEcScoring = " << convertBoolToPythonString(invertedIndexUseEcScoring) << "\n";
-    s << "invertedIndexEnableMcopyFast = " << convertBoolToPythonString(invertedIndexEnableMcopyFast) << "\n";
-    s << "invertedIndexMcopyNum = " << invertedIndexMcopyNum << "\n";
-    s << "invertedIndexMcopyRate = " << invertedIndexMcopyRate << "\n";
-    s << "invertedIndexMcopyKhitCutoff = " << invertedIndexMcopyKhitCutoff << "\n";
-    s << "invertedIndexMcopyOcvWindow = " << invertedIndexMcopyOcvWindow << "\n";
-    s << "invertedIndexMcopyOcvWeakKeepRatio = " << invertedIndexMcopyOcvWeakKeepRatio << "\n";
+    s << "maxChainingFreq = " << maxChainingFreq << "\n";
 }
 
 

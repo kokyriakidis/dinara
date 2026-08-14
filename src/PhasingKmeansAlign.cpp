@@ -5,6 +5,7 @@
 
 #include "PhasingKmeansAlign.hpp"
 #include "Assembler.hpp"
+#include "compressAlignment.hpp"
 #include "Marker.hpp"
 #include "Reads.hpp"
 
@@ -72,8 +73,13 @@ KmNoisyReadInfo dinara::collectNoisyReadInfo(
     KmNoisyReadInfo info;
 
     const auto& markersRef = *assembler.markers;
-    const auto& alignments = assembler.alignmentCandidatesAlignmentsData.alignments;
     const auto& alignmentDataRef = assembler.alignmentData;
+    // Per-overlap marker chains come from the stored (compressed) alignments,
+    // indexed by alignmentId in lockstep with alignmentData; decompressed on
+    // demand below. (The legacy alignmentCandidatesAlignmentsData chain store
+    // was removed with the inverted-index chaining path.)
+    const auto& storedAlignments = assembler.compressedAlignments;
+    Alignment decompressedAlignment;
 
     if(scratch.overlaps.empty()) return info;
 
@@ -112,8 +118,10 @@ KmNoisyReadInfo dinara::collectNoisyReadInfo(
     const uint32_t numOv = uint32_t(scratch.overlaps.size());
     for(uint32_t oi = 0; oi < numOv; oi++) {
         const auto& ov = scratch.overlaps[oi];
-        if(ov.alignmentId >= alignments.size()) continue;
-        const auto& aln = alignments[ov.alignmentId];
+        if(ov.alignmentId >= alignmentDataRef.size()) continue;
+        span<const char> compressed = storedAlignments[ov.alignmentId];
+        dinara::decompress(compressed, decompressedAlignment);
+        const Alignment& aln = decompressedAlignment;
         if(aln.ordinals.empty()) continue;
         const auto& ad = alignmentDataRef[ov.alignmentId];
 

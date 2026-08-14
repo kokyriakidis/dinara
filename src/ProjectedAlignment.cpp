@@ -11,71 +11,6 @@ using namespace dinara;
 #include "algorithm.hpp"
 #include <iostream>
 
-namespace {
-    inline bool ifIsHomopolymerRepeat(const std::vector<uint8_t>& sequence, uint64_t pos)
-    {
-        if(sequence.empty() || pos >= sequence.size()) {
-            return false;
-        }
-
-        const int64_t threshold = 3;
-        const int64_t site = int64_t(pos);
-        int64_t beg = site - threshold;
-        if(beg < 0) {
-            beg = 0;
-        }
-        int64_t end = site + threshold;
-        if(end >= int64_t(sequence.size())) {
-            end = int64_t(sequence.size()) - 1;
-        }
-
-        bool fSet = false;
-        uint8_t fCh = 0;
-        int64_t fLen = 0;
-        for(int64_t i = site + 1; i <= end; ++i) {
-            const uint8_t b = sequence[uint64_t(i)];
-            if(!fSet) {
-                fCh = b;
-                fLen = 1;
-                fSet = true;
-            } else {
-                if(b != fCh) {
-                    break;
-                }
-                ++fLen;
-            }
-        }
-
-        bool bSet = false;
-        uint8_t bCh = 0;
-        int64_t bLen = 0;
-        for(int64_t i = site - 1; i >= beg; --i) {
-            const uint8_t b = sequence[uint64_t(i)];
-            if(!bSet) {
-                bCh = b;
-                bLen = 1;
-                bSet = true;
-            } else {
-                if(b != bCh) {
-                    break;
-                }
-                ++bLen;
-            }
-        }
-
-        const uint8_t center = sequence[pos];
-        if(fSet && fCh == center) {
-            ++fLen;
-        } else if(bSet && bCh == center) {
-            ++bLen;
-        }
-
-        if(fLen >= threshold || bLen >= threshold) {
-            return true;
-        }
-        return fSet && bSet && center == fCh && bCh == fCh && (fLen + bLen >= threshold);
-    }
-}
 
 
 
@@ -214,7 +149,6 @@ void ProjectedAlignment::constructQuickRaw()
     totalLength = {0, 0};
     totalEditDistance = 0;
     mismatchCount = 0;
-    nonHomopolymerErrorCount = 0;
     totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
@@ -260,7 +194,6 @@ void ProjectedAlignment::constructQuickRaw()
         // Accumulate statistics
         totalEditDistance += segment.editDistance;
         mismatchCount += segment.mismatchCount;
-        nonHomopolymerErrorCount += segment.nonHomopolymerErrorCount;
         totalIndelBaseCount += segment.indelBaseCount;
         totalGapEventCount += segment.gapEventCount;
         totalDpScore += segment.dpScore;
@@ -288,7 +221,6 @@ void ProjectedAlignment::constructQuickRawSparse()
     totalLength = {0, 0};
     totalEditDistance = 0;
     mismatchCount = 0;
-    nonHomopolymerErrorCount = 0;
     totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
@@ -409,10 +341,6 @@ void ProjectedAlignment::constructQuickRawSparse()
                             asciiToBase[a1]
                         });
                         ++mismatchHere;
-                        if(!ifIsHomopolymerRepeat(asciiSequence0, position0 + k) &&
-                           !ifIsHomopolymerRepeat(asciiSequence1, position1 + k)) {
-                            ++nonHomopolymerErrorCount;
-                        }
                     }
 
                     // Accumulate match/mismatch runs for CIGAR tokens.
@@ -446,12 +374,9 @@ void ProjectedAlignment::constructQuickRawSparse()
                 // A*PA2 'D' consumes read0/query, which in SAM/PAF terms is an
                 // insertion (query bases absent from the target).
                 if(storeCigar) cigarStore->pushInsertion(uint32_t(currentVal));
-                const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
-                                ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position0 += currentVal;
                 totalIndelBaseCount += currentVal;
                 ++totalGapEventCount;
-                nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(currentVal));
                 if(currentVal >= 6) hasLargeIndel = true;
 
@@ -464,12 +389,9 @@ void ProjectedAlignment::constructQuickRawSparse()
                 // A*PA2 'I' consumes read1/target, which in SAM/PAF terms is a
                 // deletion (target bases absent from the query).
                 if(storeCigar) cigarStore->pushDeletion(uint32_t(currentVal));
-                const bool hp = ifIsHomopolymerRepeat(asciiSequence0, position0) ||
-                                ifIsHomopolymerRepeat(asciiSequence1, position1);
                 position1 += currentVal;
                 totalIndelBaseCount += currentVal;
                 ++totalGapEventCount;
-                nonHomopolymerErrorCount += uint64_t(currentVal) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(currentVal));
                 if(currentVal >= 6) hasLargeIndel = true;
 
@@ -527,13 +449,16 @@ bool ProjectedAlignment::constructFromHifiasmCigar(
         if(uint64_t(read0End) > uint64_t(read0Anchor) + read0Covered) return false;
     }
 
-    sparseMismatches.clear();
-    sparseIndels.clear();
-
+    // hifiasm's exported CIGAR labels every column '='(0)/'X'(1)/'I'(2)/'D'(3)
+    // per SAM convention, and the aligner emits 'X' for each mismatched column
+    // (never a generic 'M' hiding a mismatch inside a match run). So we trust the
+    // op labels for every statistic and do NOT re-read bases: no per-column
+    // comparison. The sparse per-base diffs are likewise not produced here --
+    // the only consumer of ProjectedAlignment::sparse* (the leaf-snarl phasing
+    // path) builds its own QuickRawSparse alignment, never this one.
     totalLength = {0, 0};
     totalEditDistance = 0;
     mismatchCount = 0;
-    nonHomopolymerErrorCount = 0;
     totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
@@ -559,30 +484,10 @@ bool ProjectedAlignment::constructFromHifiasmCigar(
         return gapOpen1 + gapExtend1 * int64_t(length);
     };
 
-    const uint32_t read0Len = uint32_t(sequences[0].baseCount);
-    const uint32_t read1Len = uint32_t(sequences[1].baseCount);
-
-    // Is the base at oriented position `pos` on read `which` inside a homopolymer
-    // run? Mirrors ifIsHomopolymerRepeat (threshold 3), read from getBase so it
-    // works directly in the oriented frame the sparse diffs use.
-    auto isHomopolymer = [&](uint64_t which, uint32_t pos, uint32_t readLen) -> bool {
-        if(readLen == 0 || pos >= readLen) return false;
-        const int64_t threshold = 3;
-        int64_t beg = int64_t(pos) - threshold; if(beg < 0) beg = 0;
-        int64_t end = int64_t(pos) + threshold; if(end >= int64_t(readLen)) end = int64_t(readLen) - 1;
-        const uint8_t center = getBase(which, pos).value;
-        for(int64_t p = beg; p <= end; ++p) {
-            if(p == int64_t(pos)) continue;
-            if(getBase(which, uint32_t(p)).value == center) return true;
-        }
-        return false;
-    };
-
     // Coalesce runs and walk clipped to [read0Begin, read0End) on read0,
     // replicating OverlapCigarStore::walkRange. op match(0)/mismatch(1) consume
     // both reads; ins(2) consumes read0 (query-only); del(3) consumes read1.
-    // Emission mirrors constructQuickRawSparse exactly, including the A*PA2 op
-    // letter stored in sparseIndel.op: query-only gaps are 'D', target-only 'I'.
+    // Statistics come straight from the op labels (see top-of-function note).
     uint64_t xk = read0Anchor;   // read0 forward position
     uint64_t yk = read1Anchor;   // read1 alignment-orientation position
 
@@ -612,16 +517,11 @@ bool ProjectedAlignment::constructFromHifiasmCigar(
             // Deletion (read1-only). Emitted iff its read0 anchor is in range.
             if(xk >= read0Begin && xk < read0End) {
                 noteBoundaries(xk, yk);
-                sparseIndels.push_back(ProjectedAlignmentSparseIndel{
-                    uint32_t(xk), uint32_t(yk), totalLen, 'I' });
                 if(storeCigar) cigarStore->pushDeletion(totalLen);
-                const bool hp = isHomopolymer(0, uint32_t(xk), read0Len) ||
-                                isHomopolymer(1, uint32_t(yk), read1Len);
                 totalLength[1] += totalLen;
                 totalIndelBaseCount += totalLen;
                 ++totalGapEventCount;
                 totalEditDistance += int64_t(totalLen);
-                nonHomopolymerErrorCount += uint64_t(totalLen) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(totalLen));
                 if(totalLen >= 6) hasLargeIndel = true;
                 cigarRead1End = uint32_t(ykEnd);
@@ -636,58 +536,33 @@ bool ProjectedAlignment::constructFromHifiasmCigar(
             noteBoundaries(clipStart, adjYk);
 
             if(op == CigarOpIns) {
-                // Insertion (read0-only). SAM/PAF 'I'; A*PA2 letter 'D'.
-                sparseIndels.push_back(ProjectedAlignmentSparseIndel{
-                    uint32_t(clipStart), uint32_t(adjYk), clipLen, 'D' });
+                // Insertion (read0-only). SAM/PAF 'I'.
                 if(storeCigar) cigarStore->pushInsertion(clipLen);
-                const bool hp = isHomopolymer(0, uint32_t(clipStart), read0Len) ||
-                                isHomopolymer(1, uint32_t(adjYk), read1Len);
                 totalLength[0] += clipLen;
                 totalIndelBaseCount += clipLen;
                 ++totalGapEventCount;
                 totalEditDistance += int64_t(clipLen);
-                nonHomopolymerErrorCount += uint64_t(clipLen) - (hp ? 1ULL : 0ULL);
                 totalDpScore -= gapPenalty(uint64_t(clipLen));
                 if(clipLen >= 6) hasLargeIndel = true;
                 cigarRead1End = uint32_t(adjYk);
             } else {
-                // Aligned columns (op is match or mismatch): trust the bases,
-                // not the op label, exactly like constructQuickRawSparse's
-                // M-block. Emit a sparse mismatch per differing column and
-                // accumulate match/mismatch runs for the CIGAR store.
-                uint64_t mismatchHere = 0;
-                uint32_t runStart = 0;
-                bool runIsMismatch = false;
-                for(uint32_t kk = 0; kk < clipLen; ++kk) {
-                    const uint8_t b0 = getBase(0, uint32_t(clipStart + kk)).value;
-                    const uint8_t b1 = getBase(1, uint32_t(adjYk + kk)).value;
-                    const bool isMismatch = (b0 != b1);
-                    if(isMismatch) {
-                        sparseMismatches.push_back(ProjectedAlignmentSparseMismatch{
-                            uint32_t(clipStart + kk), uint32_t(adjYk + kk), b0, b1 });
-                        ++mismatchHere;
-                        if(!isHomopolymer(0, uint32_t(clipStart + kk), read0Len) &&
-                           !isHomopolymer(1, uint32_t(adjYk + kk), read1Len)) {
-                            ++nonHomopolymerErrorCount;
-                        }
-                    }
-                    if(storeCigar) {
-                        if(kk == 0) { runIsMismatch = isMismatch; runStart = 0; }
-                        else if(isMismatch != runIsMismatch) {
-                            cigarStore->pushOp(runIsMismatch ? 1 : 0, kk - runStart);
-                            runIsMismatch = isMismatch; runStart = kk;
-                        }
-                    }
-                }
+                // Aligned run: op is match(0) or mismatch(1), uniform across the
+                // whole run after coalescing. Trust the op label -- a mismatch run
+                // is clipLen mismatched columns, a match run is clipLen identical
+                // columns -- so no base fetch or per-column comparison is needed.
+                const bool runIsMismatch = (op == CigarOpMismatch);
                 if(storeCigar && clipLen > 0) {
-                    cigarStore->pushOp(runIsMismatch ? 1 : 0, clipLen - runStart);
+                    cigarStore->pushOp(runIsMismatch ? 1 : 0, clipLen);
                 }
-                mismatchCount += mismatchHere;
-                totalEditDistance += int64_t(mismatchHere);
+                if(runIsMismatch) {
+                    mismatchCount += clipLen;
+                    totalEditDistance += int64_t(clipLen);
+                    totalDpScore += mismatch * int64_t(clipLen);
+                } else {
+                    totalDpScore += match * int64_t(clipLen);
+                }
                 totalLength[0] += clipLen;
                 totalLength[1] += clipLen;
-                totalDpScore += match * int64_t(uint64_t(clipLen) - mismatchHere)
-                              + mismatch * int64_t(mismatchHere);
                 cigarRead1End = uint32_t(adjYk + clipLen);
             }
         }
@@ -743,7 +618,6 @@ void ProjectedAlignmentSegment::computeAlignment(
         alignment.resize(sequence0.size());
         fill(alignment.begin(), alignment.end(), make_pair(true, true));
         mismatchCount = 0;
-        nonHomopolymerErrorCount = 0;
         indelBaseCount = 0;
         gapEventCount = 0;
         // Hifiasm/minimap2-style match reward (HiFi defaults).
@@ -811,7 +685,6 @@ void ProjectedAlignmentSegment::computeAlignment(
         uint64_t position0 = 0;
         uint64_t position1 = 0;
         mismatchCount = 0;
-        nonHomopolymerErrorCount = 0;
         indelBaseCount = 0;
         gapEventCount = 0;
         dpScore = 0;
@@ -855,12 +728,6 @@ void ProjectedAlignmentSegment::computeAlignment(
                             if (sequence0[position0 + k] != sequence1[position1 + k]) {
                                 mismatchCount++;
                                 mismatchHere++;
-                                if(
-                                    !ifIsHomopolymerRepeat(sequence0, position0 + k) &&
-                                    !ifIsHomopolymerRepeat(sequence1, position1 + k)
-                                ) {
-                                    ++nonHomopolymerErrorCount;
-                                }
                             }
                         }
                         const uint64_t matchHere = uint64_t(currentVal) - mismatchHere;
@@ -868,24 +735,16 @@ void ProjectedAlignmentSegment::computeAlignment(
                         position0 += currentVal;
                         position1 += currentVal;
                     } else if (op.first) { // D
-                        const bool isHomopolymerGap =
-                            ifIsHomopolymerRepeat(sequence0, position0) ||
-                            ifIsHomopolymerRepeat(sequence1, position1);
                         position0 += currentVal;
                         indelBaseCount += currentVal;
                         gapEventCount++;
-                        nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
                         dpScore -= gapPenalty(uint64_t(currentVal));
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
                     } else if (op.second) { // I
-                        const bool isHomopolymerGap =
-                            ifIsHomopolymerRepeat(sequence0, position0) ||
-                            ifIsHomopolymerRepeat(sequence1, position1);
                         position1 += currentVal;
                         indelBaseCount += currentVal;
                         gapEventCount++; // ONE gap event
-                        nonHomopolymerErrorCount += uint64_t(currentVal) - (isHomopolymerGap ? 1ULL : 0ULL);
                         dpScore -= gapPenalty(uint64_t(currentVal));
                         if(currentVal >= 6) hasLargeIndel = true;
                         if(currentVal > maxIndelSize) maxIndelSize = uint32_t(currentVal);
@@ -1296,7 +1155,6 @@ void ProjectedAlignment::computeStatistics()
     totalEditDistance = 0;
     totalEditDistanceRle = 0;
     mismatchCount = 0;
-    nonHomopolymerErrorCount = 0;
     totalIndelBaseCount = 0;
     totalGapEventCount = 0;
     totalDpScore = 0;
@@ -1307,7 +1165,6 @@ void ProjectedAlignment::computeStatistics()
         totalIndelBaseCount += segment.indelBaseCount;
         totalGapEventCount += segment.gapEventCount;
         mismatchCount += segment.mismatchCount;
-        nonHomopolymerErrorCount += segment.nonHomopolymerErrorCount;
         totalDpScore += segment.dpScore;
         if (segment.hasLargeIndel) hasLargeIndel = true;
     }

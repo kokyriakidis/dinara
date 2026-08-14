@@ -65,7 +65,6 @@ namespace dinara {
     class Align6;
     class AssemblerOptions;
     class AssembledSegment;
-    class AssemblyGraph2;
     class ClusterGraph;
     class CompressedAssemblyGraph;
     class ConsensusCaller;
@@ -358,15 +357,23 @@ public:
         uint64_t threadCount
     );
 
-    // Lightweight marker-chain materialization for marker-graph prototypes.
-    // Populates alignmentData, compressedAlignments, and alignmentTable from
-    // precomputed chained marker alignments, but skips projected banded/base
-    // alignment and sparse evidence generation.
-    void computeAlignmentDataFromChainedCandidatesOnly(
-        const AlignOptions&,
-        uint64_t threadCount
-    );
+    // Derive a marker-ordinal chain for one overlap directly from hifiasm's
+    // validated overlap box, WITHOUT running chaining DP. Inside the box the
+    // alignment is colinear, so the chain is just the shared markers (equal
+    // KmerId) that fall in read0's [read0Begin,read0End) and read1's
+    // [read1Begin,read1End), both in the oriented frames of orientedReadIds
+    // (strand baked in). Both marker arrays are position-sorted (index ==
+    // ordinal); a two-pointer merge by KmerId with a strict-monotonicity guard
+    // yields ordinals strictly increasing in both reads. Emits into `ordinals`
+    // (cleared first). Ambiguous KmerIds (appearing more than once on either
+    // side within the box) are skipped as unreliable anchors.
+    void deriveChainFromInterval(
+        const array<OrientedReadId, 2>& orientedReadIds,
+        uint32_t read0Begin, uint32_t read0End,
+        uint32_t read1Begin, uint32_t read1End,
+        vector< array<uint32_t, 2> >& ordinals) const;
 
+    // Lightweight marker-chain materialization for marker-graph prototypes.
     // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
     void performPhasing(uint64_t threadCount);
     void accessAlignmentData();
@@ -773,18 +780,6 @@ private:
 
 
 
-    // The alignment associated to each alignment candidate.
-    // Computed by findAlignmentCandidatesInvertedIndex (Direct Chain Propagation).
-    // If empty, computed by computeAlignments.
-    class AlignmentCandidatesAlignmentsData {
-    public:
-        MemoryMapped::Vector<Alignment> alignments;
-        MemoryMapped::Vector<int32_t> sharedSeedScores;
-    };
-public:
-    AlignmentCandidatesAlignmentsData alignmentCandidatesAlignmentsData;
-private:
-    
     // Low level functions to get marker Kmers/KmerIds of an oriented read.
     // They are obtained from the reads and not from CompressedMarker::kmerId,
     // which will soon go away.
@@ -868,17 +863,7 @@ public:
 
 
 
-    // Flag palindromic reads.
-    // Uses inverted index + DP chaining (same pipeline as overlap discovery)
-    // to find self-alignments (strand 0 vs strand 1), then ProjectedAlignment
-    // with astarpa for base-level identity.
-    // Requires buildInvertedIndex to have been called first.
-    void flagPalindromicReads(
-        double maxDriftRate,
-        const OverlapCandidatesOptions& overlapCandidatesOptions,
-        double alignedFractionThreshold,
-        double maxErrorRate,
-        uint64_t threadCount);
+
 
 	    // Filter secondary/redundant alignments per read pair (hifiasm-style).
 		    void filterSecondaryAlignmentsPerReadPairThreadFunction(size_t threadId);
@@ -1026,18 +1011,6 @@ public:
     AlignmentCandidates alignmentCandidates;
 private:
 
-    // PAF-imported overlap intervals, keyed by canonical read pair (readId0<readId1).
-    // Populated by importAlignmentCandidatesFromPaf and consumed by chainPafCandidates
-    // to constrain shared-minimizer collection to the interval hifiasm already agreed on.
-    // Each pair can hold both a same-strand and a reverse overlap (PafPairIntervals),
-    // since inverted repeats can produce both. PafCandidateInterval/PafPairIntervals are
-    // defined in PafImport.hpp; coordinates are half-open base positions on each read,
-    // target coordinates forward-strand (Alignment::ts/te).
-    // Key packs (readId0<<32 | readId1) with readId0<readId1.
-public:
-    std::unordered_map<uint64_t, PafPairIntervals> pafCandidateIntervals;
-private:
-
 public:
     void writeAlignmentCandidates(bool useReadName=false, bool verbose=false) const;
 private:
@@ -1064,8 +1037,6 @@ public:
     void accessAlignmentCandidateTable();
     vector<OrientedReadPair> getAlignmentCandidates() const;
     void computeCandidateTable();
-    // threadCount == 0 means "use all hardware threads".
-    void importAlignmentCandidatesFromPaf(const string& pafFilePath, uint64_t threadCount = 0);
 
     // Import candidates directly from hifiasm's in-memory overlaps (no PAF file).
     // overlaps/names/nameOffsets come from hifiasm_detect_overlaps_mem(); read
@@ -1086,18 +1057,9 @@ public:
         uint64_t cigarLen,
         uint64_t threadCount = 0);
 
-    // Chain pre-imported PAF candidates using the inverted index.
-    // buildInvertedIndex must be called before this.
-    void chainPafCandidates(
-        double maxDriftRate,
-        uint64_t maxChainLimit,
-        const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint64_t threadCount
-    );
-
 private:
-    // Shared dedup + publish tail for both overlap importers (PAF file and
-    // in-memory hifiasm). Returns the number of duplicate entries merged away.
+    // Dedup + publish tail for the in-memory hifiasm overlap importer.
+    // Returns the number of duplicate entries merged away.
     uint64_t publishPafEntries(vector<PafEntry>& entries);
 
 public:
@@ -1426,8 +1388,9 @@ public:
         return (*containmentParent)[readId];
     }
 #endif
-private:
+public:
     MemoryMapped::VectorOfVectors<char, uint64_t> compressedAlignments;
+private:
 
     void checkAlignmentDataAreOpen() const;
 public:
@@ -1701,46 +1664,6 @@ private:
     };
     FlagInconsistentAlignmentsData flagInconsistentAlignmentsData;
 public:
-
-
-
-    // Functions and data used with read creation for iterative assembly.
-    void createReadGraphUsingPseudoPaths(
-        int64_t matchScore,
-        int64_t mismatchScore,
-        int64_t gapScore,
-        double mismatchSquareFactor,
-        double minScore,
-        uint64_t maxAlignmentCount,
-        uint64_t threadCount);
-    class CreateReadGraphsingPseudoPathsAlignmentData {
-    public:
-        uint64_t alignedMarkerCount = 0;
-
-        // Pseudo-path alignment information.
-        uint64_t weakMatchCount = 0;
-        uint64_t strongMatchCount = 0;
-        uint64_t mismatchCount = 0;
-    };
-    class CreateReadGraphUsingPseudoPathsData {
-    public:
-        int64_t matchScore;
-        int64_t mismatchScore;
-        int64_t gapScore;
-
-        // The pseudopaths of all oriented reads.
-        // Indexed by OrientedReadId::getValue().
-        vector< vector<AssemblyGraphEdgeId> > pseudoPaths;
-
-        // Vector to store information about each alignment.
-        vector<CreateReadGraphsingPseudoPathsAlignmentData> alignmentInfos;
-    };
-    CreateReadGraphUsingPseudoPathsData createReadGraphUsingPseudoPathsData;
-
-    // Thread function used to compute pseudoPaths.
-    void createReadGraphUsingPseudoPathsThreadFunction1(size_t threadId);
-    // Thread functions used to align pseudopaths.
-    void createReadGraphUsingPseudoPathsThreadFunction2(size_t threadId);
 
 
 
@@ -2301,43 +2224,6 @@ public:
 
 
 
-    // Cluster the oriented reads on a marker graph edge based on their sequence.
-    // This returns a vector of connected components.
-    // Each connected component is an index into the marker intervals for the edge.
-    vector< vector<uint64_t> > clusterMarkerGraphEdgeOrientedReads(
-        MarkerGraphEdgeId,
-        double errorRateThreshold,
-        bool debug) const;
-
-
-
-    // Use clusterMarkerGraphEdgeOrientedReads to split secondary marker graph edges
-    // where necessary.
-    void splitMarkerGraphSecondaryEdges(
-        double errorRateThreshold,
-        uint64_t minCoverage,
-        uint64_t threadCount);
-    void splitMarkerGraphSecondaryEdgesThreadFunction(size_t threadId);
-    class SplitMarkerGraphSecondaryEdgesData {
-    public:
-        double errorRateThreshold;
-        uint64_t minCoverage;
-        uint64_t initialSecondaryCount;
-        uint64_t splitCount;
-        uint64_t createdCount;
-
-        // The new edges that were created by each thread.
-        class Edge {
-        public:
-            MarkerGraphVertexId source;
-            MarkerGraphVertexId target;
-            vector<MarkerInterval> markerIntervals;
-        };
-        vector< vector<Edge> > threadEdges;
-    };
-    SplitMarkerGraphSecondaryEdgesData splitMarkerGraphSecondaryEdgesData;
-
-
 
     // Set marker graph edge flags to specified values for all marker graph edges.
     // Specify any value other than 0 or 1 leaves that flag unchanged.
@@ -2448,101 +2334,6 @@ public:
         uint64_t referenceReadCount,
         uint64_t threadCount,
         uint64_t maxRefKmerFreq = 1);
-
-    // Alignment candidates using Inverted Index (modular pipeline).
-    // Phase 1-4: Build the inverted index for overlap candidate discovery.
-    // buildCanonicalCache=true (default) stores a per-marker canonical k-mer
-    // cache that lets chaining skip reverse-complement recomputation, at a cost
-    // of ~17 bytes/marker of persistent RAM. Set false to save that memory on
-    // low-RAM machines; the query phase then recomputes canonicalization inline.
-    void buildInvertedIndex(uint64_t threadCount, bool buildCanonicalCache = true);
-
-    // Phase 5: Run DP chaining on the built index to find alignment candidates.
-    void chainAlignmentCandidates(
-        double maxDriftRate,
-        uint64_t maxChainLimit,
-        const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint64_t threadCount
-    );
-
-    // Convenience wrapper that calls both buildInvertedIndex and chainAlignmentCandidates.
-    void findAlignmentCandidatesInvertedIndex(
-        double maxDriftRate,
-        uint64_t maxChainLimit,
-        const OverlapCandidatesOptions& overlapCandidatesOptions,
-        uint64_t threadCount
-    );
-public:
-    // Compact Structure for Query Phase (8 bytes).
-    struct CompactOccurrence {
-        ReadId readId;
-        uint32_t position;
-    };
-
-	    class AlignmentCandidatesInvertedIndexData {
-	    public:
-	         double maxDriftRate;
-	         uint64_t k; // k-mer length for canonicalization
-	         uint64_t coverageHet; // Added for Hifiasm Parity (Gradient Scoring)
-             // InvertedIndex chaining configuration (see OverlapCandidatesOptions for meaning).
-             double weightExponent = 1.1;
-             double lowFreqMultiplier = 0.333;
-             double highFreqMultiplier = 1.667;
-             uint32_t rareKmerWeight = 2;
-             bool downsampleHighFrequencyMarkers = true;
-             uint32_t highFrequencySampleDistance = 500;
-             uint32_t maxHighFrequencyPerStreak = 16;
-             double highFactor = 5.0;        // Hifiasm high_factor: max_n_chain = max(hom_cov * high_factor, min_n_chain)
-             uint32_t minNChain = 100;       // Hifiasm MIN_N_CHAIN: minimum max_n_chain value
-	             double nonRedundantOverlapFraction = 0.5;
-		             bool lchainIsAccurate = true;
-		             bool useEcScoring = true;
-	             bool enableMcopyFast = true;
-             // Chaining scoring mode: 0 = hifiasm, 1 = minimap2-sr.
-             int chainingMode = 0;
-             // When > 0, only chain pairs where at least one read is a
-             // reference (readId < referenceReadCount). Skips read-vs-read.
-             uint64_t referenceReadCount = 0;
-             int32_t minimap2Bw = 100;
-             int32_t minimap2MaxGap = 100;
-             int32_t minimap2MinChainScore = 25;
-             uint32_t mcopyNum = 3;
-             double mcopyRate = 0.70;
-             uint32_t mcopyKhitCutoff = 32;
-             uint32_t mcopyOcvWindow = 3072;
-             double mcopyOcvWeakKeepRatio = 0.70;
-             uint32_t minOverlapLength = 0;  // If >0, reject candidates whose min(qSpan, tSpan) < threshold.
-             uint32_t maxEndFuzz = 0;        // If >0, reject candidates needing more extension to read ends.
-             uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during hit collection.
-	             vector<uint32_t> weightLut; // size 512 (pow(weightBase, weightExponent) truncated)
-	         
-         // Compact vector for Query (8 bytes/hit).
-         vector<CompactOccurrence> compactOccurrences;
-
-	         // Canonical k-mer ids for strand-0 markers, laid out read-contiguously.
-	         // offsets[r]..offsets[r+1]-1 corresponds to read r strand 0.
-	         // This cache lets chaining avoid per-marker reverse-complement work.
-	         vector<uint64_t> strand0CanonicalOffsets;
-	         vector<KmerId> strand0CanonicalKmerIds;
-	         // For each entry in strand0CanonicalKmerIds, stores whether the observed k-mer on strand 0
-	         // was the reverse complement of the canonical k-mer (1) or the canonical itself (0).
-	         // This is the hifiasm z->rev equivalent needed to compute per-hit rev = z->rev ^ y->rev.
-	         vector<uint8_t> strand0CanonicalIsRc;
-
-
-         // Open Addressing Hash Table (Linear Probing).
-         // Key = KmerId. Value = {Start, Count}.
-         // Stored as a flat vector. size must be Power of 2.
-         struct HashEntry {
-             KmerId key;
-             uint64_t start;
-             uint32_t count;
-             bool empty = true;
-         };
-         vector<HashEntry> hashTable;
-    };
-
-    AlignmentCandidatesInvertedIndexData invertedIndexData;
 
 private:
     void applyKmerCountFilterThreadFunctionPass1(size_t threadId);
@@ -3418,16 +3209,6 @@ public:
 private:
     shared_ptr<ConsensusCaller> consensusCaller;
 public:
-
-
-
-    // Assembly graph for mode 2 assembly.
-    shared_ptr<AssemblyGraph2> assemblyGraph2Pointer;
-    void createAssemblyGraph2(
-        uint64_t pruneLength,
-        const Mode2AssemblyOptions&,
-        uint64_t threadCount,
-        bool debug);
 
 
 

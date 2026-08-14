@@ -17,7 +17,7 @@
 //     same-strand overlap, reverse-complemented for a reverse overlap).
 //
 // dinara canonicalizes every read pair to read0 = min(ReadId), read1 =
-// max(ReadId) (see makePafEntry / pafCandidateIntervals). read0 always runs
+// max(ReadId) (see makePafEntry). read0 always runs
 // forward; read1 runs in the alignment orientation (reverse-complemented for a
 // reverse overlap), exactly as consumers walk it (e.g. read1Start = rlen - te
 // in AssemblerWindowProjectedAlignmentLeafSnarls.cpp).

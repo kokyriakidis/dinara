@@ -106,9 +106,6 @@ public:
     string exploreAccess;
     uint16_t port;
     string alignmentsPafFile;
-    string overlapsFromPafFile;
-    bool overlapsFromHifiasm;       // Run hifiasm and ALSO write hifiasm.ovlp.paf, then import it (file path).
-    bool overlapsFromInvertedIndex; // Opt out of hifiasm; use dinara's own inverted-index discovery.
     bool saveBinaryData;
 };
 
@@ -246,64 +243,9 @@ public:
     uint32_t maxEndFuzz = 0;       // If >0, discard candidates needing more extension (bases) to reach read ends.
     uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during chaining (markers still kept for journeys).
 
-    // Additional knobs for the InvertedIndex chaining path (defaults match hifiasm behavior).
-    // These exist so we can more easily match hifiasm/minimap2 behavior when needed.
-
-    // --- Marker frequency hard cutoff (hifiasm htab.cpp max_kmer_cnt) ---
-    // K-mers occurring more than this many times are excluded entirely from
-    // the marker set. Hifiasm default: 2000 (CommandLines.cpp:270).
-    // K-mers between 5*coverageHet and this threshold are kept but subject
-    // to per-streak downsampling during chaining.
-    uint32_t invertedIndexMaxKmerCount = 2000;
-
-    // --- Marker frequency-based weighting (hifiasm anchor.cpp) ---
-    double invertedIndexWeightExponent = 1.1;                // Exponent for frequency-based weight LUT: weight = pow(count, exponent)
-    double invertedIndexLowFreqMultiplier = 0.333;           // Hifiasm HA_KMER_GOOD_RATIO: low_occ = hom_cov * 0.333
-    double invertedIndexHighFreqMultiplier = 1.667;          // Hifiasm: high_occ = hom_cov * (2.0 - HA_KMER_GOOD_RATIO) = hom_cov * 1.667
-    uint32_t invertedIndexRareKmerWeight = 2;                // Weight assigned to rare/informative kmers
-
-    // --- High-frequency marker downsampling (hifiasm sketch.cpp) ---
-    bool invertedIndexDownsampleHighFrequencyMarkers = true; // Downsample high-frequency marker streaks before chaining
-    uint32_t invertedIndexHighFrequencySampleDistance = 500; // Sample distance for computing streak retention
-    uint32_t invertedIndexMaxHighFrequencyPerStreak = 16;    // Hifiasm MAX_MAX_HIGH_OCC: hard cap on high-freq markers per streak
-
-    // --- Chain selection strategy (hifiasm anchor.cpp soft ranking) ---
-    // Hifiasm uses soft ranking: keep top N overlaps per read by score, no hard minimum score threshold.
-    // The max_n_chain limit (max overlaps per read) is computed as: max(hom_cov * high_factor, min_n_chain)
-    double invertedIndexHighFactor = 5.0;                    // Hifiasm high_factor: max_n_chain = max(hom_cov * 5.0, 100) (CommandLines.cpp:271,413)
-    uint32_t invertedIndexMinNChain = 100;                   // Hifiasm MIN_N_CHAIN: minimum max_n_chain (CommandLines.h:28)
-
-    // --- Redundant chain suppression (hifiasm chain_cutoff logic) ---
-    // Note: Hifiasm's r484 interval overlap filtering (anchor.cpp:1874-1911) is commented out.
-    // Setting to 1.0 disables this filtering to match hifiasm's current behavior (no interval filtering).
-    // If hifiasm's r484 were active, it would use 0.95 threshold.
-    double invertedIndexNonRedundantOverlapFraction = 1.0;   // Disabled (was 0.5) - matches hifiasm r484 commented-out state
-
-    // --- Chaining scoring mode ---
-    // 0 = hifiasm (adaptive bandwidth, linear/adaptive gap penalty)
-    // 1 = minimap2-sr (fixed bandwidth, log gap penalty)
-    int chainingMode = 0;
-    int32_t minimap2Bw = 100;       // Fixed bandwidth for minimap2-sr mode (minimap2 -r100).
-    int32_t minimap2MaxGap = 100;   // Max gap for minimap2-sr mode (minimap2 -g100).
-    int32_t minimap2MinChainScore = 25; // Min chain score (minimap2 -m25).
-
     // When > 0, only chain pairs where at least one read has
     // readId < referenceReadCount. Skips read-vs-read pairs.
     uint64_t referenceReadCount = 0;
-
-    // --- Chaining parameters (hifiasm lchain) ---
-    bool invertedIndexLchainIsAccurate = true;               // Hifiasm is_accurate=1 for ONT error correction path (ecovlp.cpp:3274)
-    bool invertedIndexUseEcScoring = true;                   // Use hifiasm comput_sc_ch_ec long-gap penalty scoring
-
-    // --- Multi-peak chain extraction (hifiasm mcopy) ---
-    bool invertedIndexEnableMcopyFast = true;                // Enable mcopy_fast: extract multiple score-competitive chains
-    uint32_t invertedIndexMcopyNum = 3;                      // Hifiasm ecovlp.cpp:3274: keep up to 3 chains per pair
-    double invertedIndexMcopyRate = 0.70;                    // Hifiasm ecovlp.cpp:3274: keep chains with score >= best * 0.7
-    uint32_t invertedIndexMcopyKhitCutoff = 32;              // Hifiasm ecovlp.cpp:3274: require >=32 markers to enable mcopy
-
-    // --- Overlap coverage control (hifiasm COV_W) ---
-    uint32_t invertedIndexMcopyOcvWindow = 3072;             // Hifiasm COV_W=3072: window size for containing-overlap detection
-    double invertedIndexMcopyOcvWeakKeepRatio = 0.70;        // Keep weak overlaps when window coverage fraction >= 0.7
 
     void write(ostream&) const;
 };
@@ -470,7 +412,6 @@ public:
 
 
 // Assembly options that are specific to Mode 2 assembly.
-// See class AssemblyGraph2 for more information.
 class dinara::Mode2AssemblyOptions {
 public:
 

@@ -20,20 +20,12 @@ using namespace dinara;
 // Standard libraries.
 #include "chrono.hpp"
 #include <cmath>
-#include <filesystem>
 #include "iterator.hpp"
 #include "tuple.hpp"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <thread>
-
-// Linux, for the memory-mapped parallel PAF reader.
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 // hifiasm in-memory overlap bridge (hifiasm_overlap_t).
 #include "hifiasm_overlaps.h"
@@ -256,164 +248,10 @@ void Assembler::alignOverlappingOrientedReads(
 // Minimum PAF alignment block length (column 11) for an overlap to be kept.
 static constexpr uint64_t pafMinAlignmentBlockLength = 200;
 
-void Assembler::importAlignmentCandidatesFromPaf(const string& pafFilePath, uint64_t threadCount)
-{
-    // Memory-map the PAF file and parse it in parallel. The file is split into
-    // line-aligned byte ranges (one per thread); each thread parses its range
-    // with a locale-free, allocation-free scanner (see PafImport.hpp) into a
-    // thread-local vector of PafEntry. The per-thread vectors are concatenated
-    // and then sorted/deduplicated once, keeping the longest overlap per read
-    // pair. The result is deterministic and independent of thread count.
-    //
-    // Only overlaps actually present in the PAF are chained: no transitive
-    // expansion is performed. The interval each record agreed on is retained in
-    // pafCandidateIntervals for chainPafCandidates.
-
-    if (!std::filesystem::exists(pafFilePath)) {
-        throw runtime_error("PAF file not found: " + pafFilePath);
-    }
-
-    cout << timestamp << "Loading alignment candidates from " << pafFilePath << "..." << endl;
-    const auto tBegin = steady_clock::now();
-
-    alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
-    pafCandidateIntervals.clear();
-
-    // ---- Memory-map the file. ----
-    const int fd = ::open(pafFilePath.c_str(), O_RDONLY);
-    if (fd == -1) {
-        throw runtime_error("Error opening PAF file: " + pafFilePath);
-    }
-    struct stat st{};
-    if (::fstat(fd, &st) == -1) {
-        ::close(fd);
-        throw runtime_error("Error stat-ing PAF file: " + pafFilePath);
-    }
-    const size_t fileSize = size_t(st.st_size);
-
-    const char* data = nullptr;
-    void* mapping = MAP_FAILED;
-    if (fileSize > 0) {
-        mapping = ::mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (mapping == MAP_FAILED) {
-            ::close(fd);
-            throw runtime_error("Error memory-mapping PAF file: " + pafFilePath);
-        }
-        // Sequential access hint improves read-ahead behavior.
-        ::madvise(mapping, fileSize, MADV_SEQUENTIAL);
-        data = reinterpret_cast<const char*>(mapping);
-    }
-    ::close(fd);
-
-    // ---- Split into line-aligned chunks and parse in parallel. ----
-    // threadCount == 0 means "auto": use all hardware threads.
-    if (threadCount == 0) threadCount = std::thread::hardware_concurrency();
-    if (threadCount == 0) threadCount = 1;
-
-    const auto ranges = computePafChunkRanges(data, fileSize, threadCount);
-    const size_t nRanges = ranges.size();
-
-    vector<vector<PafEntry>> threadEntries(nRanges);
-    vector<uint64_t> threadParsed(nRanges, 0);   // Lines that produced a kept overlap.
-    vector<uint64_t> threadMalformed(nRanges, 0);
-
-    vector<std::thread> threads;
-    threads.reserve(nRanges);
-    for (size_t ti = 0; ti < nRanges; ti++) {
-        threads.emplace_back([&, ti]() {
-            const size_t rBegin = ranges[ti].first;
-            const size_t rEnd = ranges[ti].second;
-            auto& entries = threadEntries[ti];
-            uint64_t parsed = 0;
-            uint64_t malformed = 0;
-
-            const char* p = data + rBegin;
-            const char* const chunkEnd = data + rEnd;
-            while (p < chunkEnd) {
-                // Find end of this line within the chunk.
-                const char* lineEnd = p;
-                while (lineEnd < chunkEnd && *lineEnd != '\n') ++lineEnd;
-
-                PafRecord rec;
-                if (parsePafLine(p, lineEnd, rec)) {
-                    if (rec.alignLen >= pafMinAlignmentBlockLength) {
-                        const ReadId readId0 = reads->getReadId(rec.qName);
-                        const ReadId readId1 = reads->getReadId(rec.tName);
-                        const bool valid =
-                            readId0 != invalidReadId &&
-                            readId1 != invalidReadId &&
-                            readId0 != readId1 &&
-                            !reads->getFlags(readId0).isPalindromic &&
-                            !reads->getFlags(readId1).isPalindromic;
-                        if (valid) {
-                            entries.push_back(makePafEntry(
-                                readId0, readId1,
-                                uint32_t(rec.qStart), uint32_t(rec.qEnd),
-                                uint32_t(rec.tStart), uint32_t(rec.tEnd),
-                                uint32_t(rec.alignLen), rec.isSameStrand));
-                            ++parsed;
-                        }
-                    }
-                } else if (lineEnd != p) {
-                    // Non-empty line that failed to parse (ignore blank lines).
-                    ++malformed;
-                }
-
-                // Advance past the newline (if any).
-                p = (lineEnd < chunkEnd) ? lineEnd + 1 : chunkEnd;
-            }
-
-            threadParsed[ti] = parsed;
-            threadMalformed[ti] = malformed;
-        });
-    }
-    for (auto& t : threads) t.join();
-
-    // ---- Merge thread-local entries into one vector. ----
-    size_t totalEntries = 0;
-    uint64_t parsedTotal = 0;
-    uint64_t malformedTotal = 0;
-    for (size_t ti = 0; ti < nRanges; ti++) {
-        totalEntries += threadEntries[ti].size();
-        parsedTotal += threadParsed[ti];
-        malformedTotal += threadMalformed[ti];
-    }
-    vector<PafEntry> entries;
-    entries.reserve(totalEntries);
-    for (size_t ti = 0; ti < nRanges; ti++) {
-        auto& te = threadEntries[ti];
-        entries.insert(entries.end(), te.begin(), te.end());
-        vector<PafEntry>().swap(te);   // Free thread-local memory eagerly.
-    }
-
-    if (fileSize > 0 && mapping != MAP_FAILED) {
-        ::munmap(mapping, fileSize);
-    }
-
-    // ---- Deduplicate + publish. Shared with the in-memory hifiasm path so the
-    // two overlap sources cannot drift in dedup or candidate-emission semantics. ----
-    const size_t rawCount = entries.size();
-    const uint64_t duplicateCount = publishPafEntries(entries);
-
-    const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        steady_clock::now() - tBegin).count());
-    cout << timestamp << "Parsed " << parsedTotal << " PAF overlap records ("
-         << duplicateCount << " duplicate pairs merged";
-    if (malformedTotal > 0) {
-        cout << ", " << malformedTotal << " malformed lines skipped";
-    }
-    cout << ") in " << seconds << " s using " << nRanges << " threads." << endl;
-    cout << timestamp << "Total PAF candidates: " << alignmentCandidates.candidates.size() << endl;
-    (void)rawCount;
-}
-
-
-// Deduplicate the parsed/collected PAF entries (one entry per (read pair,
-// strand), keeping the longest overlap) and publish them into
-// alignmentCandidates.candidates + pafCandidateIntervals. Returns the number of
-// duplicate entries that were merged away. Shared by the PAF-file importer and
-// the in-memory hifiasm importer; the caller must have created
-// alignmentCandidates.candidates and cleared pafCandidateIntervals.
+// Deduplicate the collected overlap entries (one entry per (read pair, strand),
+// keeping the longest overlap) and publish them into
+// alignmentCandidates.candidates. Returns the number of duplicate entries that
+// were merged away. The caller must have created alignmentCandidates.candidates.
 uint64_t Assembler::publishPafEntries(vector<PafEntry>& entries)
 {
     const size_t rawCount = entries.size();
@@ -425,18 +263,8 @@ uint64_t Assembler::publishPafEntries(vector<PafEntry>& entries)
 
     // Publish (deterministic: entries are in ascending key order, same-strand
     // before reverse within a key). Each surviving entry becomes one oriented
-    // candidate; both orientations of a pair are folded into the pair's
-    // PafPairIntervals so chaining can look up the interval for either strand.
-    pafCandidateIntervals.reserve(entries.size());
+    // candidate.
     for (const PafEntry& e : entries) {
-        PafPairIntervals& pair = pafCandidateIntervals[e.key];
-        if(e.iv.isSameStrand) {
-            pair.same = e.iv;
-            pair.haveSame = true;
-        } else {
-            pair.diff = e.iv;
-            pair.haveDiff = true;
-        }
         const ReadId readId0 = ReadId(e.key >> 32);
         const ReadId readId1 = ReadId(e.key & 0xffffffffULL);
         alignmentCandidates.candidates.push_back(
@@ -468,7 +296,6 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const auto tBegin = steady_clock::now();
 
     alignmentCandidates.candidates.createNew(largeDataName("AlignmentCandidates"), largeDataPageSize);
-    pafCandidateIntervals.clear();
     hifiasmImportedCigarStore.clear();
 
     if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
@@ -545,9 +372,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
 
     // publishPafEntries deduped `entries` in place, so it now holds exactly the
     // overlaps that became candidates (one per key+strand, the longest). Copy
-    // each survivor's hifiasm CIGAR into the imported-CIGAR store, keyed the same
-    // way as pafCandidateIntervals, so computeBaseAlignmentsAndStore can reuse
-    // hifiasm's base alignment instead of recomputing it. Stored in the native
+    // each survivor's hifiasm CIGAR into the imported-CIGAR store, keyed by
+    // canonical read pair, so computeBaseAlignmentsAndStore can reuse hifiasm's
+    // base alignment instead of recomputing it. Stored in the native
     // (query,target) alignment frame; reframing to read0/read1 happens at use.
     if(cigar != nullptr) {
         uint64_t cigarOverlaps = 0;
@@ -903,31 +730,9 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
 
 
             // Compute the alignment.
-            bool precomputedUsed = false;
+            const bool precomputedUsed = false;
             try {
                 if(alignmentMethod == 0) {
-                    // ...
-                }
-                
-                // Direct Chain Propagation Check
-                if(!alignmentCandidatesAlignmentsData.alignments.empty() && 
-                   (alignmentMethod == 5 || alignmentMethod == 6)) { // Only supported for these methods/InvertedIndex
-                    if(i < alignmentCandidatesAlignmentsData.alignments.size()) {
-                        // Use precomputed alignment.
-                        alignment = alignmentCandidatesAlignmentsData.alignments[i];
-                        uint32_t mCount0 = uint32_t((*markers)[orientedReadIds[0].getValue()].size());
-                        uint32_t mCount1 = uint32_t((*markers)[orientedReadIds[1].getValue()].size());
-                        alignmentInfo.create(alignment, mCount0, mCount1);
-                        if(i < alignmentCandidatesAlignmentsData.sharedSeedScores.size()) {
-                            alignmentInfo.sharedSeedScore = alignmentCandidatesAlignmentsData.sharedSeedScores[i];
-                        }
-                        precomputedUsed = true;
-                    }
-                }
-
-                if(precomputedUsed) {
-                    // Skip alignment computation.
-                } else if(alignmentMethod == 0) {
 
                     // Get the markers for the two oriented reads in this candidate.
                     for(size_t j=0; j<2; j++) {
@@ -1038,7 +843,6 @@ void Assembler::computeAlignmentsThreadFunction(size_t threadId)
             
             alignmentInfo.errorRate = float(projectedAlignment.errorRate());
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
-            alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             alignmentInfo.errorRateGaps = float(projectedAlignment.errorRateGaps());
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalIndelBaseCount);
             alignmentInfo.gapEventCount = uint32_t(projectedAlignment.totalGapEventCount); // Transfer gap events

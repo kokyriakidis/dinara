@@ -92,9 +92,7 @@ static void gatherOverlaps(
         ov.alignmentId = alignmentId;
         ov.cigarOffset = info.cigarOffset;
         ov.cigarTokenCount = info.cigarTokenCount;
-        ov.errorCount = (info.nonHomopolymerErrorCount != uint32_t(-1))
-            ? info.nonHomopolymerErrorCount
-            : (info.mismatchCount + info.gapCount);
+        ov.errorCount = info.mismatchCount + info.gapCount;
         ov.isMatch = 1; // default cis, matching hifiasm post-alignment state
         ov.strong = 0;
 

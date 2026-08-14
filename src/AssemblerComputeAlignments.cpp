@@ -31,6 +31,108 @@
 using namespace dinara;
 using namespace std;
 
+void Assembler::deriveChainFromInterval(
+    const array<OrientedReadId, 2>& orientedReadIds,
+    uint32_t read0Begin, uint32_t read0End,
+    uint32_t read1Begin, uint32_t read1End,
+    vector< array<uint32_t, 2> >& ordinals) const
+{
+    ordinals.clear();
+
+    // Markers and their KmerIds share the same oriented indexing (index ==
+    // ordinal) and are position-sorted ascending in each oriented frame.
+    const auto markers0    = (*markers)[orientedReadIds[0].getValue()];
+    const auto markers1    = (*markers)[orientedReadIds[1].getValue()];
+    const auto kmerIds0    = (*markerKmerIds)[orientedReadIds[0].getValue()];
+    const auto kmerIds1    = (*markerKmerIds)[orientedReadIds[1].getValue()];
+
+    // Collect (KmerId, ordinal) for markers whose position lies in the overlap
+    // box on each side. Positions are sorted, so we can stop once past the end.
+    // Pair type kept local; sorted by KmerId for the intersection below.
+    using KmerOrdinal = pair<KmerId, uint32_t>;
+    vector<KmerOrdinal> box0, box1;
+    auto collect = [](
+        const span<const CompressedMarker>& m,
+        const span<const KmerId>& kids,
+        uint32_t begin, uint32_t end,
+        vector<KmerOrdinal>& out)
+    {
+        const uint32_t n = uint32_t(m.size());
+        for(uint32_t ord = 0; ord < n; ++ord) {
+            const uint32_t pos = m[ord].position;
+            if(pos < begin) continue;
+            if(pos >= end) break;              // sorted: no later marker qualifies
+            out.emplace_back(kids[ord], ord);
+        }
+    };
+    collect(markers0, kmerIds0, read0Begin, read0End, box0);
+    collect(markers1, kmerIds1, read1Begin, read1End, box1);
+
+    if(box0.empty() || box1.empty()) {
+        return;
+    }
+
+    // Sort each side by KmerId, then mark KmerIds that occur more than once on a
+    // side: within the box such anchors are ambiguous (repeats) and are dropped,
+    // exactly like a seed-chaining step ignoring high-multiplicity minimizers.
+    auto byKmer = [](const KmerOrdinal& a, const KmerOrdinal& b) {
+        return a.first < b.first;
+    };
+    sort(box0.begin(), box0.end(), byKmer);
+    sort(box1.begin(), box1.end(), byKmer);
+
+    // Two-pointer intersection over sorted-by-KmerId lists. Only KmerIds that
+    // appear EXACTLY once on each side produce an anchor pair {ord0, ord1}.
+    vector< array<uint32_t, 2> > anchors;
+    {
+        size_t i = 0, j = 0;
+        const size_t n0 = box0.size(), n1 = box1.size();
+        while(i < n0 && j < n1) {
+            if(box0[i].first < box1[j].first) {
+                ++i;
+            } else if(box1[j].first < box0[i].first) {
+                ++j;
+            } else {
+                // Equal KmerId. Count run length on each side.
+                const KmerId key = box0[i].first;
+                size_t iEnd = i, jEnd = j;
+                while(iEnd < n0 && box0[iEnd].first == key) ++iEnd;
+                while(jEnd < n1 && box1[jEnd].first == key) ++jEnd;
+                if((iEnd - i) == 1 && (jEnd - j) == 1) {
+                    anchors.push_back({box0[i].second, box1[j].second});
+                }
+                i = iEnd;
+                j = jEnd;
+            }
+        }
+    }
+
+    if(anchors.empty()) {
+        return;
+    }
+
+    // Order anchors by read0 ordinal. Inside hifiasm's validated box the overlap
+    // is colinear, so read1 ordinals are then already almost-monotonic; enforce a
+    // strictly-increasing guard on read1 to yield a valid chain and drop the rare
+    // out-of-order anchor (a mismapped repeat that slipped the multiplicity test).
+    sort(anchors.begin(), anchors.end(),
+        [](const array<uint32_t, 2>& a, const array<uint32_t, 2>& b) {
+            return a[0] < b[0];
+        });
+
+    ordinals.reserve(anchors.size());
+    uint32_t lastOrd1 = 0;
+    bool haveLast = false;
+    for(const array<uint32_t, 2>& a : anchors) {
+        if(haveLast && a[1] <= lastOrd1) {
+            continue;                         // keep read1 strictly increasing
+        }
+        ordinals.push_back(a);
+        lastOrd1 = a[1];
+        haveLast = true;
+    }
+}
+
 void Assembler::computeBaseAlignmentsAndStore(
     const AlignOptions& alignOptions,
     uint64_t threadCount
@@ -175,116 +277,16 @@ void Assembler::computeBaseAlignmentsAndStore(
 
 
 
-void Assembler::computeAlignmentDataFromChainedCandidatesOnly(
-    const AlignOptions& alignOptions,
-    uint64_t threadCount)
-{
-    const auto tBegin = steady_clock::now();
-    const size_t candidateCount = alignmentCandidates.candidates.size();
-
-    cout << timestamp << "Begin lightweight alignmentData materialization for "
-         << candidateCount << " chained candidates." << endl;
-
-    reads->checkReadsAreOpen();
-    checkMarkersAreOpen();
-    checkAlignmentCandidatesAreOpen();
-
-    if(threadCount == 0) {
-        threadCount = std::thread::hardware_concurrency();
-    }
-    (void)threadCount; // This path is intentionally simple; no base DP is run.
-
-    const auto& candidates = alignmentCandidates.candidates;
-    const auto& precomputedAlignments = alignmentCandidatesAlignmentsData.alignments;
-    const auto& precomputedSharedSeedScores = alignmentCandidatesAlignmentsData.sharedSeedScores;
-    const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
-        size_t(alignOptions.minAlignedMarkerCount) : 0;
-
-    alignmentData.createNew(
-        largeDataName("AlignmentData"),
-        largeDataPageSize,
-        0,
-        candidateCount);
-    compressedAlignments.createNew(largeDataName("CompressedAlignments"), largeDataPageSize);
-
-    string compressedAlignment;
-    uint64_t skippedEmpty = 0;
-    uint64_t skippedShort = 0;
-
-    for(uint64_t candidateIndex=0; candidateIndex<candidateCount; candidateIndex++) {
-        const Alignment& alignment = precomputedAlignments[candidateIndex];
-        if(alignment.ordinals.empty()) {
-            ++skippedEmpty;
-            continue;
-        }
-        if(minAlignedMarkerCount > 0 &&
-            alignment.ordinals.size() < minAlignedMarkerCount) {
-            ++skippedShort;
-            continue;
-        }
-
-        const OrientedReadPair& candidate = candidates[candidateIndex];
-        const array<OrientedReadId, 2> orientedReadIds = {
-            OrientedReadId(candidate.readIds[0], 0),
-            OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1)
-        };
-        const array<span<const CompressedMarker>, 2> markerSpans = {
-            (*markers)[orientedReadIds[0].getValue()],
-            (*markers)[orientedReadIds[1].getValue()]
-        };
-
-        AlignmentInfo alignmentInfo(
-            alignment,
-            uint32_t(markerSpans[0].size()),
-            uint32_t(markerSpans[1].size()));
-        if(candidateIndex < precomputedSharedSeedScores.size()) {
-            alignmentInfo.sharedSeedScore = precomputedSharedSeedScores[candidateIndex];
-        }
-
-        AlignmentData thisAlignmentData(candidate, alignmentInfo);
-        thisAlignmentData.qs = alignment.qs;
-        thisAlignmentData.qe = alignment.qe;
-        thisAlignmentData.ts = alignment.ts;
-        thisAlignmentData.te = alignment.te;
-        thisAlignmentData.hasLargeIndel = false;
-        thisAlignmentData.informativeHetSiteCount0 = 0;
-        thisAlignmentData.informativeHetSiteCount1 = 0;
-        thisAlignmentData.informativeHetSiteScore = 0;
-        thisAlignmentData.deleteReasons0 = AlignmentData::DeleteReasonNone;
-        thisAlignmentData.deleteReasons1 = AlignmentData::DeleteReasonNone;
-
-        alignmentData.push_back(thisAlignmentData);
-
-        dinara::compress(alignment, compressedAlignment);
-        compressedAlignments.appendVector(
-            compressedAlignment.begin(),
-            compressedAlignment.end());
-    }
-
-    alignmentData.unreserve();
-    compressedAlignments.unreserve();
-
-    performanceLog << timestamp << "Creating alignment table." << endl;
-    computeAlignmentTable();
-
-    const auto tEnd = steady_clock::now();
-    const double elapsedSeconds = seconds(tEnd - tBegin);
-    cout << timestamp << "Done lightweight alignmentData materialization. "
-         << "kept=" << alignmentData.size()
-         << " skippedEmpty=" << skippedEmpty
-         << " skippedShort=" << skippedShort
-         << " elapsed=" << elapsedSeconds << " s." << endl;
-}
-
-
 
 void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
     auto& data = computeAlignmentsData;
     const AlignOptions& alignOptions = *data.alignOptions;
     auto& threadAlignmentData = data.threadAlignmentData[threadId];
     const auto& candidates = alignmentCandidates.candidates;
-    const auto& precomputedAlignments = alignmentCandidatesAlignmentsData.alignments;
-    const auto& precomputedSharedSeedScores = alignmentCandidatesAlignmentsData.sharedSeedScores;
+    // Every candidate carries an imported hifiasm CIGAR (candidates and the
+    // CIGAR store come from the SAME deduped import list, keyed identically).
+    // The marker-ordinal chain is DERIVED per candidate from the hifiasm overlap
+    // box (deriveChainFromInterval); there is no separate chaining DP.
     const uint32_t markerK = uint32_t(assemblerInfo->k);
     const bool collectProjectedTiming = (assemblerInfo->readGraphCreationMethod == 5);
     const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
@@ -310,20 +312,11 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
     while(getNextBatch(begin, end)) {
         for(uint64_t candidateIndex = begin; candidateIndex != end; candidateIndex++) {
             const OrientedReadPair& candidate = candidates[candidateIndex];
-            
-            // This refactored flow EXCLUSIVELY uses precomputed chains.
-            // Chaining is now performed upfront during candidate generation/PAF import.
-            const Alignment& alignment = precomputedAlignments[candidateIndex];
-            if(alignment.ordinals.empty()) {
-                continue;
-            }
-            // Skip low-support candidates early.
-            // This avoids spending time in projected alignment construction for pairs
-            // that cannot possibly meet Align.minAlignedMarkerCount.
-            if(minAlignedMarkerCount > 0 &&
-                alignment.ordinals.size() < minAlignedMarkerCount) {
-                continue;
-            }
+
+            // The marker-ordinal chain is derived from hifiasm's overlap box
+            // (deriveChainFromInterval) after the CIGAR walk below. The chain
+            // size is only known after that derivation, so the
+            // minAlignedMarkerCount support filter is applied there.
             orientedReadIds[0] = OrientedReadId(candidate.readIds[0], 0);
             orientedReadIds[1] = OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1);
             const array<LongBaseSequenceView, 2> sequenceViews = {
@@ -341,29 +334,29 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 tProjStart = steady_clock::now();
             }
 
-            // Reuse hifiasm's base alignment when available: instead of
-            // recomputing the alignment with A*PA2 per candidate, reframe
-            // hifiasm's CIGAR into dinara's read0/read1 canonical frame and walk
-            // it clipped to the marker interval. Falls back to A*PA2 (Method
-            // QuickRawSparse) when no CIGAR was imported (PAF/raw path) or it
-            // does not span the interval.
+            // Reuse hifiasm's base alignment: reframe hifiasm's CIGAR into
+            // dinara's read0/read1 canonical frame and walk it clipped to the
+            // marker interval. Falls back to A*PA2 (Method QuickRawSparse) only
+            // if the imported CIGAR is missing/unusable for this pair.
             bool usedHifiasmCigar = false;
+            // The chain is derived from the overlap box (deriveChainFromInterval),
+            // so the ctor gets an empty local Alignment that we fill below; under
+            // Method::None the ctor does not read it.
+            Alignment directAlignment;
             ProjectedAlignment projectedAlignment(
                 markerK,
                 orientedReadIds,
                 sequenceViews,
-                alignment,
+                directAlignment,
                 markerSpans,
-                hifiasmImportedCigarStore.empty()
-                    ? ProjectedAlignment::Method::QuickRawSparse
-                    : ProjectedAlignment::Method::None,
+                ProjectedAlignment::Method::None,
                 dpMatchScore,
                 dpMismatchScore,
                 dpGapOpen1,
                 dpGapExtend1,
                 &cigarStore);
 
-            if(!hifiasmImportedCigarStore.empty()) {
+            {
                 // Candidate readIds are canonical (readIds[0] < readIds[1]); the
                 // pair key and strand match the imported-CIGAR store keys.
                 const uint64_t pairKey =
@@ -371,15 +364,6 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 const HifiasmImportedCigarStore::Record* rec =
                     hifiasmImportedCigarStore.find(pairKey, candidate.isSameStrand);
                 if(rec != nullptr && rec->cigarTokenCount > 0) {
-                    // Marker interval on read0 (forward coords), matching the
-                    // cigarRead0Start/End constructQuickRawSparse would compute.
-                    const uint32_t kHalf = markerK / 2;
-                    const auto lastIdx = alignment.ordinals.size() - 1;
-                    const uint32_t read0Begin =
-                        markerSpans[0][alignment.ordinals[0][0]].position + kHalf;
-                    const uint32_t read0End =
-                        markerSpans[0][alignment.ordinals[lastIdx][0]].position + kHalf;
-
                     // Reframe the native hifiasm CIGAR into read0/read1 canonical
                     // frame. read lengths are needed for the reverse-strand /
                     // id-swap cases.
@@ -393,10 +377,28 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                         rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
                         qLen, tLen, rec->isSameStrand);
 
+                    // Clip window is the CIGAR's own read0 span (forward coords).
+                    // The marker-ordinal chain is derived separately from the
+                    // hifiasm overlap interval (deriveChainFromInterval), not from
+                    // this walk; the walk only produces statistics and the CIGAR.
                     usedHifiasmCigar = projectedAlignment.constructFromHifiasmCigar(
                         span<const CigarToken>(norm.tokens.data(), norm.tokens.size()),
                         norm.read0Start, norm.read1Start,
-                        read0Begin, read0End);
+                        norm.read0Start, norm.read0End);
+
+                    // Derive the marker-ordinal chain from the overlap box hifiasm
+                    // validated. Both intervals are in the oriented frames of
+                    // orientedReadIds: read0 forward [read0Start,read0End); read1
+                    // in alignment orientation [read1Start,read1End) (norm already
+                    // reframed for reverse overlaps). No chaining DP -- the box is
+                    // colinear.
+                    if(usedHifiasmCigar) {
+                        deriveChainFromInterval(
+                            orientedReadIds,
+                            norm.read0Start, norm.read0End,
+                            norm.read1Start, norm.read1End,
+                            directAlignment.ordinals);
+                    }
                 }
                 if(!usedHifiasmCigar) {
                     // No usable CIGAR: recompute with A*PA2.
@@ -406,6 +408,16 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             if(collectProjectedTiming) {
                 data.threadProjectedAlignmentTime[threadId] += seconds(steady_clock::now() - tProjStart);
             }
+
+            // The chain size is only known after deriveChainFromInterval. Drop
+            // pairs with no chain or fewer than Align.minAlignedMarkerCount anchors.
+            if(directAlignment.ordinals.empty()) {
+                continue;
+            }
+            if(minAlignedMarkerCount > 0 &&
+                directAlignment.ordinals.size() < minAlignedMarkerCount) {
+                continue;
+            }
             
             // Error rate filtering.
             const double projectedErrorRate = projectedAlignment.errorRate();
@@ -414,18 +426,14 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 continue;
             }
 
-            // Create alignment info summary.
-            AlignmentInfo alignmentInfo(alignment, 
+            // Create alignment info summary from the derived-chain alignment.
+            AlignmentInfo alignmentInfo(directAlignment,
                 uint32_t(markerSpans[0].size()),
                 uint32_t(markerSpans[1].size())
             );
-            if(candidateIndex < precomputedSharedSeedScores.size()) {
-                alignmentInfo.sharedSeedScore = precomputedSharedSeedScores[candidateIndex];
-            }
-            
+
             alignmentInfo.errorRate = float(projectedErrorRate);
             alignmentInfo.mismatchCount = uint32_t(projectedAlignment.mismatchCount);
-            alignmentInfo.nonHomopolymerErrorCount = uint32_t(projectedAlignment.nonHomopolymerErrorCount);
             const double projectedGapErrorRate = projectedAlignment.errorRateGaps();
             alignmentInfo.errorRateGaps = float(projectedGapErrorRate);
             alignmentInfo.gapCount = uint32_t(projectedAlignment.totalIndelBaseCount);
@@ -480,7 +488,7 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
 
             threadAlignmentData.push_back(thisAlignmentData);
             
-            dinara::compress(alignment, compressedAlignment);
+            dinara::compress(directAlignment, compressedAlignment);
             thisThreadCompressedAlignments.appendVector(
                 compressedAlignment.begin(),
                 compressedAlignment.end()
@@ -978,13 +986,7 @@ void Assembler::keepOnlyBestAlignmentPerReadPairByDpScoreThreadFunction(size_t)
  * | `y_id` | `ad.readIds[1]` | Partner read ID |
  * | `x_pos_s, x_pos_e` | `ad.qs, ad.qe` | Query span (when readIds[0] = r0) |
  * | `is_match` | `hifiasmEcMatchState{0,1}` | Stored per read perspective |
- * | `non_homopolymer_errors` | `nonHomopolymerErrorCount` | Stored from ProjectedAlignment when available |
- *
- * ### Current limitation
- *
- * Dinara now stores `nonHomopolymerErrorCount` from ProjectedAlignment's
- * hifiasm-style homopolymer-aware CIGAR accounting. If that field is missing,
- * we fall back to `mismatchCount + gapCount`.
+ * | error count | `mismatchCount + gapCount` | From the CIGAR walk |
  *
  * ## Why Deduplication is Necessary
  *
@@ -1205,8 +1207,6 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
                 const uint32_t span = ad.qe - ad.qs;  // Matches hifiasm: x_pos_e + 1 - x_pos_s
 
                 const uint32_t err =
-                    (ad.info.nonHomopolymerErrorCount != invalid<uint32_t>) ?
-                    ad.info.nonHomopolymerErrorCount :
                     ((ad.info.mismatchCount == invalid<uint32_t>) ? 0U : ad.info.mismatchCount) +
                     ((ad.info.gapCount == invalid<uint32_t>) ? 0U : ad.info.gapCount);
 

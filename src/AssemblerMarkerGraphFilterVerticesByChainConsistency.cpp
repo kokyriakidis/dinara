@@ -25,7 +25,8 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
 
     checkMarkersAreOpen();
     checkMarkerGraphVerticesAreAvailable();
-    DINARA_ASSERT(alignmentCandidates.candidateTable.isOpen());
+    checkAlignmentDataAreOpen();
+    DINARA_ASSERT(alignmentTable.isOpen());
 
     if(threadCount == 0) {
         threadCount = std::thread::hardware_concurrency();
@@ -73,17 +74,27 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                     const OrientedReadId readIdI = readOrdinals[i].first;
                     const uint32_t ordinalI = readOrdinals[i].second;
 
-                    const auto candidateIndices =
-                        alignmentCandidates.candidateTable[readIdI.getValue()];
+                    // Chain endpoints per read pair come from the STORED alignment
+                    // (alignmentData / alignmentTable), not from the precomputed
+                    // chaining store: in direct-chaining mode the latter is empty,
+                    // and AlignmentInfo::data[slot].firstOrdinal/lastOrdinal capture
+                    // the same chain start/end ordinals in canonical orientation in
+                    // both modes.
+                    const auto alignmentIndices = alignmentTable[readIdI.getValue()];
 
-                    // For each candidate of readIdI, check if the other read
-                    // is one of the reads j > i in this vertex.
-                    for(const uint64_t candidateIndex : candidateIndices) {
+                    // For each stored alignment of readIdI, check if the other
+                    // read is one of the reads j > i in this vertex.
+                    for(const uint32_t alignmentIndex : alignmentIndices) {
                         if(foundInconsistent) break;
 
-                        const OrientedReadPair& pair =
-                            alignmentCandidates.candidates[candidateIndex];
-                        const OrientedReadId otherReadId = pair.getOther(readIdI);
+                        const AlignmentData& ad = alignmentData[alignmentIndex];
+                        const OrientedReadId canonicalRead0(ad.readIds[0], 0);
+                        const OrientedReadId canonicalRead1(ad.readIds[1],
+                            ad.isSameStrand ? 0 : 1);
+                        // The partner of readIdI in this alignment (canonical frame).
+                        const OrientedReadId otherReadId =
+                            (readIdI.getReadId() == ad.readIds[0]) ?
+                                canonicalRead1 : canonicalRead0;
 
                         // Find otherReadId among reads j > i in this vertex.
                         for(uint64_t j = i + 1; j < n; ++j) {
@@ -93,26 +104,15 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
 
                             // Found a pair (i, j) with an alignment. Check consistency.
                             const uint32_t ordinalJ = readOrdinals[j].second;
-                            const Alignment& alignment =
-                                alignmentCandidatesAlignmentsData.alignments[candidateIndex];
 
-                            if(alignment.ordinals.empty()) {
+                            if(ad.info.markerCount == 0) {
                                 foundInconsistent = true;
                                 break;
                             }
 
-                            // The alignment ordinals are stored for the canonical orientation:
-                            //   [0] -> OrientedReadId(readIds[0], 0)
-                            //   [1] -> OrientedReadId(readIds[1], isSameStrand ? 0 : 1)
-                            // If readIdI or readIdJ is on a different strand, we must
-                            // convert the vertex ordinal to the canonical ordinal space.
-                            const OrientedReadId canonicalRead0(pair.readIds[0], 0);
-                            const OrientedReadId canonicalRead1(pair.readIds[1],
-                                pair.isSameStrand ? 0 : 1);
-
                             // Determine which alignment slot (0 or 1) corresponds to readIdI and readIdJ.
                             int slotI, slotJ;
-                            if(readIdI.getReadId() == pair.readIds[0]) {
+                            if(readIdI.getReadId() == ad.readIds[0]) {
                                 slotI = 0;
                                 slotJ = 1;
                             } else {
@@ -137,10 +137,10 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                                 canonOrdinalJ = mc - 1 - ordinalJ;
                             }
 
-                            const uint32_t chainStartI = alignment.ordinals.front()[slotI];
-                            const uint32_t chainEndI   = alignment.ordinals.back()[slotI];
-                            const uint32_t chainStartJ = alignment.ordinals.front()[slotJ];
-                            const uint32_t chainEndJ   = alignment.ordinals.back()[slotJ];
+                            const uint32_t chainStartI = ad.info.data[slotI].firstOrdinal;
+                            const uint32_t chainEndI   = ad.info.data[slotI].lastOrdinal;
+                            const uint32_t chainStartJ = ad.info.data[slotJ].firstOrdinal;
+                            const uint32_t chainEndJ   = ad.info.data[slotJ].lastOrdinal;
 
                             if(canonOrdinalI < chainStartI || canonOrdinalI > chainEndI ||
                                canonOrdinalJ < chainStartJ || canonOrdinalJ > chainEndJ) {
