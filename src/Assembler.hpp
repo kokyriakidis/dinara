@@ -10,7 +10,6 @@
 #include "AlignmentCandidates.hpp"
 #include "Align6Marker.hpp"
 #include "AssemblerOptions.hpp"
-#include "AssemblyGraph2Statistics.hpp"
 #include "HttpServer.hpp"
 #include "Kmer.hpp"
 #include "KmerDistributionInfo.hpp"
@@ -64,16 +63,13 @@ namespace dinara {
     class Align6Options;
     class Align6;
     class AssemblerOptions;
-    class AssembledSegment;
     class ClusterGraph;
-    class CompressedAssemblyGraph;
     class ConsensusCaller;
     class Histogram2;
     class InducedAlignment;
     class KmerChecker;
     class KmerCounter;
     class KmersOptions;
-    class LocalAssemblyGraph;
     class LocalAlignmentCandidateGraph;
     class LocalAlignmentGraph;
     class LocalMarkerGraph0;
@@ -86,7 +82,6 @@ namespace dinara {
     class MarkerConnectivityGraph;
     class MarkerConnectivityGraphVertexMap;
     class MarkerKmers;
-    class Mode2AssemblyOptions;
     class Mode3AssemblyOptions;
     class Mode3Assembler;
     class OrientedReadPair;
@@ -100,10 +95,6 @@ namespace dinara {
     class Shasta2AssemblyGraph;
     class Shasta2AssemblyGraphOptions;
     class Shasta2AssemblyGraphPostprocessor;
-
-    namespace mode0 {
-        class AssemblyGraph;
-    }
 
     namespace mode3 {
         class Anchors;
@@ -232,9 +223,6 @@ public:
     size_t totalAssembledSegmentLength = 0;
     size_t longestAssembledSegmentLength = 0;
     size_t assembledSegmentN50 = 0;
-
-    // Mode 2 assembly statistics.
-    AssemblyGraph2Statistics assemblyGraph2Statistics;
 
     // Performance information.
     double assemblyElapsedTimeSeconds = 0.;
@@ -1993,59 +1981,6 @@ private:
     // Find the common KmerId for all the markers of a marker graph vertex.
     KmerId getMarkerGraphVertexKmerId(MarkerGraphVertexId) const;
 
-    // Clean up marker graph vertices that have duplicate markers
-    // (more than one marker on the same oriented reads).
-    // Such vertices are only generated when using --MarkerGraph.allowDuplicateMarkers.
-public:
-    void cleanupDuplicateMarkers(
-        uint64_t threadCount,
-        uint64_t minCoverage,
-        uint64_t minCoveragePerStrand,
-        double pattern1Threshold,
-        bool pattern1CreateNewVertices,
-        bool pattern2CreateNewVertices);
-private:
-    void cleanupDuplicateMarkersThreadFunction(size_t threadId);
-    void cleanupDuplicateMarkersPattern1(
-        MarkerGraph::VertexId,
-        uint64_t minCoverage,
-        uint64_t minCoveragePerStrand,
-        bool createNewVertices,
-        vector<MarkerDescriptor>&,
-        vector<bool>& isDuplicateOrientedReadId,
-        bool debug,
-        ostream& out);
-    void cleanupDuplicateMarkersPattern2(
-        MarkerGraph::VertexId,
-        uint64_t minCoverage,
-        uint64_t minCoveragePerStrand,
-        bool createNewVertices,
-        vector<MarkerDescriptor>&,
-        vector<bool>& isDuplicateOrientedReadId,
-        bool debug,
-        ostream& out);
-    class CleanupDuplicateMarkersData {
-    public:
-        uint64_t minCoverage;
-        uint64_t minCoveragePerStrand;
-        double pattern1Threshold;
-        bool pattern1CreateNewVertices;
-        bool pattern2CreateNewVertices;
-        uint64_t badVertexCount;    // Total number of vertices with duplicate markers.
-        uint64_t pattern1Count;
-        uint64_t pattern2Count;
-
-        MarkerGraph::VertexId nextVertexId;
-
-        // Get the next vertex id, then increment it in thread safe way.
-        MarkerGraph::VertexId getAndIncrementNextVertexId()
-        {
-            return __sync_fetch_and_add(&nextVertexId, 1);
-        }
-
-    };
-    CleanupDuplicateMarkersData cleanupDuplicateMarkersData;
-
 
 
     // Create marker graph edges.
@@ -2070,70 +2005,6 @@ private:
 
 
 
-    // "Strict" version of createMarkerGraphEdges.
-    // Differences from createMarkerGraphEdges:
-    // - Will only create edges in which all contributing oriented reads have
-    //   exactly the same RLE sequence. If more than one distinct RLE sequence
-    //   is present, the edge is split into two parallel edges.
-    // - Enforces minEdgeCoverage and minEdgeCoveragePerStrand.
-    //   An edge is not generated if the total number of oriented
-    //   reads on the edge is less than minEdgeCoverage,
-    //   of it the number of oriented reads on each strand is less
-    //   than minEdgeCoveragePerStrand.
-    // - The main loop is written differently - it loops over reads
-    //   rather than marker graph vertices.
-    // Because of these strict criteria, this version generates frequent breaks
-    // in contiguity that must later be fixed by other means.
-public:
-    void createMarkerGraphEdgesStrict(
-        uint64_t minEdgeCoverage,
-        uint64_t minEdgeCoveragePerStrand,
-        uint64_t threadCount);
-private:
-    void createMarkerGraphEdgesStrictPass1(size_t threadId);
-    void createMarkerGraphEdgesStrictPass2(size_t threadId);
-    void createMarkerGraphEdgesStrictPass12(size_t threadId, uint64_t pass);
-    void createMarkerGraphEdgesStrictPass3(size_t threadId);
-    class CreateMarkerGraphEdgesStrictData {
-    public:
-        uint64_t minEdgeCoverage;
-        uint64_t minEdgeCoveragePerStrand;
-
-        // Marker intervals, stored in a VectorOfVectors
-        // indexed by the source vertex id, vertexId0.
-        // Each interval stores the target vertex, vertexId1.
-        class MarkerIntervalInfo {
-        public:
-            MarkerGraph::VertexId vertexId1;
-            OrientedReadId orientedReadId;
-            uint32_t ordinal0;
-            uint32_t ordinal1;
-            bool operator<(const MarkerIntervalInfo& that) const
-            {
-                return tie(vertexId1, orientedReadId, ordinal0, ordinal1) <
-                    tie(that.vertexId1, that.orientedReadId, that.ordinal0, that.ordinal1);
-            }
-        };
-        MemoryMapped::VectorOfVectors<MarkerIntervalInfo, uint64_t> markerIntervalInfos;
-
-        // The edges and corresponding marker intervals found by each thread.
-        vector< shared_ptr< MemoryMapped::Vector<MarkerGraph::Edge> > > threadEdges;
-        vector< shared_ptr< MemoryMapped::VectorOfVectors<MarkerInterval, uint64_t> > > threadEdgeMarkerIntervals;
-
-        // Class used in createMarkerGraphEdgesStrictPass3.
-        class MarkerIntervalInfo3 {
-        public:
-            MarkerInterval markerInterval;
-            uint32_t overlap;       // The number of overlapping bases between the markers.
-            vector<Base> sequence;  // RLE
-            bool operator<(const MarkerIntervalInfo3& that) const
-            {
-                return tie(overlap, sequence, markerInterval) <
-                    tie(that.overlap, that.sequence, that.markerInterval);
-            }
-        };
-    };
-    CreateMarkerGraphEdgesStrictData createMarkerGraphEdgesStrictData;
 
 
 
@@ -2170,10 +2041,6 @@ private:
 
 
 
-    // Write out the sets of parallel marker graph edges.
-    // Only createMarkerGraphedgesStrict can create parallel edges.
-public:
-    void writeParallelMarkerGraphEdges() const;
 
 
 
@@ -2209,17 +2076,6 @@ public:
     uint64_t estimateBaseOffsetUnsafe(MarkerGraphEdgeId, MarkerGraphEdgeId) const;
 
 
-    // Function createMarkerGraphSecondaryEdges can be called after createMarkerGraphEdgesStrict
-    // to create a minimal amount of additional non-strict edges (secondary edges)
-    // sufficient to restore contiguity.
-    void createMarkerGraphSecondaryEdges(
-        uint32_t secondaryEdgeMaxSkip,
-        uint64_t threadCount);
-private:
-    void createMarkerGraphSecondaryEdges(
-        uint32_t secondaryEdgeMaxSkip,
-        bool aggressive,
-        uint64_t threadCount);
 public:
 
 
@@ -2626,48 +2482,6 @@ public:
     void computeMarkerGraphCoverageHistogram();
 
 
-    // In the assembly graph, each vertex corresponds to a linear chain
-    // of edges in the pruned strong subgraph of the marker graph.
-    // A directed vertex A->B is created if the last marker graph vertex
-    // of the edge chain corresponding to A coincides with the
-    // first marker graph vertex of the edge chain corresponding to B.
-    shared_ptr<mode0::AssemblyGraph> assemblyGraphPointer;
-    void removeAssemblyGraph()
-    {
-        assemblyGraphPointer.reset();
-    }
-    void createAssemblyGraphVertices();
-    void accessAssemblyGraphVertices();
-    void createAssemblyGraphEdges();
-    void accessAssemblyGraphEdgeLists();
-    void accessAssemblyGraphEdges();
-    void accessAssemblyGraphOrientedReadsByEdge();
-    void writeAssemblyGraph(const string& fileName) const;
-    void pruneAssemblyGraph(uint64_t pruneLength);
-
-    // Gather and write out all reads that contributed to
-    // each assembly graph edge.
-    void gatherOrientedReadsByAssemblyGraphEdge(uint64_t threadCount);
-    void writeOrientedReadsByAssemblyGraphEdge();
-private:
-    void gatherOrientedReadsByAssemblyGraphEdgePass1(size_t threadId);
-    void gatherOrientedReadsByAssemblyGraphEdgePass2(size_t threadId);
-    void gatherOrientedReadsByAssemblyGraphEdgePass(int);
-
-    // Extract a local assembly graph from the global assembly graph.
-    // This returns false if the timeout was exceeded.
-    bool extractLocalAssemblyGraph(
-        AssemblyGraphEdgeId,
-        int distance,
-        double timeout,
-        LocalAssemblyGraph&) const;
-public:
-    void colorGfaBySimilarityToSegment(
-        AssemblyGraphEdgeId,
-        uint64_t minVertexCount,
-        uint64_t minEdgeCount);
-
-
     // Compute consensus repeat counts for each vertex of the marker graph.
     void assembleMarkerGraphVertices(uint64_t threadCount);
     void accessMarkerGraphVertexRepeatCounts();
@@ -2699,244 +2513,15 @@ private:
 
 
 
-    // Find the set of assembly graph edges encountered on a set
-    // of edges in the marker graph. The given marker graph edges
-    // could form a path, but don't have to.
-    void findAssemblyGraphEdges(
-        const vector<MarkerGraphEdgeId>& markerGraphEdges,
-        vector<AssemblyGraphEdgeId>& assemblyGraphEdges
-        ) const;
-
-
-
-    // Pseudo-paths.
-    // An oriented read corresponds to a path (sequence of adjacent edges)
-    // in the marker graph, which
-    // can be computed via computeOrientedReadMarkerGraphPath.
-    // That path encounters a sequence of assembly graph edges,AssemblyGraph::EdgeId
-    // which is not necessarily a path in the assembly graph
-    // because not all marker graph edges belong to an assembly graph edge.
-    // We call this sequence the pseudo-path of an oriented read in the assembly graph.
-public:
-    class PseudoPathEntry {
-    public:
-        AssemblyGraphEdgeId segmentId;
-
-        // The first and last ordinal on the oriented read
-        // where this assembly graph edge (segment) is encountered.
-        uint32_t firstOrdinal;
-        uint32_t lastOrdinal;
-
-        // The first and last position in the assembly graph edge
-        // (segment) where this oriented read is encountered.
-        uint32_t firstPosition;
-        uint32_t lastPosition;
-
-        // The number of marker graph edges on the oriented read
-        // where this assembly graph edge (segment) is encountered.
-        uint32_t markerGraphEdgeCount;
-    };
-    using PseudoPath = vector<PseudoPathEntry>;
-    void computePseudoPath(
-        OrientedReadId,
-
-        // The marker graph path computed using computeOrientedReadMarkerGraphPath.
-        // This is computed by this function - it does not neet to be filled in
-        // in advance.
-        vector<MarkerGraphEdgeId>& path,
-        vector< pair<uint32_t, uint32_t> >& pathOrdinals,
-
-        // The pseudo-path computed by this function.
-        PseudoPath&) const;
-    void writePseudoPath(ReadId, Strand) const;
-    static void getPseudoPathSegments(const PseudoPath&, vector<AssemblyGraphEdgeId>&);
-
-
-
-    // Detangle the AssemblyGraph.
-    void detangle();    // detangleMethod 1
-    void detangle2(     // detangleMethod 2
-        uint64_t diagonalReadCountMin,
-        uint64_t offDiagonalReadCountMax,
-        double detangleOffDiagonalRatio
-         );
-
-
-
-    // CompressedAssemblyGraph.
-    // Note that we have no persistent version of this.
-    // It must be created from scratch each time.
-    void createCompressedAssemblyGraph();
-    shared_ptr<CompressedAssemblyGraph> compressedAssemblyGraph;
-    void colorCompressedAssemblyGraph(const string&);
-
-
-public:
-    // Mark as isLowCoverageCrossEdge all low coverage cross edges
-    // of the assembly graph and the corresponding marker graph edges.
-    // These edges are then considered removed.
-    // An edge v0->v1 of the assembly graph is a cross edge if:
-    // - in-degree(v0)=1, out-degree(v0)>1
-    // - in-degree(v1)>1, out-degree(v1)=1
-    // A cross edge is marked as isCrossEdge if its average edge coverage
-    // is <= crossEdgeCoverageThreshold.
-    void removeLowCoverageCrossEdges(uint32_t crossEdgeCoverageThreshold);
-
-
-
-    // Assemble consensus sequence and repeat counts for each marker graph edge.
-    void assembleMarkerGraphEdges(
-        uint64_t threadCount,
-
-        // This controls when we give up trying to compute consensus for long edges.
-        uint32_t markerGraphEdgeLengthThresholdForConsensus,
-
-        // Request storing detailed coverage information in binary format.
-        bool storeCoverageData,
-
-        // Request assembling all edges (used by Mode 2 assembly)
-        bool assembleAllEdges
-        );
-private:
-    void assembleMarkerGraphEdgesThreadFunction(size_t threadId);
-    class AssembleMarkerGraphEdgesData {
-    public:
-
-        // The arguments to assembleMarkerGraphEdges, stored here so
-        // they are accessible to the threads.
-        uint32_t markerGraphEdgeLengthThresholdForConsensus;
-        bool storeCoverageData;
-        bool assembleAllEdges;
-
-        // The results computed by each thread.
-        // For each threadId:
-        // threadEdgeIds[threadId] contains the edge ids processed by each thread.
-        // threadEdgeConsensusSequence[threadId]  and
-        // threadEdgeConsensusOverlappingBaseCount[threadId] contains the corresponding
-        // consensus sequence and repeat counts.
-        // These are temporary data which are eventually gathered into
-        // MarkerGraph::edgeConsensus and MarkerGraph::edgeConsensusOverlappingBaseCount
-        // before assembleMarkerGraphEdges completes.
-        // See their definition for more details about their meaning.
-        vector< shared_ptr< MemoryMapped::Vector<MarkerGraphEdgeId> > > threadEdgeIds;
-        vector< shared_ptr< MemoryMapped::VectorOfVectors<pair<Base, uint8_t>, uint64_t> > > threadEdgeConsensus;
-        vector< shared_ptr< MemoryMapped::Vector<uint8_t> > > threadEdgeConsensusOverlappingBaseCount;
-
-        vector< shared_ptr<
-            MemoryMapped::VectorOfVectors<pair<uint32_t, CompressedCoverageData>, uint64_t> > >
-            threadEdgeCoverageData;
-    };
-    AssembleMarkerGraphEdgesData assembleMarkerGraphEdgesData;
-
     // Access coverage data for vertices and edges of the marker graph.
     // This is only available if the run had Assembly.storeCoverageData set to True
     // in dinara.conf.
 public:
     void accessMarkerGraphCoverageData();
-private:
 
 
-
-    // Assemble Mode 3 sequence for all marker graph edges.
-    // See the comments before MarkerGraph::edgeSequence for more information.
-    // For now this is done sequentially.
-public:
-    void assembleMarkerGraphEdgesMode3();
-
-
-
-    // Assemble sequence for an edge of the assembly graph.
-private:
-    void assembleAssemblyGraphEdge(
-        AssemblyGraphEdgeId,
-        bool storeCoverageData,
-        AssembledSegment&);
-    // Lower level version that works on a generic marker graph path.
-    void assembleAssemblyGraphEdge(
-        const span<const MarkerGraphEdgeId>&,
-        bool storeCoverageData,
-        AssembledSegment&);
-public:
-    AssembledSegment assembleAssemblyGraphEdge(
-        AssemblyGraphEdgeId,
-        bool storeCoverageData);
-
-
-    // Assemble sequence for all edges of the assembly graph.
-    void assemble(
-        uint64_t threadCount,
-        uint32_t storeCoverageDataCsvLengthThreshold);
-    void accessAssemblyGraphSequences();
-    void computeAssemblyStatistics();
-private:
-    class AssembleData {
-    public:
-        uint32_t storeCoverageDataCsvLengthThreshold;
-
-        // The results created by each thread.
-        // All indexed by threadId.
-        vector< vector<AssemblyGraphEdgeId> > edges;
-        vector< shared_ptr<LongBaseSequences> > sequences;
-        vector< shared_ptr<MemoryMapped::VectorOfVectors<uint8_t, uint64_t> > > repeatCounts;
-        void allocate(uint64_t threadCount);
-        void free();
-    };
-    AssembleData assembleData;
-    void assembleThreadFunction(size_t threadId);
-
-
-
-    // Write the assembly graph in GFA 1.0 format defined here:
-    // https://github.com/GFA-spec/GFA-spec/blob/master/GFA1.md
-public:
-    void writeGfa1(const string& fileName);
-    void writeGfa1BothStrands(const string& fileName);
-    void writeGfa1BothStrandsNoSequence(const string& fileName);
-private:
-    // Construct the CIGAR string given two vectors of repeat counts.
-    // Used by writeGfa1.
-    static void constructCigarString(
-        const span<uint8_t>& repeatCounts0,
-        const span<uint8_t>& repeatCounts1,
-        string&
-        );
 
 public:
-
-    // Write assembled sequences in FASTA format.
-    void writeFasta(const string& fileName);
-
-
-
-    // Write a csv file that can be used to color the double-stranded GFA
-    // in Bandage based on the presence of two oriented reads
-    // on each assembly graph edge.
-    // Red    =  only oriented read id 0 is present
-    // Blue   =  only oriented read id 1 is present
-    // Purple =  both oriented read id 0 and oriented read id 1 are present
-    // Grey   =  neither oriented read id 0 nor oriented read id 1 are present
-    void colorGfaWithTwoReads(
-        ReadId readId0, Strand strand0,
-        ReadId readId1, Strand strand1,
-        const string& fileName
-        ) const;
-
-
-
-    // Color key segments in the gfa file.
-    // A segment (assembly graph edge) v0->v1 is a key segment if in-degree(v0)<2 and
-    // out_degree(v)<2, that is, there is no uncertainty on what preceeds
-    // and follows the segment.
-    void colorGfaKeySegments(const string& fileName) const;
-
-
-
-    // Write a csv file describing the marker graph path corresponding to an
-    // oriented read and the corresponding pseudo-path on the assembly graph.
-    void writeOrientedReadPath(ReadId, Strand, const string& fileName) const;
-
-
-
     // Data and functions used for the http server.
     // This function puts the server into an endless loop
     // of processing requests.
@@ -2992,7 +2577,6 @@ public:
     void exploreUnitigGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);
     void exploreDirectedReadGraph(const vector<string>&, ostream&);
-    void exploreCompressedAssemblyGraph(const vector<string>&, ostream&);
     static bool parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html);
     static void addScaleSvgButtons(ostream&, uint64_t sizePixels);
     class HttpServerData {
@@ -3035,11 +2619,7 @@ public:
 
     // Functions and data used by the http server
     // for display of the local marker graph.
-    void exploreMarkerGraph0(const vector<string>&, ostream&);
     void exploreMarkerGraph1(const vector<string>&, ostream&);
-    void getLocalMarkerGraph0RequestParameters(
-        const vector<string>&,
-        LocalMarkerGraph0RequestParameters&) const;
     void exploreMarkerGraphVertex(const vector<string>&, ostream&);
     void exploreMarkerGraphEdge(const vector<string>&, ostream&);
     void exploreMarkerGraphEdgePair(const vector<string>&, ostream&);
@@ -3078,23 +2658,6 @@ public:
     void assessAlignments(const vector<string>& request, ostream& html);
     void sampleReads(vector<OrientedReadId>& sample, uint64_t n);
     void sampleReads(vector<OrientedReadId>& sample, uint64_t n, uint64_t minLength, uint64_t maxLength);
-    void sampleReadsFromDeadEnds(
-            vector<OrientedReadId>& sample,
-            vector<bool>& isLeftEnd,
-            uint64_t n);
-
-    void sampleReadsFromDeadEnds(
-            vector<OrientedReadId>& sample,
-            vector<bool>& isLeftEnd,
-            uint64_t n,
-            uint64_t minLength,
-            uint64_t maxLength);
-
-    void countDeadEndOverhangs(
-            const vector<pair<OrientedReadId, AlignmentInfo> >& allAlignmentInfo,
-            const vector<bool>& isLeftEnd,
-            Histogram2& overhangLengths,
-            uint32_t minOverhang);
 
     // Compute all alignments for a given read.
     // This can be slow for large assemblies,
@@ -3143,34 +2706,6 @@ public:
 
     void storePeakMemoryUsage(uint64_t peakMemoryUsage);
 
-    // Functions and data used by the http server
-    // for display of the local assembly graph.
-private:
-    void exploreAssemblyGraph(const vector<string>&, ostream&);
-    class LocalAssemblyGraphRequestParameters {
-    public:
-        AssemblyGraphEdgeId edgeId;
-        bool edgeIdIsPresent;
-        uint32_t maxDistance;
-        bool maxDistanceIsPresent;
-        bool useDotLayout;
-        bool showVertexLabels;
-        bool showEdgeLabels;
-        uint32_t sizePixels;
-        bool sizePixelsIsPresent;
-        double timeout;
-        bool timeoutIsPresent;
-        void writeForm(ostream&, AssemblyGraphEdgeId edgeCount) const;
-        bool hasMissingRequiredParameters() const;
-    };
-    void getLocalAssemblyGraphRequestParameters(
-        const vector<string>&,
-        LocalAssemblyGraphRequestParameters&) const;
-    void exploreAssemblyGraphEdge(const vector<string>&, ostream&);
-    void exploreAssemblyGraphEdgesSupport(const vector<string>&, ostream&);
-
-
-public:
     // Functions and data to save binary data.
     // This happens under control of --saveBinaryData
     // and is only implemented for Mode 3 assembly.

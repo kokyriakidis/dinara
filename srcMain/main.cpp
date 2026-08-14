@@ -1557,7 +1557,7 @@ void dinara::main::assemble(
     // Create the Assembler.
     Assembler assembler(dataDirectory, true, assemblerOptions.readsOptions.representation, pageSize);
     assembler.assemblerInfo->readGraphCreationMethod = assemblerOptions.readGraphOptions.creationMethod;
-    assembler.assemblerInfo->assemblyMode = assemblerOptions.assemblyOptions.mode;
+    assembler.assemblerInfo->assemblyMode = 3;
     assembler.minMultiNodeChainSupport = assemblerOptions.readGraphOptions.minMultiNodeChainSupport;
     assembler.minIsolatedSiteSupport = assemblerOptions.readGraphOptions.minIsolatedSiteSupport;
     assembler.assemblerInfo->variantClusteringMinOccurrences = assemblerOptions.variantClusteringOptions.minOccurrences;

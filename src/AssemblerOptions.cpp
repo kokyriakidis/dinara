@@ -120,9 +120,6 @@ AssemblerOptions::AssemblerOptions(int argumentCount, const char** arguments) :
 
 
 
-    // Parse MarkerGraph.simplifyMaxLength.
-    markerGraphOptions.parseSimplifyMaxLength();
-
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
 
@@ -157,9 +154,6 @@ AssemblerOptions::AssemblerOptions(const string& fileName)
     variables_map variablesMap;
     store(parse_config_file(configFile, configurableOptionsDescription), variablesMap);
     notify(variablesMap);
-
-    // Parse MarkerGraph.simplifyMaxLength.
-    markerGraphOptions.parseSimplifyMaxLength();
 
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
@@ -906,34 +900,20 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint64_t>(&markerGraphOptions.minEdgeCoverage)->
         default_value(6),
         "Minimum edge coverage (number of supporting oriented reads) "
-        "for a marker graph edge to be created."
-        "Only used with --Assembly.mode 2.")
+        "for a marker graph edge to be created.")
 
         ("MarkerGraph.minEdgeCoveragePerStrand",
         value<uint64_t>(&markerGraphOptions.minEdgeCoveragePerStrand)->
         default_value(2),
         "Minimum edge coverage (number of supporting oriented reads) "
         "on each strand "
-        "for a marker graph edge to be created."
-        "Only used with --Assembly.mode 2.")
+        "for a marker graph edge to be created.")
 
         ("MarkerGraph.allowDuplicateMarkers",
         bool_switch(&markerGraphOptions.allowDuplicateMarkers)->
         default_value(false),
         "Specifies whether to allow more than one marker on the "
         "same oriented read on a single marker graph vertex. Experimental.")
-
-        ("MarkerGraph.cleanupDuplicateMarkers",
-        bool_switch(&markerGraphOptions.cleanupDuplicateMarkers)->
-        default_value(false),
-        "Specifies whether to clean up marker graph vertices with more than one marker on the "
-        "same oriented read. Experimental.")
-
-        ("MarkerGraph.duplicateMarkersPattern1Threshold",
-        value<double>(&markerGraphOptions.duplicateMarkersPattern1Threshold)->
-        default_value(0.5),
-        "Used when cleaning up marker graph vertices with more than one marker on the "
-        "same oriented read. Experimental.")
 
         ("MarkerGraph.lowCoverageThreshold",
         value<int>(&markerGraphOptions.lowCoverageThreshold)->
@@ -957,24 +937,6 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(100),
         "Used during approximate transitive reduction.")
 
-        ("MarkerGraph.pruneIterationCount",
-        value<int>(&markerGraphOptions.pruneIterationCount)->
-        default_value(6),
-        "Number of prune iterations.")
-
-        ("MarkerGraph.simplifyMaxLength",
-        value<string>(&markerGraphOptions.simplifyMaxLength)->
-        default_value("10,100,1000"),
-        "Maximum lengths (in markers) used at each iteration of simplifyMarkerGraph.")
-
-        ("MarkerGraph.crossEdgeCoverageThreshold",
-        value<double>(&markerGraphOptions.crossEdgeCoverageThreshold)->
-        default_value(0.),
-        "Experimental. Cross edge coverage threshold. If this is not zero, assembly graph cross-edges "
-        "with average edge coverage less than this value are removed, together with the "
-        "corresponding marker graph edges. A cross edge is defined as an edge v0->v1 "
-        "with out-degree(v0)>1, in-degree(v1)>1.")
-
         ("MarkerGraph.peakFinder.minAreaFraction",
         value<double>(&markerGraphOptions.peakFinderMinAreaFraction)->
         default_value(0.08),
@@ -990,8 +952,7 @@ void AssemblerOptions::addConfigurableOptions()
         ("MarkerGraph.alwaysSave",
         bool_switch(&markerGraphOptions.alwaysSave)->
         default_value(false),
-        "Always save the marker graph (only effective if --memoryMode filesystem is also used)."
-        "If this is not set, the marker graph is only saved for assembly modes 0 and 2.")
+        "Always save the marker graph (only effective if --memoryMode filesystem is also used).")
 
         ("MarkerGraph.writeVertexCoverageHistogram",
         bool_switch(&markerGraphOptions.writeVertexCoverageHistogram)->
@@ -1009,32 +970,6 @@ void AssemblerOptions::addConfigurableOptions()
         implicit_value(true),
         "If true, count only canonical marker graph vertices (one per reverse-complement pair) "
         "when generating the vertex coverage histogram.")
-
-        ("MarkerGraph.secondaryEdges.maxSkip",
-        value<uint64_t>(&markerGraphOptions.secondaryEdgesMaxSkip)->
-        default_value(1000000),
-        "Maximum number of markers skipped by a secondary edge (mode 2 assembly only).")
-
-        ("MarkerGraph.secondaryEdges.split.errorRateThreshold",
-        value<double>(&markerGraphOptions.secondaryEdgesSplitErrorRateThreshold)->
-        default_value(0.25),
-        "Error rate threshold used for splitting secondary edges (mode 2 assembly only).")
-
-        ("MarkerGraph.secondaryEdges.split.minCoverage",
-        value<uint64_t>(&markerGraphOptions.secondaryEdgesSplitMinCoverage)->
-        default_value(4),
-        "Minimum coverage for secondary edges generated during splitting (mode 2 assembly only).")
-
-        ("Assembly.mode",
-        value<uint64_t>(&assemblyOptions.mode)->
-        default_value(0),
-        "Assembly mode (0=default, 1=experimental).")
-
-        ("Assembly.crossEdgeCoverageThreshold",
-        value<int>(&assemblyOptions.crossEdgeCoverageThreshold)->
-        default_value(3),
-        "Maximum average edge coverage for a cross edge "
-        "of the assembly graph to be removed.")
 
         ("Assembly.markerGraphEdgeLengthThresholdForConsensus",
         value<int>(&assemblyOptions.markerGraphEdgeLengthThresholdForConsensus)->
@@ -1147,109 +1082,6 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(2),
         "Maximum distance for read graph bridge removal for iterative assembly (experimental).")
 
-        ("Assembly.mode2.strongBranchThreshold",
-        value<uint64_t>(&assemblyOptions.mode2Options.strongBranchThreshold)->
-        default_value(2),
-        "Minimum number of supporting reads required for a strong branch. Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.epsilon",
-        value<double>(&assemblyOptions.mode2Options.epsilon)->
-        default_value(0.1),
-        "Epsilon for the Bayesian model used for phasing and for bubble removal."
-        "This is the probability that a read appears on the wrong branch of a diploid bubble. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.bubbleRemoval.minConcordantReadCount",
-        value<uint64_t>(&assemblyOptions.mode2Options.minConcordantReadCountForBubbleRemoval)->
-        default_value(3),
-        "Minimum number of concordant reads for bubble removal. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.bubbleRemoval.maxDiscordantReadCount",
-        value<uint64_t>(&assemblyOptions.mode2Options.maxDiscordantReadCountForBubbleRemoval)->
-        default_value(6),
-        "Maximum number of discordant reads for bubble removal. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.bubbleRemoval.minLogP",
-        value<double>(&assemblyOptions.mode2Options.minLogPForBubbleRemoval)->
-        default_value(30.),
-        "Minimul log(P) (in decibels) for bubble removal. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.bubbleRemoval.componentSizeThreshold",
-        value<uint64_t>(&assemblyOptions.mode2Options.componentSizeThresholdForBubbleRemoval)->
-        default_value(10),
-        "Component size threshold for bubble removal. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.phasing.minConcordantReadCount",
-        value<uint64_t>(&assemblyOptions.mode2Options.minConcordantReadCountForPhasing)->
-        default_value(2),
-        "Minimum number of concordant reads for phasing. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.phasing.maxDiscordantReadCount",
-        value<uint64_t>(&assemblyOptions.mode2Options.maxDiscordantReadCountForPhasing)->
-        default_value(1),
-        "Maximum number of discordant reads for phasing. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.phasing.minLogP",
-        value<double>(&assemblyOptions.mode2Options.minLogPForPhasing)->
-        default_value(10.),
-        "Minimul log(P) (in decibels) for phasing. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.superbubble.maxSize",
-        value<uint64_t>(&assemblyOptions.mode2Options.maxSuperbubbleSize)->
-        default_value(50),
-        "Maximum size (number of edges) of a superbubble to be processed. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.superbubble.maxChunkSize",
-        value<uint64_t>(&assemblyOptions.mode2Options.maxSuperbubbleChunkSize)->
-        default_value(20),
-        "Maximum size (numbef of edges) of a superbubble chunk to be processed. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.superbubble.maxChunkPathCount",
-        value<uint64_t>(&assemblyOptions.mode2Options.maxSuperbubbleChunkPathCount)->
-        default_value(20),
-        "Maximum number of paths to be processed in a superbubble chunk. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.superbubble.edgeLengthThreshold",
-        value<uint64_t>(&assemblyOptions.mode2Options.superbubbleEdgeLengthThreshold)->
-        default_value(6),
-        "Edge length threshold (in markers) for superbubble removal. "
-        "Only used in Mode 2 assembly.")
-
-        ("Assembly.mode2.suppressGfaOutput",
-        bool_switch(&assemblyOptions.mode2Options.suppressGfaOutput)->
-        default_value(false),
-        "Suppress all GFA output (Mode 2 assembly only).")
-
-        ("Assembly.mode2.suppressFastaOutput",
-        bool_switch(&assemblyOptions.mode2Options.suppressFastaOutput)->
-        default_value(false),
-        "Suppress all FASTA output (Mode 2 assembly only).")
-
-        ("Assembly.mode2.suppressDetailedOutput",
-        bool_switch(&assemblyOptions.mode2Options.suppressDetailedOutput)->
-        default_value(false),
-        "Suppress output of detailed representation of the assembly (Mode 2 assembly only).")
-
-        ("Assembly.mode2.suppressPhasedOutput",
-        bool_switch(&assemblyOptions.mode2Options.suppressPhasedOutput)->
-        default_value(false),
-        "Suppress output of phased representation of the assembly (Mode 2 assembly only).")
-
-        ("Assembly.mode2.suppressHaploidOutput",
-        bool_switch(&assemblyOptions.mode2Options.suppressHaploidOutput)->
-        default_value(false),
-        "Suppress output of haploid representation of the assembly (Mode 2 assembly only).")
-
         ("Assembly.mode3.anchorCreationMethod",
         value<string>(&assemblyOptions.mode3Options.anchorCreationMethod)->
         default_value("FromMarkerGraphEdges"),
@@ -1267,30 +1099,26 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(0),
         "Minimum anchor coverage. "
         "If minAnchorCoverage and maxAnchorCoverage are both 0, "
-        "they are set automatically to appropriate values using a simple heuristic. "
-        "Only used with --Assembly.mode 3.")
+        "they are set automatically to appropriate values using a simple heuristic.")
 
         ("Assembly.mode3.maxAnchorCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.maxAnchorCoverage)->
         default_value(0),
         "Maximum anchor coverage. "
         "If minAnchorCoverage and maxAnchorCoverage are both 0, "
-        "they are set automatically to appropriate values using a simple heuristic."
-        "Only used with --Assembly.mode 3.")
+        "they are set automatically to appropriate values using a simple heuristic.")
 
         ("Assembly.mode3.minAnchorCoverageMultiplier",
         value<double>(&assemblyOptions.mode3Options.minAnchorCoverageMultiplier)->
         default_value(1.),
         "Multiplier applied to heuristically determined minimum anchor coverage "
-        "if minAnchorCoverage and maxAnchorCoverage are both 0. "
-        "Only used with --Assembly.mode 3.")
+        "if minAnchorCoverage and maxAnchorCoverage are both 0.")
 
         ("Assembly.mode3.maxAnchorCoverageMultiplier",
         value<double>(&assemblyOptions.mode3Options.maxAnchorCoverageMultiplier)->
         default_value(1.),
         "Multiplier applied to heuristically determined maximum anchor coverage "
-        "if minAnchorCoverage and maxAnchorCoverage are both 0. "
-        "Only used with --Assembly.mode 3.")
+        "if minAnchorCoverage and maxAnchorCoverage are both 0.")
 
         ("Assembly.mode3.vertexSplit.useMclSecondary",
         bool_switch(&assemblyOptions.mode3Options.vertexSplitOptions.useMclSecondary)->
@@ -1787,16 +1615,10 @@ void MarkerGraphOptions::write(ostream& s) const
     s << "minEdgeCoveragePerStrand = " << minEdgeCoveragePerStrand << "\n";
     s << "allowDuplicateMarkers = " <<
         convertBoolToPythonString(allowDuplicateMarkers) << "\n";
-    s << "cleanupDuplicateMarkers = " <<
-        convertBoolToPythonString(cleanupDuplicateMarkers) << "\n";
-    s << "duplicateMarkersPattern1Threshold = " << duplicateMarkersPattern1Threshold << "\n";
     s << "lowCoverageThreshold = " << lowCoverageThreshold << "\n";
     s << "highCoverageThreshold = " << highCoverageThreshold << "\n";
     s << "maxDistance = " << maxDistance << "\n";
     s << "edgeMarkerSkipThreshold = " << edgeMarkerSkipThreshold << "\n";
-    s << "pruneIterationCount = " << pruneIterationCount << "\n";
-    s << "simplifyMaxLength = " << simplifyMaxLength << "\n";
-    s << "crossEdgeCoverageThreshold = " << crossEdgeCoverageThreshold << "\n";
     s << "peakFinder.minAreaFraction = " << peakFinderMinAreaFraction << "\n";
     s << "peakFinder.areaStartIndex = " << peakFinderAreaStartIndex << "\n";
     s << "alwaysSave = " <<
@@ -1808,9 +1630,6 @@ void MarkerGraphOptions::write(ostream& s) const
     s << "vertexCoverageHistogramCanonicalOnly = " <<
         convertBoolToPythonString(vertexCoverageHistogramCanonicalOnly) << "\n";
 
-    s << "secondaryEdges.maxSkip = " << secondaryEdgesMaxSkip << "\n";
-    s << "secondaryEdges.split.errorRateThreshold = " << secondaryEdgesSplitErrorRateThreshold << "\n";
-    s << "secondaryEdges.split.minCoverage = " << secondaryEdgesSplitMinCoverage << "\n";
 }
 
 
@@ -1818,8 +1637,6 @@ void MarkerGraphOptions::write(ostream& s) const
 void AssemblyOptions::write(ostream& s) const
 {
     s << "[Assembly]\n";
-    s << "mode = " << mode << "\n";
-    s << "crossEdgeCoverageThreshold = " << crossEdgeCoverageThreshold << "\n";
     s << "markerGraphEdgeLengthThresholdForConsensus = " <<
         markerGraphEdgeLengthThresholdForConsensus << "\n";
     s << "consensusCaller = " <<
@@ -1847,33 +1664,7 @@ void AssemblyOptions::write(ostream& s) const
     s << "iterative.bridgeRemovalIterationCount = " << iterativeBridgeRemovalIterationCount << "\n";
     s << "iterative.bridgeRemovalMaxDistance = " << iterativeBridgeRemovalMaxDistance << "\n";
 
-    mode2Options.write(s);
     mode3Options.write(s);
-}
-
-
-
-void Mode2AssemblyOptions::write(ostream& s) const
-{
-    s << "mode2.strongBranchThreshold = " << strongBranchThreshold << "\n";
-    s << "mode2.epsilon = " << epsilon << "\n";
-    s << "mode2.bubbleRemoval.minConcordantReadCount = " << minConcordantReadCountForBubbleRemoval << "\n";
-    s << "mode2.bubbleRemoval.maxDiscordantReadCount = " << maxDiscordantReadCountForBubbleRemoval << "\n";
-    s << "mode2.bubbleRemoval.minLogP = " << minLogPForBubbleRemoval << "\n";
-    s << "mode2.bubbleRemoval.componentSizeThreshold = " << componentSizeThresholdForBubbleRemoval << "\n";
-    s << "mode2.phasing.minConcordantReadCount = " << minConcordantReadCountForPhasing << "\n";
-    s << "mode2.phasing.maxDiscordantReadCount = " << maxDiscordantReadCountForPhasing << "\n";
-    s << "mode2.phasing.minLogP = " << minLogPForPhasing << "\n";
-    s << "mode2.superbubble.maxSize = " << maxSuperbubbleSize << "\n";
-    s << "mode2.superbubble.maxChunkSize = " << maxSuperbubbleChunkSize << "\n";
-    s << "mode2.superbubble.maxChunkPathCount = " << maxSuperbubbleChunkPathCount << "\n";
-    s << "mode2.superbubble.edgeLengthThreshold = " << superbubbleEdgeLengthThreshold << "\n";
-
-    s << "mode2.suppressGfaOutput = " << convertBoolToPythonString(suppressGfaOutput) << "\n";
-    s << "mode2.suppressFastaOutput = " << convertBoolToPythonString(suppressFastaOutput) << "\n";
-    s << "mode2.suppressDetailedOutput = " << convertBoolToPythonString(suppressDetailedOutput) << "\n";
-    s << "mode2.suppressPhasedOutput = " << convertBoolToPythonString(suppressPhasedOutput) << "\n";
-    s << "mode2.suppressHaploidOutput = " << convertBoolToPythonString(suppressHaploidOutput) << "\n";
 }
 
 
@@ -1988,31 +1779,6 @@ void AssemblerOptions::write(ostream& s) const
     s << "\n";
     assemblyOptions.write(s);
     s << endl;
-}
-
-
-
-void MarkerGraphOptions::parseSimplifyMaxLength()
-{
-    simplifyMaxLengthVector.clear();
-
-    boost::tokenizer< boost::char_separator<char> > tokenizer(
-        simplifyMaxLength, boost::char_separator<char>(","));
-    for(const string& token: tokenizer) {
-        try {
-            size_t numberEndsHere;
-            const size_t value = std::stoi(token, &numberEndsHere);
-            if(numberEndsHere != token.size()) {
-                throw runtime_error("Error parsing MarkerGraph.simplifyMaxLength " +
-                    simplifyMaxLength);
-            }
-            simplifyMaxLengthVector.push_back(value);
-        } catch(const std::invalid_argument& e) {
-            throw runtime_error("Error parsing MarkerGraph,simplifyMaxLength " +
-                simplifyMaxLength);
-        }
-    }
-
 }
 
 

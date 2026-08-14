@@ -4,7 +4,6 @@
 #include "AlignmentGraph.hpp"
 #include "Align4.hpp"
 #include "Align6.hpp"
-#include "AssemblyGraph.hpp"
 #include "Histogram.hpp"
 #include "KmerCounter.hpp"
 #include "LocalAlignmentGraph.hpp"
@@ -16,7 +15,6 @@
 #include "Reads.hpp"
 #include "ReferenceOverlapMap.hpp"
 using namespace dinara;
-using namespace mode0;
 
 // Boost libraries.
 #include <boost/icl/interval_map.hpp>
@@ -2373,174 +2371,6 @@ void Assembler::sampleReads(vector<OrientedReadId>& sample, uint64_t n, uint64_t
 }
 
 
-void Assembler::sampleReadsFromDeadEnds(
-        vector<OrientedReadId>& sample,
-        vector<bool>& isLeftEnd,
-        uint64_t n){
-
-    sample.clear();
-
-    const AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
-
-    random_device rd;
-    uniform_int_distribution<uint32_t> distribution(0, uint32_t(assemblyGraph.edges.size() - 1));
-
-    while (sample.size() < n) {
-        // Randomly select an edge in the assembly graph
-        const MarkerGraph::EdgeId edgeId = distribution(rd);
-        const AssemblyGraph::Edge& edge = assemblyGraph.edges[edgeId];
-
-        // Only consider edges that were actually assembled
-        if (not assemblyGraph.isAssembledEdge(edgeId)){
-            continue;
-        }
-
-        // Randomly select an end of the segment
-        const bool side = bool(rand() % 2);
-
-        MarkerGraph::VertexId vertexId;
-
-        // Depending on the choice, check different markers to see if they are dead ends
-        if (side){
-            vertexId = edge.source;
-            if (assemblyGraph.inDegree(vertexId) > 0) {
-                continue;
-            }
-        }
-        else{
-            vertexId = edge.target;
-            if (assemblyGraph.outDegree(vertexId) > 0) {
-                continue;
-            }
-        }
-
-        // Convert vertexId to its corresponding MarkerGraph vertex ID (not the same as assemblyGraph vertex ID)
-        vertexId = assemblyGraph.vertices[vertexId];
-
-        // Get all the markers for each read in this vertex
-        span<MarkerId> markerIds = markerGraph.getVertexMarkerIds(vertexId);
-
-        uniform_int_distribution<uint64_t> markerDistribution(0, markerIds.size() - 1);
-
-        // Randomly select a read markerID from the terminal marker vertex
-        MarkerId index = markerDistribution(rd);
-        MarkerId markerId = markerIds[index];
-
-        // Get the Read ID
-        const OrientedReadId r = findMarkerId(markerId).first;
-
-        cout << "Sampling read " << r << " from marker vertex " <<  vertexId << " on edge " << edgeId << '\n';
-
-        sample.push_back(r);
-        isLeftEnd.push_back(side);
-    }
-}
-
-
-void Assembler::sampleReadsFromDeadEnds(
-        vector<OrientedReadId>& sample,
-        vector<bool>& isLeftEnd,
-        uint64_t n,
-        uint64_t minLength,
-        uint64_t maxLength){
-
-    sample.clear();
-
-    const AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
-
-    random_device rd;
-    uniform_int_distribution<uint32_t> distribution(0, uint32_t(assemblyGraph.edges.size() - 1));
-
-    while (sample.size() < n) {
-        // Randomly select an edge in the assembly graph
-        const MarkerGraph::EdgeId edgeId = uint32_t(rand() % assemblyGraph.edges.size());
-        const AssemblyGraph::Edge& edge = assemblyGraph.edges[edgeId];
-
-        // Only consider edges that were actually assembled
-        if (not assemblyGraph.isAssembledEdge(edgeId)){
-            continue;
-        }
-
-        // Randomly select an end of the segment
-        const bool side = bool(rand() % 2);
-
-        MarkerGraph::VertexId vertexId;
-
-        // Depending on the choice, check different markers to see if they are dead ends
-        if (side){
-            vertexId = edge.source;
-            if (assemblyGraph.inDegree(vertexId) > 0) {
-                continue;
-            }
-        }
-        else{
-            vertexId = edge.target;
-            if (assemblyGraph.outDegree(vertexId) > 0) {
-                continue;
-            }
-        }
-
-        // Convert vertexId to its corresponding MarkerGraph vertex ID (not the same as assemblyGraph vertex ID)
-        vertexId = assemblyGraph.vertices[vertexId];
-
-        // Get all the markers for each read in this vertex
-        span<MarkerId> markerIds = markerGraph.getVertexMarkerIds(vertexId);
-
-        uniform_int_distribution<uint64_t> markerDistribution(0, markerIds.size() - 1);
-
-        // Randomly select a read markerID from the terminal marker vertex
-        MarkerId index = markerDistribution(rd);
-        MarkerId markerId = markerIds[index];
-
-        // Get the Read ID
-        const OrientedReadId r = findMarkerId(markerId).first;
-
-        // Number of raw bases.
-        const auto repeatCounts = reads->getReadRepeatCounts(r.getReadId());
-        uint64_t length = 0;
-        for(const auto repeatCount: repeatCounts) {
-            length += repeatCount;
-        }
-
-        // Only update the sample of reads if this read passes the length criteria
-        if(length >= minLength and length <= maxLength) {
-            sample.push_back(r);
-            cout << "Sampling read " << r << " from marker vertex " <<  vertexId << " on edge " << edgeId << '\n';
-
-            // Keep track of which end of the segment these reads came from
-            isLeftEnd.push_back(side);
-        }
-    }
-}
-
-
-void Assembler::countDeadEndOverhangs(
-        const vector<pair<OrientedReadId, AlignmentInfo> >& allAlignmentInfo,
-        const vector<bool>& isLeftEnd,
-        Histogram2& overhangLengths,
-        uint32_t minOverhang){
-
-    for (uint64_t i=0; i < allAlignmentInfo.size(); i++){
-        const auto& alignment = allAlignmentInfo[i].second;
-
-        if (isLeftEnd[i]){
-            const auto overhangLength = alignment.leftTrim(1);
-
-            if (overhangLength > minOverhang) {
-                overhangLengths.update(overhangLength);
-            }
-        }
-        else{
-            const auto overhangLength = alignment.rightTrim(1);
-
-            if (overhangLength > minOverhang) {
-                overhangLengths.update(overhangLength);
-            }
-        }
-    }
-}
-
-
 // Compute alignments on an oriented read against
 // all other oriented reads, using a sampling of reads.
 // Display some useful stats for these alignments.
@@ -2553,23 +2383,19 @@ void Assembler::assessAlignments(
     uint64_t minLength = 0;
     uint64_t maxLength = std::numeric_limits<uint64_t>::max();
     bool showAlignmentResults = false;
-    bool useDeadEnds = false;
     string showAlignmentResultsString;
-    string useDeadEndsString;
 
     double alignedFractionMax = 1;
     double markerCountMax = 3000;
     double alignmentCountMax = 200;
     double maxDriftMax = 60;
     double maxSkipMax = 60;
-    double overhangLengthsMax = 1000;
 
     size_t alignedFractionBinCount = 20;
     size_t markerCountBinCount = 120;
     size_t alignmentCountBinCount = 20;
     size_t maxDriftBinCount = 30;
     size_t maxSkipBinCount = 30;
-    size_t overhangLengthsBinCount = 40;
 
     const bool sampleCountIsPresent = getParameterValue(request, "sampleCount", sampleCount);
     const bool minLengthIsPresent = getParameterValue(request, "minLength", minLength);
@@ -2580,17 +2406,14 @@ void Assembler::assessAlignments(
     getParameterValue(request, "alignmentCountMax", alignmentCountMax);
     getParameterValue(request, "maxDriftMax", maxDriftMax);
     getParameterValue(request, "maxSkipMax", maxSkipMax);
-    getParameterValue(request, "overhangLengthsMax", overhangLengthsMax);
 
     getParameterValue(request, "alignedFractionBinCount", alignedFractionBinCount);
     getParameterValue(request, "markerCountBinCount", markerCountBinCount);
     getParameterValue(request, "alignmentCountBinCount", alignmentCountBinCount);
     getParameterValue(request, "maxDriftBinCount", maxDriftBinCount);
     getParameterValue(request, "maxSkipBinCount", maxSkipBinCount);
-    getParameterValue(request, "overhangLengthsBinCount", overhangLengthsBinCount);
 
     showAlignmentResults = getParameterValue(request, "showAlignmentResults", showAlignmentResultsString);
-    useDeadEnds = getParameterValue(request, "useDeadEnds", useDeadEndsString);
 
     // Get alignment parameters.
     computeAllAlignmentsData.method = httpServerData.assemblerOptions->alignOptions.alignMethod;
@@ -2681,11 +2504,6 @@ void Assembler::assessAlignments(
         "<td><input type=checkbox name=showAlignmentResults"
         << (showAlignmentResults ? " checked=checked" : "") <<
         ">"
-        "<tr>"
-        "<td>Sample from segment dead ends only"
-        "<td><input type=checkbox name=useDeadEnds"
-        << (useDeadEnds ? " checked=checked" : "") <<
-        ">"
         "</table>";
 
     renderEditableAlignmentConfig(
@@ -2752,12 +2570,6 @@ void Assembler::assessAlignments(
              "value="+to_string(uint64_t(maxSkipMax)) << ">" <<
              "<td class=centered><input type=text name=maxSkipBinCount size=8 style='text-align:center;border:none'" <<
              "value="+to_string(maxSkipBinCount) << ">";
-    html << "<tr>";
-    html << "<td class=centered>overhangLengths" <<
-             "<td class=centered><input type=text name=overhangLengthsMax size=8 style='text-align:center;border:none'" <<
-             "value="+to_string(uint64_t(overhangLengthsMax)) << ">" <<
-             "<td class=centered><input type=text name=overhangLengthsBinCount size=8 style='text-align:center;border:none'" <<
-             "value="+to_string(overhangLengthsBinCount) << ">";
 
     html << "</table>";
     html << "</form>";
@@ -2770,26 +2582,13 @@ void Assembler::assessAlignments(
         return;
     }
 
-    vector<bool> isLeftEnd;
-    if (useDeadEnds){
-        // If the user doesn't care about filtering length, sample uniformly
-        if (not minLengthIsPresent and not maxLengthIsPresent) {
-            sampleReadsFromDeadEnds(sampledReads, isLeftEnd, sampleCount);
-        }
-        // Or else use any provided filters (defaults are used if only one is set)
-        else {
-            sampleReadsFromDeadEnds(sampledReads, isLeftEnd, sampleCount, minLength, maxLength);
-        }
+    // If the user doesn't care about filtering length, sample uniformly
+    if (not minLengthIsPresent and not maxLengthIsPresent) {
+        sampleReads(sampledReads, sampleCount);
     }
+    // Or else use any provided filters (defaults are used if only one is set)
     else {
-        // If the user doesn't care about filtering length, sample uniformly
-        if (not minLengthIsPresent and not maxLengthIsPresent) {
-            sampleReads(sampledReads, sampleCount);
-        }
-        // Or else use any provided filters (defaults are used if only one is set)
-        else {
-            sampleReads(sampledReads, sampleCount, minLength, maxLength);
-        }
+        sampleReads(sampledReads, sampleCount, minLength, maxLength);
     }
 
     // Initialize histograms
@@ -2798,10 +2597,6 @@ void Assembler::assessAlignments(
     Histogram2 alignmentCountHistogram(0, alignmentCountMax, alignmentCountBinCount);
     Histogram2 maxDriftHistogram(0, maxDriftMax, maxDriftBinCount);
     Histogram2 maxSkipHistogram(0, maxSkipMax, maxSkipBinCount);
-
-    // Only used if user specified to sample dead ends
-    vector<bool> allIsLeftEnd;
-    vector<bool> allStoredIsLeftEnd;
 
     vector<pair<OrientedReadId, AlignmentInfo> > allAlignmentInfo;
     vector<pair<OrientedReadId, AlignmentInfo> > allStoredAlignmentInfo;
@@ -2891,15 +2686,6 @@ void Assembler::assessAlignments(
             allAlignmentInfo.push_back(a);
         }
 
-        if (useDeadEnds){
-            for (uint64_t n=0; n<alignmentInfo.size(); n++) {
-                allIsLeftEnd.push_back(isLeftEnd[i]);
-            }
-            for (uint64_t n=0; n<storedAlignments.size(); n++) {
-                allStoredIsLeftEnd.push_back(isLeftEnd[i]);
-            }
-        }
-
         alignmentCountHistogram.update(double(alignmentInfo.size()));
     }
 
@@ -2944,34 +2730,6 @@ void Assembler::assessAlignments(
     maxSkipHistogram.writeToHtml(html, histogramSize, 0);
 
     html << "<br><br>";
-
-    if (useDeadEnds){
-        Histogram2 overhangLengths(0, overhangLengthsMax,overhangLengthsBinCount,false,true);
-        Histogram2 storedOverhangLengths(0,overhangLengthsMax,overhangLengthsBinCount,false,true);
-
-        auto minOverhang = uint32_t(httpServerData.assemblerOptions->markerGraphOptions.pruneIterationCount);
-
-        countDeadEndOverhangs(allAlignmentInfo, allIsLeftEnd, overhangLengths, minOverhang);
-        countDeadEndOverhangs(allStoredAlignmentInfo, allStoredIsLeftEnd, storedOverhangLengths, minOverhang);
-
-        html << "<br><strong>Overhang lengths observed in recomputed vs stored alignments</strong>";
-        html << "<br>For each dead end read in the sample, how long were the overhangs that extend beyond that end?";
-        html << "<br>Overhangs less than " << minOverhang << " markers were excluded from all analyses.";
-        html << "<br>Recomputed alignments = A = red";
-        html << "<br>Stored alignments = B = blue";
-        writeHistogramsToHtml(html, overhangLengths, storedOverhangLengths, histogramSize, 0);
-        html << "<br>";
-        html << "<strong>Total overhangs observed in recomputed alignments</strong>";
-        html << "<br>";
-        html << overhangLengths.getSum();
-        html << "<br>";
-        html << "<strong>Total overhangs observed in stored alignments</strong>";
-        html << "<br>";
-        html << storedOverhangLengths.getSum();
-        html << "<br>";
-        html << "<br>";
-        html << "<br>";
-    }
 }
 
 

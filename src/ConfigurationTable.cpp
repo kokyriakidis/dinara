@@ -192,8 +192,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Automatically determine this using PeakFinder
 minCoverage = 0
@@ -282,8 +280,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Automatically determine this using PeakFinder
 minCoverage = 0
@@ -332,8 +328,6 @@ creationMethod = 2
 
 [MarkerGraph]
 minCoveragePerStrand = 3
-simplifyMaxLength = 10,100
-crossEdgeCoverageThreshold = 3 
 
 [Assembly]
 detangleMethod = 2 
@@ -414,8 +408,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Automatically determine this using PeakFinder
 minCoverage = 0
@@ -472,8 +464,6 @@ minAlignedMarkerCount = 200
 minAlignedFraction = 0.3
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 minCoverage = 0
 
 [Assembly]
@@ -521,8 +511,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -574,8 +562,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -629,8 +615,6 @@ maxChimericReadDistance = 2
 
 [MarkerGraph]
 minCoverage = 6
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 [Assembly]
 consensusCaller = Modal
@@ -687,8 +671,6 @@ maxAlignmentCount = 12
 strandSeparationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -784,10 +766,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-a
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -880,10 +860,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-a
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -935,8 +913,6 @@ minAlignedFraction = 0.1
 creationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -1013,10 +989,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-b
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -1072,8 +1046,6 @@ maxAlignmentCount = 12
 strandSeparationMethod = 2
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -1152,10 +1124,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-b
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -1203,8 +1173,6 @@ creationMethod = 0
 maxAlignmentCount = 12
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -1259,10 +1227,8 @@ minEdgeCoverage = 6
 minEdgeCoveragePerStrand = 1
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-b
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -1340,11 +1306,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Bayesian:guppy-5.0.7-b
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
-mode2.phasing.minLogP = 50
 
 
 
@@ -1392,8 +1355,6 @@ creationMethod = 0
 maxAlignmentCount = 15
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -1445,8 +1406,6 @@ creationMethod = 0
 maxAlignmentCount = 15
 
 [MarkerGraph]
-simplifyMaxLength = 10,100,1000,10000,100000
-crossEdgeCoverageThreshold = 3
 
 # Adaptive estimation of coverage threshold to generate marker graph vertices.
 minCoverage = 0
@@ -1525,10 +1484,8 @@ minEdgeCoverage = 6
 minEdgeCoveragePerStrand = 1
 
 [Assembly]
-mode = 2
 consensusCaller = Modal
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -1602,10 +1559,8 @@ minEdgeCoveragePerStrand = 1
 
 
 [Assembly]
-mode = 2
 consensusCaller = Modal
 pruneLength = 100
-mode2.bubbleRemoval.minConcordantReadCount = 2
 
 
 
@@ -1625,6 +1580,7 @@ mode2.bubbleRemoval.minConcordantReadCount = 2
 representation = 0
 minReadLength = 10000
 noCache = True
+palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1650,7 +1606,6 @@ maxAlignmentCount = 20
 strandSeparationMethod = 2
 
 [Assembly]
-mode = 3
 
 
 )zzz"},
@@ -1662,6 +1617,7 @@ mode = 3
 representation = 0
 minReadLength = 10000
 noCache = True
+palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1689,7 +1645,6 @@ maxAlignmentCount = 40
 strandSeparationMethod = 2
 
 [Assembly]
-mode = 3
 mode3.primaryGraph.maxLoss = 0.5
 
 )zzz"},
@@ -1701,6 +1656,7 @@ mode3.primaryGraph.maxLoss = 0.5
 representation = 0
 minReadLength = 10000
 noCache = True
+palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 30
@@ -1731,7 +1687,6 @@ strandSeparationMethod = 2
 preferAlignedFraction = True
 
 [Assembly]
-mode = 3
 mode3.primaryGraph.maxLoss = 0.5
 mode3.assemblyGraph.phaseErrorThreshold = 0.2
 mode3.assemblyGraph.minLogP = 10
@@ -1746,6 +1701,7 @@ mode3.assemblyGraph.minLogP = 10
 representation = 0
 minReadLength = 1000
 noCache = True
+palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 50
@@ -1779,14 +1735,16 @@ WThreshold = 1e-8
 WThresholdForBreaks = 1e+15
 
 [Assembly]
-mode = 3
 mode3.primaryGraph.maxLoss = 0.5
 mode3.minAnchorCoverage = 0
 mode3.maxAnchorCoverage = 0
 mode3.maxAnchorCoverageMultiplier = 1.18
 mode3.assemblyGraph.pruneLength = 150000
 
-)zzz"},
+
+
+[MarkerGraph]
+alwaysSave = True)zzz"},
     {"Nanopore-r10.4.1_e8.2-400bps_sup-Raw-Jan2025", R"zzz(# Dinara assembly configuration for ONT r10.4.1_e8.2-400bps_sup raw reads,
 # without error correction, as announced by Oxford Nanopore in May 2024:
 # see https://labs.epi2me.io/lc2024_t2t/
@@ -1795,6 +1753,7 @@ mode3.assemblyGraph.pruneLength = 150000
 representation = 0
 minReadLength = 10000
 noCache = True
+palindromicReads.deltaThreshold = 300
 
 [Kmers]
 k = 26
@@ -1825,7 +1784,6 @@ strandSeparationMethod = 2
 preferAlignedFraction = True
 
 [Assembly]
-mode = 3
 mode3.primaryGraph.maxLoss = 0.5
 mode3.assemblyGraph.phaseErrorThreshold = 0.2
 mode3.assemblyGraph.minLogP = 10

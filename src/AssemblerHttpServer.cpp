@@ -1,7 +1,6 @@
 
 // Dinara.
 #include "Assembler.hpp"
-#include "AssemblyGraph.hpp"
 #include "buildId.hpp"
 #include "Coverage.hpp"
 #include "filesystem.hpp"
@@ -9,7 +8,6 @@
 #include "platformDependent.hpp"
 #include "Reads.hpp"
 using namespace dinara;
-using namespace mode0;
 
 // Boost libraries.
 #include <boost/tokenizer.hpp>
@@ -241,7 +239,6 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreStringGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreUnitigGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph0);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph1);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphVertex);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphEdge);
@@ -250,10 +247,6 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphInducedAlignment);
     DINARA_ADD_TO_FUNCTION_TABLE(followReadInMarkerGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerConnectivity);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAssemblyGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAssemblyGraphEdge);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAssemblyGraphEdgesSupport);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreCompressedAssemblyGraph);
 
     DINARA_ADD_TO_FUNCTION_TABLE(fillMode3AssemblyPathStep);
 
@@ -589,10 +582,9 @@ void Assembler::writeNavigation(ostream& html) const
 
 
     // Marker graph menu.
-    if((assemblerInfo->assemblyMode != 3) or httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
+    if(httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
         writeNavigation(html, "Marker graph", {
-            {"Local marker graph", "exploreMarkerGraph0?useBubbleReplacementEdges=on"},
-            {"Local marker graph (alternate)", "exploreMarkerGraph1"},
+            {"Local marker graph", "exploreMarkerGraph1"},
             {"Marker graph vertices", "exploreMarkerGraphVertex"},
             {"Marker graph edges", "exploreMarkerGraphEdge"},
             {"Marker coverage", "exploreMarkerCoverage"},
@@ -604,24 +596,8 @@ void Assembler::writeNavigation(ostream& html) const
 
 
 
-    // Assembly menu for assembly mode 0.
-    if(assemblerInfo->assemblyMode == 0) {
-        writeNavigation(html, "Assembly graph", {
-            {"Local assembly graph", "exploreAssemblyGraph"},
-            {"Assembly graph edges", "exploreAssemblyGraphEdge"},
-            {"Assembly graph edges support", "exploreAssemblyGraphEdgesSupport"},
-            {"Compressed assembly graph", "exploreCompressedAssemblyGraph"},
-            });
-    }
-
-
-
-    // Assembly Mode 2 does not provide an assembly menu.
-
-
-
     // Anchors and Assembly menus for assembly mode 3.
-    if(assemblerInfo->assemblyMode == 3) {
+    {
 
         writeNavigation(html, "Anchors", {
             {"Anchor", "exploreAnchor"},
@@ -984,7 +960,7 @@ void Assembler::accessAllSoft()
 
 
     // Marker graph. It is not accessed for mode 3, unless --MarkerGraph.alwaysSave is set.
-    if((assemblerInfo->assemblyMode != 3) or httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
+    if(httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
         try {
             accessMarkerGraphVertices();
         } catch(const exception& e) {
@@ -1030,42 +1006,8 @@ void Assembler::accessAllSoft()
 
 
 
-    // Data specific to assembly mode 0.
-    if(assemblerInfo->assemblyMode == 0) {
-        try {
-            accessAssemblyGraphVertices();
-        } catch(const exception& e) {
-            cout << "Assembly graph vertices are not accessible." << endl;
-            allDataAreAvailable = false;
-        }
-
-        try {
-            accessAssemblyGraphEdges();
-        } catch(const exception& e) {
-            cout << "Assembly graph edges are not accessible." << endl;
-            allDataAreAvailable = false;
-        }
-
-        try {
-            accessAssemblyGraphEdgeLists();
-        } catch(const exception& e) {
-            cout << "Assembly graph edge lists are not accessible." << endl;
-            allDataAreAvailable = false;
-        }
-
-        try {
-            accessAssemblyGraphSequences();
-        } catch(const exception& e) {
-            cout << "Assembly graph sequences are not accessible." << endl;
-            allDataAreAvailable = false;
-        }
-
-    }
-
-
-
     // Data specific to assembly mode 3.
-    if(assemblerInfo->assemblyMode == 3) {
+    {
         try {
             accessMode3Assembler();
         } catch(const exception& e) {
@@ -1267,7 +1209,6 @@ void Assembler::writeAssemblySummary(ostream& html)
 void Assembler::writeAssemblySummaryBody(ostream& html)
 {
     using std::setprecision;
-    mode0::AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
 
     const uint64_t totalDiscardedReadCount =
         assemblerInfo->discardedInvalidBaseReadCount +
@@ -1442,107 +1383,6 @@ void Assembler::writeAssemblySummaryBody(ostream& html)
         "<td class=centered>" << double(assemblerInfo->baseCount-assemblerInfo->isolatedReadBaseCount)/double(assemblerInfo->baseCount) <<
         "</table>";
 
-    if(assemblerInfo->assemblyMode != 3) {
-        html <<
-            "<h3>Marker graph</h3>"
-            "<table>"
-            "<tr><td>Total number of vertices"
-            "<td class=right>" << markerGraph.vertexCount() <<
-            "<tr><td>Total number of edges"
-            "<td class=right>" << markerGraph.edges.size() <<
-            "<tr><td>Number of vertices that are not isolated after edge removal"
-            "<td class=right>" << assemblerInfo->markerGraphVerticesNotIsolatedCount <<
-            "<tr><td>Number of edges that were not removed"
-            "<td class=right>" << assemblerInfo->markerGraphEdgesNotRemovedCount <<
-            "</table>"
-            "<ul><li>The marker graph contains both strands.</ul>";
-    }
-
-
-        if(assemblyGraphPointer) {
-            html <<
-                "<h3>Assembly graph</h3>"
-                "<table>"
-                "<tr><td>Number of vertices"
-                "<td class=right>" << assemblyGraph.vertices.size() <<
-                "<tr><td>Number of edges"
-                "<td class=right>" << assemblyGraph.edges.size() <<
-                "<tr><td>Number of edges assembled"
-                "<td class=right>" << assemblerInfo->assemblyGraphAssembledEdgeCount <<
-                "</table>"
-                "<ul><li>The assembly graph contains both strands.</ul>";
-        }
-
-
-
-        if(assemblerInfo->assemblyMode == 0) {
-            html <<
-            "<h3>Assembled segments (&quot;contigs&quot;)</h3>"
-            "<table>"
-            "<tr><td>Number of segments assembled"
-            "<td class=right>" << assemblerInfo->assemblyGraphAssembledEdgeCount <<
-            "<tr><td>Total assembled segment length"
-            "<td class=right>" << assemblerInfo->totalAssembledSegmentLength <<
-            "<tr><td>Longest assembled segment length"
-            "<td class=right>" << assemblerInfo->longestAssembledSegmentLength <<
-            "<tr><td>Assembled segments N<sub>50</sub>"
-            "<td class=right>" << assemblerInfo->assembledSegmentN50 <<
-            "</table>"
-            "<ul><li>Dinara uses GFA terminology "
-            "(<i>segment</i> instead of the most common <i>contig</i>). "
-            "A contiguous section of assembled sequence can consist of multiple segments, "
-            "for example in the presence of heterozygous bubbles."
-            "<li>See AssemblySummary.csv for lengths of assembled segments."
-            "</ul>";
-        }
-
-
-
-        if(assemblerInfo->assemblyMode == 2) {
-            const AssemblyGraph2Statistics& statistics = assemblerInfo->assemblyGraph2Statistics;
-            html <<
-                "<h3>Phased assembly statistics</h3>"
-                "<table>"
-                "<tr><th><th>Length<th>N<sub>50</sub>"
-                "<tr><td>Bubble chains"
-                "<td class=right>" << statistics.totalBubbleChainLength <<
-                "<td class=right>" << statistics.bubbleChainN50 <<
-                "<tr><td>Diploid sequence (per haplotype)"
-                "<td class=right>" << statistics.totalDiploidLengthBothHaplotypes / 2 <<
-                "<td class=right>" << statistics.diploidN50 <<
-                "<tr><td>Haploid sequence"
-                "<td class=right>" << statistics.totalHaploidLength <<
-                "<td class=right>" << statistics.haploidN50 <<
-                "<tr><td>Total sequence assembled in bubble chains, per haplotype"
-                "<td class=right>" <<
-                statistics.totalDiploidLengthBothHaplotypes / 2 +
-                statistics.totalHaploidLength <<
-                "<td class=right>"
-                "<tr><td>Sequence outside bubble chains"
-                "<td class=right>" << statistics.outsideBubbleChainsLength <<
-                "<td class=right>"
-                "</table>"
-
-                "<p>"
-                "<table>"
-                "<tr><td>Number of bubbles that describe a single SNP (transition)"
-                "<td class=right>" << statistics.simpleSnpBubbleTransitionCount <<
-                "<tr><td>Number of bubbles that describe a single SNP (transversion)"
-                "<td class=right>" << statistics.simpleSnpBubbleTransversionCount <<
-                "<tr><td>Number of bubbles that describe a single SNP (total)"
-                "<td class=right>" <<
-                statistics.simpleSnpBubbleTransitionCount +
-                statistics.simpleSnpBubbleTransversionCount <<
-                "<tr><td>Transition/transversion ratio for bubbles that describe a single SNP"
-                "<td class=right>" <<
-                double(statistics.simpleSnpBubbleTransitionCount) /
-                double(statistics.simpleSnpBubbleTransversionCount) <<
-                "<tr><td>Number of bubbles that describe indels or more than one SNP"
-                "<td class=right>" << statistics.nonSimpleSnpBubbleCount <<
-                "</table>";
-        }
-
-
     html <<
         "<h3>Performance</h3>"
         "<table>"
@@ -1571,7 +1411,6 @@ void Assembler::writeAssemblySummaryBody(ostream& html)
 
 void Assembler::writeAssemblySummaryJson(ostream& json)
 {
-    AssemblyGraph& assemblyGraph = *assemblyGraphPointer;
     using std::setprecision;
 
     const uint64_t totalDiscardedReadCount =
@@ -1740,89 +1579,6 @@ void Assembler::writeAssemblySummaryJson(ostream& json)
         "      \"Bases\": " << double(assemblerInfo->baseCount-assemblerInfo->isolatedReadBaseCount)/double(assemblerInfo->baseCount) << "\n"
         "    }\n"
         "  },\n";
-
-    if(assemblerInfo->assemblyMode != 3) {
-        json <<
-            "  \"Marker graph\":\n"
-            "  {\n"
-            "    \"Total number of vertices\": " << markerGraph.vertexCount() << ",\n"
-            "    \"Total number of edges\": " << markerGraph.edges.size() << ",\n"
-            "    \"Number of vertices that are not isolated after edge removal\": " <<
-            assemblerInfo->markerGraphVerticesNotIsolatedCount << ",\n"
-            "    \"Number of edges that were not removed\": " << assemblerInfo->markerGraphEdgesNotRemovedCount << "\n"
-            "  },\n";
-    }
-
-
-    if(assemblyGraphPointer) {
-        json <<
-            "  \"Assembly graph\":\n"
-            "  {\n"
-            "    \"Number of vertices\": " << assemblyGraph.vertices.size() << ",\n"
-            "    \"Number of edges\": " << assemblyGraph.edges.size() << ",\n"
-            "    \"Number of edges assembled\": " << assemblerInfo->assemblyGraphAssembledEdgeCount << "\n"
-            "  },\n";
-    }
-
-
-    if(assemblerInfo->assemblyMode == 0) {
-        json <<
-            "  \"Assembled segments\":\n"
-            "  {\n"
-            "    \"Number of segments assembled\": " << assemblerInfo->assemblyGraphAssembledEdgeCount << ",\n"
-            "    \"Total assembled segment length\": " << assemblerInfo->totalAssembledSegmentLength << ",\n"
-            "    \"Longest assembled segment length\": " << assemblerInfo->longestAssembledSegmentLength << ",\n"
-            "    \"Assembled segments N50\": " << assemblerInfo->assembledSegmentN50 << "\n"
-            "  },\n";
-    }
-
-
-
-    if(assemblerInfo->assemblyMode == 2) {
-        const AssemblyGraph2Statistics& statistics = assemblerInfo->assemblyGraph2Statistics;
-
-        json <<
-            "  \"Phased assembly statistics\":\n"
-            "  {\n"
-            "    \"Bubble chains\":\n"
-            "    {\n"
-            "      \"Length\": " << statistics.totalBubbleChainLength << ",\n"
-            "      \"N50\": " << statistics.bubbleChainN50 << "\n"
-            "    },\n"
-            "    \"Diploid sequence (per haplotype)\":\n"
-            "    {\n"
-            "      \"Length\": " << statistics.totalDiploidLengthBothHaplotypes / 2 << ",\n"
-            "      \"N50\": " << statistics.diploidN50 << "\n"
-            "    },\n"
-            "    \"Haploid sequence\":\n"
-            "    {\n"
-            "      \"Length\": " << statistics.totalHaploidLength << ",\n"
-            "      \"N50\": " << statistics.haploidN50 << "\n"
-            "    },\n"
-            "    \"Total sequence assembled in bubble chains, per haplotype\": " <<
-            statistics.totalDiploidLengthBothHaplotypes / 2 +
-            statistics.totalHaploidLength << ",\n"
-            "    \"Sequence outside bubble chains\": " <<
-            statistics.outsideBubbleChainsLength << ",\n"
-            "    \"Number of bubbles that describe a single SNP (transition)\": " <<
-            statistics.simpleSnpBubbleTransitionCount << ",\n"
-            "    \"Number of bubbles that describe a single SNP (transversion)\": " <<
-            statistics.simpleSnpBubbleTransversionCount << ",\n"
-            "    \"Number of bubbles that describe a single SNP (total)\": " <<
-            statistics.simpleSnpBubbleTransitionCount + statistics.simpleSnpBubbleTransversionCount << ",\n"
-            "    \"Transition/transversion ratio for bubbles that describe a single SNP\": " <<
-            (
-                // Make sure not to write a nan to json - it is not allowed.
-                (statistics.simpleSnpBubbleTransversionCount > 0) ?
-                (double(statistics.simpleSnpBubbleTransitionCount) / double(statistics.simpleSnpBubbleTransversionCount)) :
-                0.
-            ) << ",\n"
-            "    \"Number of bubbles that describe indels or more than one SNP\": " <<
-            statistics.nonSimpleSnpBubbleCount << "\n"
-            "  },\n";
-    }
-
-
 
     json <<
         "  \"Performance\":\n"
