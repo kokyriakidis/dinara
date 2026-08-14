@@ -1814,6 +1814,31 @@ struct MarkerSelectionConfig {
     }
 };
 
+// Which generator produces the initial markers. Resolved once from the parsed
+// options so the branch that runs is named by what it is, instead of an
+// implicit OR-of-flags with silent precedence.
+//
+//   HifiasmMinimizers : hifiasm's no-HPC sketcher + overlap-path filter. The
+//                       default; pairs with the hifiasm/PAF overlap path.
+//   SimdMinimizers    : the simd-minimizers library.
+//   LegacyKmer        : the original k-mer marker method.
+//
+// Precedence: within the SIMD minimizer path (Kmers.useSimdMinimizers, which is
+// also implied by the default-true Kmers.useHifiasmMinimizers), the position
+// source is hifiasm when Kmers.useHifiasmMinimizers is true, otherwise
+// simd-minimizers. The legacy method runs only when neither SIMD flag selects
+// the SIMD path.
+enum class MarkerSource { HifiasmMinimizers, SimdMinimizers, LegacyKmer };
+
+inline MarkerSource resolveMarkerSource(const KmersOptions& k)
+{
+    const bool simdPath = k.useHifiasmMinimizers || k.useSimdMinimizers;
+    if(!simdPath) return MarkerSource::LegacyKmer;
+    return k.useHifiasmMinimizers
+        ? MarkerSource::HifiasmMinimizers
+        : MarkerSource::SimdMinimizers;
+}
+
 // Shared-read-store bridge to hifiasm.
 //
 // dinara already holds every read in memory (2-bit packed, in class Reads).
@@ -2005,28 +2030,15 @@ void dinara::main::assemble(
     // Marker generation method selection.
     //
     // The SIMD minimizer path is the main path and is taken by default because
-    // Kmers.useHifiasmMinimizers defaults to true: it generates markers from
-    // hifiasm's own no-HPC sketcher plus the overlap-path minimizer filter, so
-    // the marker seeds match the seeds hifiasm uses for overlaps. This is what
-    // pairs with the PAF/hifiasm overlap path.
-    //
-    // Within the SIMD path the position source is:
-    //   - hifiasm sketcher            when useHifiasmMinimizers (default)
-    //   - simd-minimizers library     when only useSimdClosedSyncmers is set
-    // The legacy k-mer marker method is used only when BOTH flags are false.
-    const bool useSimdMinimizerPath =
-        assemblerOptions.kmersOptions.useHifiasmMinimizers ||
-        assemblerOptions.kmersOptions.useSimdClosedSyncmers;
-    if(useSimdMinimizerPath) {
-        // // Use SIMD-accelerated closed syncmers for initial marker generation (no filtering).
-        // assembler.findMarkersSimdClosedSyncmers(
-        //     threadCount,
-        //     assemblerOptions.kmersOptions.k,
-        //     assemblerOptions.kmersOptions.syncmerS);
-
-        // Use SIMD-accelerated minimizers instead of closed syncmers.
-        // For hifiasm-like behavior with k=w, use syncmerS parameter as window size.
-        // Density ≈ 2/w (smaller w = denser sampling, larger w = sparser sampling)
+    // Marker generation. Kmers.useHifiasmMinimizers defaults to true, so by
+    // default markers come from hifiasm's own no-HPC sketcher plus the
+    // overlap-path minimizer filter, and the marker seeds match the seeds
+    // hifiasm uses for overlaps (this is what pairs with the PAF/hifiasm overlap
+    // path). The source is resolved once into an explicit enum; see
+    // resolveMarkerSource / MarkerSource for the precedence rules.
+    const MarkerSource markerSource =
+        resolveMarkerSource(assemblerOptions.kmersOptions);
+    if(markerSource != MarkerSource::LegacyKmer) {
         // Resolve and validate the marker-selection configuration once, up
         // front. This centralizes the two k-mer roles (select vs encode) and
         // the two filtering stages (high-occurrence filter + distance
@@ -2199,7 +2211,7 @@ void dinara::main::assemble(
         assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
             
     } else {
-        // Use the default k-mer based method.
+        // MarkerSource::LegacyKmer: the original k-mer based method.
         // Initialize the KmerChecker, which has the information needed
         // to decide if a k-mer is a marker.
         assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);

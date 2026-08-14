@@ -164,15 +164,28 @@ public:
     string file;
     string globalFrequencyOverrideDirectory;
 
-    // Options for SIMD closed syncmer-based marker generation.
-    bool useSimdClosedSyncmers;
+    // Select the SIMD minimizer marker path (as opposed to the legacy k-mer
+    // marker method). Within that path the position source is chosen by
+    // useHifiasmMinimizers. Despite the historical name, this never ran closed
+    // syncmers: the live implementation is minimizer-based.
+    bool useSimdMinimizers;
+
+    // Deprecated alias for useSimdMinimizers. Kept so existing command lines and
+    // configs that pass Kmers.useSimdClosedSyncmers keep working; resolved into
+    // useSimdMinimizers by resolveDeprecatedAliases(). Do not read directly.
+    bool useSimdClosedSyncmersDeprecated;
+
+    // Deprecated and unused. Was intended as the sub-k-mer size for closed
+    // syncmer selection, but the closed-syncmer path was never wired up (the
+    // live SIMD path is minimizer-based). Retained only so old command lines do
+    // not error; it has no effect.
     int syncmerS;
 
     // Use hifiasm's sketcher (no-HPC) as the minimizer position source instead
     // of the simd-minimizers library. Only affects the SIMD minimizer path
-    // (useSimdClosedSyncmers == false); positions are still resolved to real
-    // canonical KmerIds by dinara, so the downstream index is unchanged. Exists
-    // to benchmark hifiasm's seed selection against simd-minimizers.
+    // (useSimdMinimizers); positions are still resolved to real canonical
+    // KmerIds by dinara, so the downstream index is unchanged. Exists to
+    // benchmark hifiasm's seed selection against simd-minimizers.
     bool useHifiasmMinimizers;
 
     // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer
@@ -192,6 +205,11 @@ public:
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.
     double minMarkerSpanFraction;
+
+    // Fold the deprecated useSimdClosedSyncmers alias into useSimdMinimizers.
+    // Call once after options are parsed. If the deprecated flag was set true,
+    // it turns on useSimdMinimizers (a warning is printed by the caller).
+    void resolveDeprecatedAliases();
 
     void write(ostream&) const;
 };

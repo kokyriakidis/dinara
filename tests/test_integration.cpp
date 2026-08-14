@@ -856,7 +856,13 @@ public:
     }
     
     void generateMarkers(int k = 16, int s = 4) {
-        withSilencedIoInDir(testDir, [&] { assembler->findMarkersSimdClosedSyncmers(1, k, s); });
+        // The simd-minimizers backend requires the window length l = k + w - 1
+        // to be odd (k and w same parity). Nudge w up by one when needed so the
+        // various (k, s) combinations used by these tests stay valid.
+        const int w = ((k + s) % 2 == 0) ? s : s + 1;
+        withSilencedIoInDir(testDir, [&] {
+            assembler->findMarkersSimdMinimizers(1, k, w, /*useHifiasm*/ false);
+        });
     }
     
     void countKmers() {

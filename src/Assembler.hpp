@@ -294,7 +294,6 @@ public:
     // Functions related to markers.
     // See the beginning of Marker.hpp for more information.
     void findMarkers(uint64_t threadCount);
-    void findMarkersSimdClosedSyncmers(uint64_t threadCount, int k, int s);
     // hifiasmFilter (a hifiasm_filter_t*, passed as void* to avoid the C bridge
     // header here) and hifiasmSampleDist enable hifiasm's overlap-path minimizer
     // filters on the hifiasm path; both are ignored when useHifiasm is false or
@@ -2395,15 +2394,6 @@ private:
     // The marker is specified by the ReadId and Strand of the oriented read
     // it belongs to, plus the ordinal
     // The thread function runs on one thread at a time.
-    void findMarkersSimdClosedSyncmersPass1(size_t threadId);
-    void findMarkersSimdClosedSyncmersPass2(size_t threadId);
-    class FindMarkersSimdClosedSyncmersData {
-    public:
-         int k;
-         int w; // interpreted as s for syncmers
-    };
-    FindMarkersSimdClosedSyncmersData findMarkersSimdClosedSyncmersData;
-
     void findMarkersSimdMinimizersPass1(size_t threadId);
     void findMarkersSimdMinimizersPass2(size_t threadId);
     class FindMarkersSimdMinimizersData {

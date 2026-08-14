@@ -373,7 +373,7 @@ TEST_CASE("Integration: CIGAR walk bases match read sequences for all overlaps",
             tmp.path.string() + "/", true, 0, 4096);
         assembler->addReads(fastqPath.string(), 0, true, 1);
         assembler->computeReadIdsSortedByName();
-        assembler->findMarkersSimdClosedSyncmers(1, 16, 5);
+        assembler->findMarkersSimdMinimizers(1, 16, 4, /*useHifiasm*/ false);
         assembler->countKmersFromMarkerKmerIds(1);
         assembler->applyKmerCountFilter(1, 1000, 1);
 
@@ -521,7 +521,7 @@ TEST_CASE("Diagnostic: determine correct read1Start for RC overlaps",
         assembler = std::make_unique<Assembler>(tmp.path.string() + "/", true, 0, 4096);
         assembler->addReads((tmp.path / "reads.fastq").string(), 0, true, 1);
         assembler->computeReadIdsSortedByName();
-        assembler->findMarkersSimdClosedSyncmers(1, 16, 5);
+        assembler->findMarkersSimdMinimizers(1, 16, 4, /*useHifiasm*/ false);
         assembler->countKmersFromMarkerKmerIds(1);
         assembler->applyKmerCountFilter(1, 1000, 1);
         OverlapCandidatesOptions candOpts;
@@ -682,7 +682,7 @@ TEST_CASE("Integration: ad.ts stores marker-based forward coords, RC conversion 
             tmp.path.string() + "/", true, 0, 4096);
         assembler->addReads((tmp.path / "reads.fastq").string(), 0, true, 1);
         assembler->computeReadIdsSortedByName();
-        assembler->findMarkersSimdClosedSyncmers(1, 16, 5);
+        assembler->findMarkersSimdMinimizers(1, 16, 4, /*useHifiasm*/ false);
         assembler->countKmersFromMarkerKmerIds(1);
         assembler->applyKmerCountFilter(1, 1000, 1);
 

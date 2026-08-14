@@ -126,6 +126,9 @@ AssemblerOptions::AssemblerOptions(int argumentCount, const char** arguments) :
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
 
+    // Fold deprecated option aliases into their replacements.
+    kmersOptions.resolveDeprecatedAliases();
+
     // Unpack the consensuscaller and replace relative path with the absolute
     // one if necessary.
     assemblyOptions.parseConsensusCallerString();
@@ -160,6 +163,9 @@ AssemblerOptions::AssemblerOptions(const string& fileName)
 
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
+
+    // Fold deprecated option aliases into their replacements.
+    kmersOptions.resolveDeprecatedAliases();
 
     // Unpack the consensuscaller and replace relative path with the absolute
     // one if necessary.
@@ -400,23 +406,36 @@ void AssemblerOptions::addConfigurableOptions()
         "The directory containing the hash table with marker k-mer global frequencies. "
         "Only used for Dinara development.")
 
-        ("Kmers.useSimdClosedSyncmers",
-        value<bool>(&kmersOptions.useSimdClosedSyncmers)->
+        ("Kmers.useSimdMinimizers",
+        value<bool>(&kmersOptions.useSimdMinimizers)->
         default_value(false),
-        "If set to true, use SIMD-accelerated closed syncmers for marker generation instead of "
-        "the default k-mer based method. Requires Kmers.syncmerS.")
+        "If set to true, use the SIMD minimizer marker path instead of the "
+        "default k-mer based method. Within this path the minimizer position "
+        "source is chosen by Kmers.useHifiasmMinimizers.")
 
+        // Deprecated alias for Kmers.useSimdMinimizers. Despite the name, the
+        // closed-syncmer selection was never implemented; the live path is
+        // minimizer-based. Retained so existing command lines keep working;
+        // resolveDeprecatedAliases() folds it into useSimdMinimizers.
+        ("Kmers.useSimdClosedSyncmers",
+        value<bool>(&kmersOptions.useSimdClosedSyncmersDeprecated)->
+        default_value(false),
+        "Deprecated alias for Kmers.useSimdMinimizers (the closed-syncmer path "
+        "was never implemented; the live path is minimizer-based).")
+
+        // Deprecated and unused: no code path consumes syncmerS.
         ("Kmers.syncmerS",
         value<int>(&kmersOptions.syncmerS)->
         default_value(11),
-        "Sub-kmer size (s) for SIMD closed syncmer-based marker generation. Only used if Kmers.useSimdClosedSyncmers is set.")
+        "Deprecated and unused. Retained only so old command lines do not error; "
+        "it has no effect.")
 
         ("Kmers.useHifiasmMinimizers",
         value<bool>(&kmersOptions.useHifiasmMinimizers)->
         default_value(true),
         "If true (default), use hifiasm's sketcher (no-HPC) as the minimizer position source "
         "instead of the simd-minimizers library. Only affects the SIMD minimizer path "
-        "(when Kmers.useSimdClosedSyncmers is false). Positions are still resolved to canonical "
+        "(Kmers.useSimdMinimizers). Positions are still resolved to canonical "
         "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
         "simd-minimizers instead.")
 
@@ -1747,6 +1766,20 @@ void ReadsOptions::write(ostream& s) const
 
 
 
+void KmersOptions::resolveDeprecatedAliases()
+{
+    // Kmers.useSimdClosedSyncmers is a deprecated alias for Kmers.useSimdMinimizers.
+    if(useSimdClosedSyncmersDeprecated) {
+        useSimdMinimizers = true;
+        cout << "Warning: Kmers.useSimdClosedSyncmers is deprecated and has been "
+                "renamed to Kmers.useSimdMinimizers (the closed-syncmer path was "
+                "never implemented; the live path is minimizer-based). Please "
+                "update your command line/config." << endl;
+    }
+}
+
+
+
 void KmersOptions::write(ostream& s) const
 {
     s << "[Kmers]\n";
@@ -1757,8 +1790,7 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
-    s << "useSimdClosedSyncmers = " << convertBoolToPythonString(useSimdClosedSyncmers) << "\n";
-    s << "syncmerS = " << syncmerS << "\n";
+    s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
     s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
     s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
