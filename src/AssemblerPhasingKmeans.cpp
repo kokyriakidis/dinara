@@ -1728,7 +1728,6 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
     opts.isOnt = isOnt;
     if (isOnt) cout << timestamp << "ONT mode: Fisher exact strand bias filter enabled (p < "
                     << opts.strandBiasPval << ")" << endl;
-    KmNoisyMsaOptions msaOpts;
     atomic<uint64_t> readsProcessed(0), readsWithOverlaps(0), readsWithSites(0);
     atomic<uint64_t> totalCis(0), totalTrans(0), totalCisDiffCopy(0), totalNoisyRegions(0);
 
@@ -1870,17 +1869,6 @@ void Assembler::phaseOverlapsKmeans(uint64_t threadCount, bool isOnt)
                 t0 = clk::now();
                 if (cleanHet > 0) kmRunKmeans(scratch, opts, KM_GERMLINE_CLEAN);
                 t1 = clk::now(); tt.kmeans += us(t0,t1);
-
-                // Step 4: noisy-region MSA variant recovery.
-                // Runs abPOA on reads spanning noisy regions, discovers hidden
-                // variants, scores reads, and merges into the candidate table.
-                // Then re-runs k-means with the expanded candidate set.
-                // Disabled: too slow, will be replaced with a better approach.
-                t0 = clk::now();
-                // if (!scratch.noisyRegions.empty()) {
-                //     kmNoisyMsaStep4(*this, scratch, msaOpts, opts);
-                // }
-                t1 = clk::now(); tt.noisyMsa += us(t0,t1);
 
                 t0 = clk::now();
                 kmWriteResults(*this, readId, scratch);

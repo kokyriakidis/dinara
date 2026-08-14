@@ -135,16 +135,6 @@ int collectNoisyRegMsa(
     const KmNoisyMsaOptions& opts,
     std::array<KmAbpoaMsaResult, 2>& results);
 
-/// Outer loop: iterate over all noisy regions, run MSA, extract variants,
-/// score reads, and merge into scratch. Port of pgphase collect_noisy_vars_step4.
-/// Uses iterative retry with inter-region k-means re-runs: regions that fail
-/// MSA are retried after other regions improve the phasing context.
-void kmNoisyMsaStep4(
-    const Assembler& assembler,
-    KmScratchpad& scratch,
-    const KmNoisyMsaOptions& msaOpts,
-    const KmPhasingOptions& phasingOpts);
-
 } // namespace dinara
 
 #endif

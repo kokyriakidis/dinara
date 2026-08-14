@@ -21,7 +21,6 @@ add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 include_directories(${DINARA_ROOT}/src)
 include_directories(${DINARA_ROOT}/srcMain)
 include_directories(${DINARA_ROOT}/external/catch2)
-include_directories(${DINARA_ROOT}/src/edlib/include)
 include_directories(${DINARA_ROOT}/src/ksw2)
 include_directories(${DINARA_ROOT}/external/snarls/vendored ${DINARA_ROOT}/external/snarls/libhandlegraph/src/include ${DINARA_ROOT}/external/snarls/structures/src/include)
 include_directories(${DINARA_ROOT}/external/hifiasmCandidates)
@@ -53,7 +52,6 @@ add_library(catch_main OBJECT catch_main.cpp)
 file(GLOB DINARA_SRC_FILES CONFIGURE_DEPENDS
     ${DINARA_ROOT}/src/*.cpp
     ${DINARA_ROOT}/srcMain/*.cpp
-    ${DINARA_ROOT}/src/edlib/src/edlib.cpp
     ${DINARA_ROOT}/src/ksw2/ksw2_extd2_sse.c
 )
 # Remove main.cpp (it has its own main())

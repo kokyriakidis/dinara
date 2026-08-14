@@ -40,7 +40,7 @@ add_definitions(-DDINARA_PYTHON_API)
 add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 
 # Sources files.
-file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../src/edlib/src/edlib.cpp ../src/ksw2/ksw2_extd2_sse.c)
+file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../src/ksw2/ksw2_extd2_sse.c)
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
@@ -56,7 +56,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../src/edlib/include ../src/ksw2 ../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
+include_directories(../src ../src/ksw2 ../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
 include_directories(../external/hifiasmCandidates)
 
 # # Additional link directory.
