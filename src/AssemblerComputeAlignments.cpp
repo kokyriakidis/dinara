@@ -1232,198 +1232,10 @@ void Assembler::deduplicateOntChainsPerPartnerReadHifiasmLikeThreadFunction(size
 
 
 
-// ---------------------------------------------------------------------------
-// Pre-phasing chain deduplication (hifiasm dedup_chains port)
-// ---------------------------------------------------------------------------
-// For each (readIds[0], readIds[1]) pair, keep only the single best chain.
-// Runs before marker graph construction, so no phasing info is available.
-//
-// Scoring (matches hifiasm ecovlp.cpp:2984):
-//   1. Maximize score = span - 12 * nonHomopolymerErrors
-//   2. Maximize span (tiebreaker)
-//   3. Minimize alignmentId (determinism tiebreaker)
-//
-// Unlike deduplicateOntChainsPerPartnerReadHifiasmLike, this version:
-//   - Does not filter by deletion reasons (nothing is deleted yet)
-//   - Does not use is_match / phasing state (phasing hasn't run)
-//   - Processes ALL alignments regardless of cis/trans status
-
-void Assembler::dedupChainsPrePhasing(uint64_t threadCount)
-{
-    const auto tBegin = steady_clock::now();
-    cout << timestamp << "Pre-phasing chain dedup (one chain per read pair) begins." << endl;
-
-    removedPrePhasingDedupCount = 0;
-
-    const uint64_t readCount = reads->readCount();
-    setupLoadBalancing(readCount, 100);
-    runThreads(&Assembler::dedupChainsPrePhasingThreadFunction, threadCount);
-
-    const auto tEnd = steady_clock::now();
-    const double tSeconds = seconds(tEnd - tBegin);
-    cout << timestamp << "Pre-phasing chain dedup ends in " << tSeconds << " s. Removed "
-         << removedPrePhasingDedupCount.load() << " secondary chains." << endl;
-}
-
-
-
-// Per-read-pair chain dedup.
-//
-// Dinara's mcopy chaining (hifiasm_lchain_qdp_mcopy_fast) can produce
-// multiple chains between the same read pair on the same strand.
-// Hifiasm's chain_DP only produces one chain per (query, target, strand),
-// so it doesn't need this step.
-//
-// For each (readA, readB) pair we keep at most one chain per strand:
-//   - group[0]: same-strand overlaps
-//   - group[1]: opposite-strand overlaps
-// This matches hifiasm's separate paf[] / reverse_paf[] storage where
-// same-strand and opposite-strand overlaps never compete.
-//
-// Within each strand group, the chain with the highest sharedSeedScore
-// (hifiasm's shared_seed = DP chain score) wins. All others are marked
-// DeleteReasonSecondary.
-//
-// Note: this is separate from the max_n_chain per-read global cap,
-// which is already applied during chaining.
-void Assembler::dedupChainsPrePhasingThreadFunction(size_t)
-{
-    uint64_t begin = 0, end = 0;
-    uint64_t localRemoved = 0;
-
-    struct CandidateInfo {
-        uint32_t alignmentId;
-        int32_t sharedSeed;
-        bool isCis;  // true if both sides are cis (1), false if either is unclassified (0).
-    };
-
-    vector<CandidateInfo> group[2];
-    group[0].reserve(4);
-    group[1].reserve(4);
-
-    // Process accumulated groups for the current partner.
-    // For each strand bucket, keep only the best chain.
-    // Cis chains always win over unclassified ones regardless of score.
-    // Among chains of the same class, the highest sharedSeed wins.
-    auto flushGroups = [&]() {
-        for(int s = 0; s < 2; s++) {
-            if(group[s].size() <= 1) {
-                group[s].clear();
-                continue;
-            }
-
-            size_t best = 0;
-            for(size_t i = 1; i < group[s].size(); ++i) {
-                const auto& curr = group[s][i];
-                const auto& bestCandidate = group[s][best];
-                // Cis always wins over unclassified.
-                if(curr.isCis && !bestCandidate.isCis) {
-                    best = i;
-                } else if(curr.isCis == bestCandidate.isCis &&
-                          curr.sharedSeed > bestCandidate.sharedSeed) {
-                    best = i;
-                }
-            }
-
-            for(size_t i = 0; i < group[s].size(); ++i) {
-                if(i == best) continue;
-                alignmentData[group[s][i].alignmentId].addDeleteReasonsBoth(
-                    AlignmentData::DeleteReasonSecondary);
-                ++localRemoved;
-            }
-            group[s].clear();
-        }
-    };
-
-    while(getNextBatch(begin, end)) {
-        for(ReadId r0 = ReadId(begin); r0 != ReadId(end); ++r0) {
-            const OrientedReadId orientedR0(r0, 0);
-            const auto& table = alignmentTable[orientedR0.getValue()];
-            if(table.empty()) {
-                continue;
-            }
-
-            group[0].clear();
-            group[1].clear();
-            ReadId currentPartner = invalidReadId;
-
-            // The alignment table is sorted by partner. Binary search
-            // to skip entries where partner < r0 (those are handled
-            // when the other read is the query).
-            size_t firstIndex = 0;
-            {
-                size_t lo = 0;
-                size_t hi = table.size();
-                while(lo < hi) {
-                    const size_t mid = (lo + hi) / 2;
-                    const uint32_t alignmentId = table[mid];
-                    const OrientedReadId other =
-                        alignmentData[alignmentId].getOther(orientedR0);
-                    if(other < orientedR0) {
-                        lo = mid + 1;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                firstIndex = lo;
-            }
-
-            for(size_t tableIndex = firstIndex; tableIndex < table.size();
-                ++tableIndex) {
-                const uint32_t alignmentId = table[tableIndex];
-                const auto& ad = alignmentData[alignmentId];
-
-                // Only process each pair once: r0 must be readIds[0].
-                if(ad.readIds[0] != r0) {
-                    continue;
-                }
-
-                // Delete trans (2) and cisDifferentCopy (3) chains.
-                if(ad.hifiasmEcMatchState0 > 1 || ad.hifiasmEcMatchState1 > 1) {
-                    alignmentData[alignmentId].addDeleteReasonsBoth(
-                        AlignmentData::DeleteReasonSecondary);
-                    ++localRemoved;
-                    continue;
-                }
-
-                // Self-overlaps should not exist; remove if found.
-                if(ad.readIds[0] == ad.readIds[1]) {
-                    alignmentData[alignmentId].addDeleteReasonsBoth(
-                        AlignmentData::DeleteReasonSecondary);
-                    ++localRemoved;
-                    continue;
-                }
-
-                const ReadId partner = ad.readIds[1];
-
-                // New partner — flush the previous partner's groups.
-                if(partner != currentPartner) {
-                    flushGroups();
-                    currentPartner = partner;
-                }
-
-                const int32_t sharedSeed =
-                    (ad.info.sharedSeedScore != invalid<int32_t>) ?
-                    ad.info.sharedSeedScore : 0;
-
-                const bool isCis = (ad.hifiasmEcMatchState0 == 1 && ad.hifiasmEcMatchState1 == 1);
-
-                const int strandIdx = ad.isSameStrand ? 0 : 1;
-                group[strandIdx].push_back(CandidateInfo{alignmentId, sharedSeed, isCis});
-            }
-
-            // Flush the last partner's groups.
-            flushGroups();
-        }
-    }
-
-    removedPrePhasingDedupCount += localRemoved;
-}
-
-
-// Remove all chains for read pairs that have multiple chains on the same
-// strand. Such multi-chain pairs are likely repeat-induced and can corrupt
-// the marker graph during transitive collapse.
+// For each read pair with multiple chains to the same target on the same
+// strand, keep the single best chain (highest hifiasm shared_seed) and delete
+// the rest. Mirrors hifiasm's live special_lchain selection; see
+// removeMultiChainAlignmentsThreadFunction for details.
 void Assembler::removeMultiChainAlignments(uint64_t threadCount)
 {
     const auto tBegin = steady_clock::now();
@@ -1447,16 +1259,17 @@ void Assembler::removeMultiChainAlignmentsThreadFunction(size_t)
     uint64_t begin = 0, end = 0;
     uint64_t localRemoved = 0;
 
-    // For each (partner, strandBucket) pair, collect alignment IDs.
-    struct PairKey {
-        ReadId partner;
-        int strandBucket;
-        bool operator<(const PairKey& o) const {
-            if (partner != o.partner) return partner < o.partner;
-            return strandBucket < o.strandBucket;
-        }
+    // Candidate chains between r0 and one target, plus the key hifiasm's live
+    // selection uses to pick the survivor.
+    struct Candidate {
+        uint32_t alignmentId;
+        int32_t sharedSeed;  // hifiasm overlap_region.shared_seed (chain DP score)
     };
-    std::map<PairKey, vector<uint32_t>> pairAlignments;
+    // Grouped by (target read, strand). hifiasm keeps same-strand (paf[]) and
+    // reverse-strand (reverse_paf[]) overlaps in separate stores that never
+    // compete, so an inverted-repeat pair legitimately keeps one chain per
+    // orientation. Index [0]=same-strand, [1]=reverse-strand.
+    std::map<ReadId, array<vector<Candidate>, 2>> byTarget;
 
     while(getNextBatch(begin, end)) {
         for(ReadId r0 = ReadId(begin); r0 != ReadId(end); ++r0) {
@@ -1464,7 +1277,7 @@ void Assembler::removeMultiChainAlignmentsThreadFunction(size_t)
             const auto& table = alignmentTable[orientedR0.getValue()];
             if(table.empty()) continue;
 
-            pairAlignments.clear();
+            byTarget.clear();
 
             for(size_t tableIndex = 0; tableIndex < table.size(); ++tableIndex) {
                 const uint32_t alignmentId = table[tableIndex];
@@ -1479,19 +1292,51 @@ void Assembler::removeMultiChainAlignmentsThreadFunction(size_t)
                 // Skip already-deleted alignments.
                 if(ad.deleteReasons0 || ad.deleteReasons1) continue;
 
-                const ReadId partner = ad.readIds[1];
+                // hifiasm's live selection among multiple chains to the same
+                // target (special_lchain, anchor.cpp): keep the chain with the
+                // highest overlap_region.shared_seed (the minimizer-chain DP
+                // score). This is the key hifiasm actually uses; the
+                // span - 12*non_homopolymer_errors formula lives only in a
+                // disabled (/**...**/) block in ecovlp.cpp and is NOT run.
+                const int32_t sharedSeed =
+                    (ad.info.sharedSeedScore != invalid<int32_t>) ?
+                    ad.info.sharedSeedScore : 0;
+
                 const int strandIdx = ad.isSameStrand ? 0 : 1;
-                pairAlignments[PairKey{partner, strandIdx}].push_back(alignmentId);
+                byTarget[ad.readIds[1]][strandIdx].push_back(
+                    Candidate{alignmentId, sharedSeed});
             }
 
-            // For each (partner, strand) group with >1 chain, delete all.
-            for(const auto& [key, alignmentIds] : pairAlignments) {
-                if(alignmentIds.size() <= 1) continue;
+            // For each (target, strand) with >1 chain, keep the highest
+            // shared_seed and delete the rest. A legitimate overlap produces one
+            // chain per target per strand; multiple chains indicate a repeat
+            // region where the chainer found several plausible paths. hifiasm
+            // keeps the best-scoring one rather than discarding the pair,
+            // preserving coverage. Ties are broken by smaller alignmentId for
+            // determinism (hifiasm's internal x_pos_strand tie-break has no
+            // dinara equivalent).
+            for(auto& [targetId, strandGroups] : byTarget) {
+                for(int s = 0; s < 2; ++s) {
+                    auto& candidates = strandGroups[s];
+                    if(candidates.size() <= 1) continue;
 
-                for(uint32_t alignmentId : alignmentIds) {
-                    alignmentData[alignmentId].addDeleteReasonsBoth(
-                        AlignmentData::DeleteReasonSecondary);
-                    ++localRemoved;
+                    size_t best = 0;
+                    for(size_t i = 1; i < candidates.size(); ++i) {
+                        const auto& c = candidates[i];
+                        const auto& b = candidates[best];
+                        if(c.sharedSeed > b.sharedSeed ||
+                           (c.sharedSeed == b.sharedSeed &&
+                            c.alignmentId < b.alignmentId)) {
+                            best = i;
+                        }
+                    }
+
+                    for(size_t i = 0; i < candidates.size(); ++i) {
+                        if(i == best) continue;
+                        alignmentData[candidates[i].alignmentId].addDeleteReasonsBoth(
+                            AlignmentData::DeleteReasonSecondary);
+                        ++localRemoved;
+                    }
                 }
             }
         }

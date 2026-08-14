@@ -2475,17 +2475,15 @@ void dinara::main::assemble(
     // assembler.phaseOverlaps(threadCount);
     // assembler.phaseOverlapsKmeans(threadCount);
 
-    // // Keep one best chain per read pair per strand (hifiasm dedup port).
-    // // Same-strand and opposite-strand overlaps are deduped independently,
-    // // matching hifiasm's separate paf/reverse_paf storage.
-    // // Runs after phasing so that only cis and unclassified overlaps compete.
-    // assembler.dedupChainsPrePhasing(threadCount);
-
-    // For each read pair, if there are multiple chains on the same strand,
-    // delete all of them. A legitimate overlap produces one chain per strand.
-    // Multiple chains indicate the reads overlap in a repeat region where
-    // the chainer found multiple plausible paths. Keeping any of them risks
-    // merging distinct repeat copies during transitive collapse.
+    // For each read pair with multiple chains to the same target read on the
+    // same strand, keep the single best chain and delete the rest. A legitimate
+    // overlap produces one chain per target per strand; multiple chains indicate
+    // a repeat region where the chainer found several plausible paths. This
+    // mirrors hifiasm's live special_lchain selection: keep the chain with the
+    // highest shared_seed (minimizer-chain DP score). Same-strand and
+    // reverse-strand overlaps are deduped independently (hifiasm's separate
+    // paf[] / reverse_paf[] storage), so inverted-repeat pairs keep one chain
+    // per orientation.
     assembler.removeMultiChainAlignments(threadCount);
 
     // assembler.performHifiasmECParity(threadCount);

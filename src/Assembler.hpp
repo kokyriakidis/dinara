@@ -909,18 +909,11 @@ public:
 	    // among overlaps that are cis on both reads and not already deleted.
 	    void keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount);
 public:
-    // Pre-phasing chain deduplication: keep one best chain per read pair.
-    // Port of hifiasm's dedup_chains (ecovlp.cpp:2984) for use before
-    // marker graph construction, when phasing info is not yet available.
-    // Uses score = span - 12*errors, then span as tiebreaker.
-    void dedupChainsPrePhasing(uint64_t threadCount);
-private:
-    void dedupChainsPrePhasingThreadFunction(size_t threadId);
-    std::atomic<uint64_t> removedPrePhasingDedupCount;
-public:
-
-    // Remove all chains for read pairs that have multiple chains on the
-    // same strand. Such multi-chain pairs are likely repeat-induced.
+    // For each read pair with multiple chains to the same target on the same
+    // strand, keep the single best chain (highest hifiasm shared_seed) and
+    // delete the rest. Mirrors hifiasm's live special_lchain selection.
+    // Same-strand and reverse-strand overlaps are deduped independently,
+    // matching hifiasm's separate paf[] / reverse_paf[] storage.
     void removeMultiChainAlignments(uint64_t threadCount);
 private:
     void removeMultiChainAlignmentsThreadFunction(size_t threadId);
