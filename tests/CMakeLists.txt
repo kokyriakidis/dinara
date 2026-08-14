@@ -22,7 +22,6 @@ include_directories(${DINARA_ROOT}/src)
 include_directories(${DINARA_ROOT}/srcMain)
 include_directories(${DINARA_ROOT}/external/catch2)
 include_directories(${DINARA_ROOT}/src/ksw2)
-include_directories(${DINARA_ROOT}/external/snarls/vendored ${DINARA_ROOT}/external/snarls/libhandlegraph/src/include ${DINARA_ROOT}/external/snarls/structures/src/include)
 include_directories(${DINARA_ROOT}/external/hifiasmCandidates)
 
 # Figure out if we are on Intel (as opposed to ARM).
@@ -60,6 +59,11 @@ list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
+# AssemblerShasta2Anchors.cpp excluded: it is the only translation unit that
+# calls into libshasta2, which is no longer installed or linked. The Executable
+# and PythonModule already exclude it; the tests glob picks up srcMain/*.cpp so
+# it must be excluded here too.
+list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerShasta2Anchors\\.cpp$")
 # Theseus disabled: these files use fork-only theseus APIs (align_from,
 # multi-segment constructor) that upstream theseus-lib does not provide.
 # Excluded from the build until theseus usage is reworked. Callers are stubbed.
@@ -77,7 +81,6 @@ list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerHifiasmEC\\.cpp$")
 find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(POASTA_LIB poasta_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
-find_library(SHASTA2_LIB shasta2 PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(ABPOA_LIB abpoa PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(THESEUS_LIB theseus PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 if(NOT THESEUS_LIB)
@@ -108,21 +111,21 @@ add_custom_command(TARGET test_integration POST_BUILD
 # Link all required libraries
 if(APPLE)
     target_link_libraries(test_integration
-        dinara_snarls hifiasm_overlaps
+        hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
-        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
+        ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
         ZLIB::ZLIB
     )
 else()
     # Most of our dependencies are static .a libraries, so we need either strict
     # ordering or a link group to resolve transitive symbols.
     target_link_libraries(test_integration
-        dinara_snarls hifiasm_overlaps
+        hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
         -Wl,--start-group
-        ${SHASTA2_LIB} ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
+        ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
         ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS}
         z
         -Wl,--end-group

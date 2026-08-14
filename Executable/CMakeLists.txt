@@ -74,7 +74,6 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerHifiasmEC\\.cpp$")
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
 include_directories(../src ../src/ksw2)
-include_directories(../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
 include_directories(../external/hifiasmCandidates)
 
 # Additional link directory.
@@ -150,7 +149,6 @@ endif()
 if(APPLE)
     target_link_libraries(
         dinaraExecutable
-        dinara_snarls
         hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
@@ -161,7 +159,6 @@ else()
         if(X86_64)
         target_link_libraries(
             dinaraExecutable
-            dinara_snarls
             hifiasm_overlaps
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
@@ -170,7 +167,6 @@ else()
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
-            dinara_snarls
             hifiasm_overlaps
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m

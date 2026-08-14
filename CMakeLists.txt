@@ -19,6 +19,13 @@ if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64")
     set(X86_64 ON)
 endif()
 
+# Prefer the static zlib everywhere. The executable and tests link -static, so a
+# find_package(ZLIB) that resolves to the full libz.so path (e.g. via the
+# hifiasm_overlaps subdirectory's ZLIB::ZLIB) breaks the static link. The system
+# libz.a is PIC-compatible, so the shared Python module links against it too.
+# Must be set before any add_subdirectory() that calls find_package(ZLIB).
+set(ZLIB_USE_STATIC_LIBS ON)
+
 
 
 # Summarize the environment.
@@ -187,9 +194,6 @@ endif()
 
 message(STATUS "HTS link flags: ${HTS_LINK_FLAGS}")
 message(STATUS "CURL link flags: ${CURL_LINK_FLAGS}")
-
-# Snarl finder (vendored from vg, stripped of protobuf/SnarlManager).
-add_subdirectory(external/snarls)
 
 # hifiasm candidate-overlap detector (submodule). Provides the static library
 # hifiasm_overlaps exposing hifiasm_overlaps.h; used by the optional

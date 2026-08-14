@@ -56,7 +56,7 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 
 # # Include directory.
 # include_directories(../src ~/.dinaraBuild/abpoa/abPOA/include)
-include_directories(../src ../src/ksw2 ../external/snarls/vendored ../external/snarls/libhandlegraph/src/include ../external/snarls/structures/src/include)
+include_directories(../src ../src/ksw2)
 include_directories(../external/hifiasmCandidates)
 
 # # Additional link directory.
@@ -109,12 +109,6 @@ if(NOT SIMD_MINIMIZERS_LIB)
     message(FATAL_ERROR "simd_minimizers_c library not found. Please install it.")
 endif()
 
-# Find shasta2 library
-find_library(SHASTA2_LIB shasta2)
-if(NOT SHASTA2_LIB)
-    message(FATAL_ERROR "shasta2 library not found. Please install it.")
-endif()
-
 # Allow multiple definitions to resolve duplicate rust_eh_personality
 # from linking both libastarpa_c.a and libpoasta_c.a (each bundles Rust stdlib).
 if(NOT APPLE)
@@ -124,7 +118,7 @@ endif()
 # Libraries to link with.
 target_link_libraries(
     dinaraPythonModule
-    dinara_snarls hifiasm_overlaps atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${SHASTA2_LIB})
+    hifiasm_overlaps atomic png boost_program_options boost_serialization pthread z m lapack blas ${DINARA_PYTHON_LIBRARIES} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB})
 
 # Install the shared library and the abpoa library it needs into the bin directory.
 install(TARGETS dinaraPythonModule DESTINATION dinara-install/bin)

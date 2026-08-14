@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import tempfile
 import urllib.request
-import json
 
 # Define the local build directory
 HOME = os.path.expanduser("~")
@@ -665,218 +664,64 @@ def installHtslib():
 
 
 def installAbpoa():
-    print("Installing abPOA (Shared Library)...")
-    
-    if os.path.exists("/usr/local/lib/libabpoa.so"):
-        print("libabpoa.so found in /usr/local/lib. Skipping installation.")
-        return
+    # abPOA is built directly here (previously it was a byproduct of the
+    # now-removed shasta2 install). The distro package and abPOA releases only
+    # ship the executable, and neither the upstream CMakeLists (unconditional
+    # -march=native, non-portable) nor the upstream Makefile (no shared lib)
+    # fit our needs, so we compile the sources directly. Recipe mirrors
+    # shasta2's BuildAbpoa.py: portable flags, both static (linked by the
+    # executable, needs -fPIC) and shared libraries.
+    print("Installing abPOA (static + shared) into " + DINARA_BUILD_DIR + "...")
+
+    abpoaIncludeDir = os.path.join(INCLUDE_DIR, "abpoa")
 
     with tempfile.TemporaryDirectory() as temporaryDirectory:
         print("Building abPOA using temporary directory", temporaryDirectory)
         oldDirectory = os.getcwd()
         os.chdir(temporaryDirectory)
-        
+
         runCommand("git clone https://github.com/yangao07/abPOA.git")
+        # Pin to an exact release for reproducible builds.
+        runCommand("git -C abPOA checkout v1.5.3")
         os.chdir("abPOA")
 
-        # Patch Makefile as requested by user
-        # 1. Comment out SIMDE flags
-        runCommand("sed -i 's/^EXTRA_FLAGS += -DUSE_SIMDE/# EXTRA_FLAGS += -DUSE_SIMDE/' Makefile")
-        
-        # 2. Add -fpic -shared to CFLAGS
-        # We append it to the definition of CFLAGS
-        runCommand("sed -i 's/^CFLAGS =/CFLAGS += -fpic -shared /' Makefile")
+        # Common compile flags (portable; no -march=native).
+        commonFlags = ("-I ../include -O3 -Wall -Wno-unused-function "
+                       "-Wno-misleading-indentation -Wno-stringop-overflow "
+                       "-fno-tree-vectorize")
 
-        # 3. Change library name to .so and build command
-        # Replace .a with .so
-        runCommand("sed -i 's/libabpoa.a/libabpoa.so/g' Makefile")
-        # Replace ar command with compiler for shared lib
-        runCommand("sed -i 's/ar -csru/$(CC) -shared -o/g' Makefile")
+        os.mkdir("lib")
+        os.chdir("src")
 
-        runCommand("make")
+        # Static library (with -fPIC so it can be linked into shared objects).
+        print("Building the abPOA static library.")
+        runCommand("cc -c -fPIC " + commonFlags + " *.c")
+        runCommand("ar -csr ../lib/libabpoa.a *.o")
+        runCommand("rm *.o")
 
-        # Install
-        print("Installing abPOA to /usr/local...")
-        if os.path.exists("lib/libabpoa.so"):
-            runCommand("sudo cp lib/libabpoa.so /usr/local/lib/")
-            # Also copy headers
-            if not os.path.exists("/usr/include/abpoa"):
-                runCommand("sudo mkdir -p /usr/include/abpoa")
-            # Usually abpoa.h is in include/. Copying content of include/*
-            runCommand("sudo cp include/*.h /usr/include/abpoa/")
-            # Also copy to /usr/include/abpoa.h for compatibility if needed?
-            # shasta code might use <abpoa.h> or <abpoa/abpoa.h>
-            runCommand("sudo cp include/abpoa.h /usr/include/")
-        else:
-            raise Exception("Build failed: lib/libabpoa.so not found")
+        # Shared library.
+        print("Building the abPOA shared library.")
+        runCommand("cc -c -fPIC " + commonFlags + " *.c")
+        runCommand("cc -shared -o ../lib/libabpoa.so *.o")
+        runCommand("rm *.o")
 
-        os.chdir(oldDirectory)
+        os.chdir("..")
 
+        # Install libraries.
+        runCommand("cp lib/libabpoa.a " + os.path.join(LIB_DIR, "libabpoa.a"))
+        runCommand("cp lib/libabpoa.so " + os.path.join(LIB_DIR, "libabpoa.so"))
 
-def installShasta2():
-    print("Installing shasta2 and dependencies (abPOA)...")
-    
-    installPath = os.path.join(INCLUDE_DIR, "shasta2")
-    libPath = os.path.join(LIB_DIR, "libshasta2.so")
-    staticLibPath = os.path.join(LIB_DIR, "libshasta2.a")
-    abpoaLibPath = os.path.join(LIB_DIR, "libabpoa.so")
-    abpoaStaticLibPath = os.path.join(LIB_DIR, "libabpoa.a")
-    
-    # Force rebuild: Remove existing shasta2 files to ensure patch is applied
-    print("Removing existing shasta2 to force rebuild with patch...")
-    if os.path.exists(installPath):
-        shutil.rmtree(installPath)
-    if os.path.exists(libPath):
-        os.remove(libPath)
-    if os.path.exists(staticLibPath):
-        os.remove(staticLibPath)
-
-    with tempfile.TemporaryDirectory() as temporaryDirectory:
-        print("Building shasta2 using temporary directory", temporaryDirectory)
-        
-        oldDirectory = os.getcwd()
-        os.chdir(temporaryDirectory)
-        
-        # Clone repo.
-        # Use upstream paoloshasta/shasta2. dinara's shasta2-compatible exporters
-        # (Shasta2AnchorGraphExport / Shasta2AssemblyGraphExport) match upstream's
-        # AnchorGraph serialization layout, and Anchors::anchorInfos is public in
-        # upstream, so no fork is needed. The generated external anchor graph must
-        # be loaded with a shasta2 binary built from this same upstream so the
-        # boost archive layout matches (edge = anchorIdA/B + index range into the
-        # graph-level orientedReadIds vector).
-        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
-        # Pin to an exact commit for reproducible builds.
-        runCommand("git -C shasta2 checkout 94389c2a6b1ff851f0302134dce386c133e64121")
-        
-        # Cleanup existing build directory to prevent BuildAbpoa.py failure
-        home = os.path.expanduser("~")
-        shastaBuildDir = home + "/.shasta2Build"
-        if os.path.exists(shastaBuildDir):
-             print("Cleaning up existing shasta2 build directory: " + shastaBuildDir)
-             shutil.rmtree(shastaBuildDir)
-
-        # Install dependencies (This builds abPOA in ~/.shasta2Build/abpoa)
-        # It handles the -fPIC shared library build for us!
-        runCommand("python3 shasta2/scripts/InstallBuildPrerequisites.py")
-
-        # Copy abPOA headers and library from shasta2 build
-        home = os.path.expanduser("~")
-        abpoaBuildDir = home + "/.shasta2Build/abpoa"
-        
-        # Install abPOA Shared
-        if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.so"):
-            print("Installing abPOA shared from shasta2 build...")
-            runCommand("cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.so " + abpoaLibPath)
-        else:
-            print("Warning: libabpoa.so not found in shasta2 build directory.")
-
-        # Install abPOA Static
-        if os.path.exists(abpoaBuildDir + "/abPOA/lib/libabpoa.a"):
-            print("Installing abPOA static from shasta2 build...")
-            runCommand("cp " + abpoaBuildDir + "/abPOA/lib/libabpoa.a " + abpoaStaticLibPath)
-        else:
-            print("Warning: libabpoa.a not found in shasta2 build directory.")
-
-        # Install Headers
-        abpoaIncludeDir = os.path.join(INCLUDE_DIR, "abpoa")
+        # Install headers. Non-excluded TUs include both <abpoa.h> and
+        # "abpoa/abpoa.h", so populate both include/abpoa/ and include/abpoa.h.
         if not os.path.exists(abpoaIncludeDir):
             os.makedirs(abpoaIncludeDir, exist_ok=True)
-        runCommand("cp " + abpoaBuildDir + "/abPOA/include/*.h " + abpoaIncludeDir)
-        # Also copy abpoa.h to /include/abpoa.h for compatibility
-        runCommand("cp " + abpoaBuildDir + "/abPOA/include/abpoa.h " + INCLUDE_DIR)
-        
-        os.chdir("shasta2")
-        
+        runCommand("cp include/*.h " + abpoaIncludeDir)
+        runCommand("cp include/abpoa.h " + INCLUDE_DIR)
 
-        
-        # Build shasta2 library (Python Module + Static Lib)
-        # The option -DBUILD_STATIC_LIBRARY=ON was added recently to shasta2.
-        if not os.path.exists("build"):
-            os.mkdir("build")
-        os.chdir("build")
-
-        # Use absolute path for install prefix to avoid ambiguity
-        installTmpDir = os.path.abspath("../install_tmp")
-        
-        # Run cmake with install prefix
-        # We need to explicitly include the paths to our locally built dependencies (poasta, astarpa, theseus, etc)
-        cxx_flags = f"-I{INCLUDE_DIR} -I{INCLUDE_DIR}/poasta -I{INCLUDE_DIR}/astarpa -I{INCLUDE_DIR}/simd-minimizers"
-        runCommand(f"cmake .. -DCMAKE_CXX_FLAGS=\"{cxx_flags}\" -DBUILD_EXECUTABLE=OFF -DBUILD_PYTHON_MODULE=ON -DBUILD_STATIC_LIBRARY=ON -DCMAKE_INSTALL_PREFIX={installTmpDir}")
-        runCommand("make -j")
-        # Run make install to populate install_tmp
-        runCommand("make install")
-        
-        # Install shasta2 library (Shared)
-        print("Installing shasta2 shared to " + LIB_DIR + "...")
-        # Check standard install location first, then fallback
-        # Shared might be in lib or bin depending on platform/cmake
-        possibleSharedNames = [
-            os.path.join(installTmpDir, "lib/shasta2.so"), 
-            os.path.join(installTmpDir, "bin/shasta2.so"), 
-            os.path.join(installTmpDir, "shasta2-install/bin/shasta2.so"),
-            "shasta2-install/bin/shasta2.so", # Fallback if prefix ignored
-            "PythonModule/shasta2.so", 
-            "src/shasta2.so"
-        ]
-        
-        foundShared = False
-        for name in possibleSharedNames:
-            if os.path.exists(name):
-                 runCommand("cp " + name + " " + libPath)
-                 foundShared = True
-                 break
-                 
-        if not foundShared:
-            print("Warning: shasta2.so not found even after make install.")
-
-        # Install shasta2 library (Static)
-        print("Installing shasta2 static to " + LIB_DIR + "...")
-        
-        # User confirmed DESTINATION is shasta2-install/bin
-        possibleStaticNames = [
-            os.path.join(installTmpDir, "shasta2-install/bin/shasta2.a"),
-            os.path.join(installTmpDir, "bin/shasta2.a"),
-            os.path.join(installTmpDir, "lib/shasta2.a"),
-            "shasta2-install/bin/shasta2.a", # Fallback if prefix ignored (installed in build)
-            "src/shasta2.a"
-        ]
-        
-        foundStatic = False
-        sourceStaticLib = ""
-        
-        for name in possibleStaticNames:
-             if os.path.exists(name):
-                 sourceStaticLib = name
-                 foundStatic = True
-                 break
-                 
-        if foundStatic:
-            print(f"Found static library at: {sourceStaticLib}")
-            # Rename to libshasta2.a for Dinara
-            runCommand("cp " + sourceStaticLib + " " + os.path.join(LIB_DIR, "libshasta2.a"))
-        else:
-             print("Error: shasta2.a not found in likely locations. Listing files:")
-             runCommand("find . -name '*.a'")
-             if os.path.exists(installTmpDir):
-                 runCommand(f"find {installTmpDir} -name '*.a'")
-
-        
-        # Install shasta2 headers.
-        # dinara includes shasta2's INTERNAL src/ headers (e.g.
-        # shasta2/CycleAvoider.hpp, SimpleMap.hpp, algorithm.hpp), but shasta2's
-        # CMake has no header-install rule, so install_tmp/include (when it
-        # exists) is an incomplete subset. Always copy from src/ (which contains
-        # every header dinara needs), then overlay install_tmp/include if present
-        # for any generated headers.
-        if not os.path.exists(installPath):
-            os.makedirs(installPath, exist_ok=True)
-        runCommand("cp -r ../src/* " + installPath)
-        tmpInclude = os.path.join(installTmpDir, "include")
-        if os.path.exists(tmpInclude):
-             runCommand(f"cp -r {tmpInclude}/* {installPath}")
-        
         os.chdir(oldDirectory)
+
+    print("abPOA installed.")
+
 
 
 def installTheseusLib():
@@ -926,74 +771,6 @@ def installTheseusLib():
     print("theseus-lib installed.")
 
 
-def installSnarlFinderDeps():
-    """Clone libhandlegraph and structures into external/snarls/ for the vendored snarl finder."""
-    print("Installing snarl finder dependencies...")
-
-    # Find the repo root (parent of scripts/).
-    scriptsDir = os.path.dirname(os.path.abspath(__file__))
-    repoRoot = os.path.dirname(scriptsDir)
-    snarlsDir = os.path.join(repoRoot, "external", "snarls")
-
-    os.makedirs(snarlsDir, exist_ok=True)
-
-    repos = [
-        ("libhandlegraph", "https://github.com/vgteam/libhandlegraph.git"),
-        ("structures", "https://github.com/vgteam/structures.git"),
-    ]
-
-    for name, url in repos:
-        dest = os.path.join(snarlsDir, name)
-        if os.path.isdir(os.path.join(dest, ".git")):
-            print(f"  {name} already cloned at {dest}. Skipping.")
-            continue
-        if os.path.exists(dest):
-            shutil.rmtree(dest)
-        print(f"  Cloning {name} ...")
-        runCommand(f"git clone --depth 1 {url} {dest}")
-
-    print("Snarl finder dependencies installed.")
-
-
-def installVg():
-    print("Installing vg (variation graph toolkit)...")
-
-    installBinDir = os.path.join(HOME, ".local", "bin")
-    installBinary = os.path.join(installBinDir, "vg")
-
-    os.makedirs(installBinDir, exist_ok=True)
-
-    if os.path.exists(installBinary) and os.access(installBinary, os.X_OK):
-        print("vg binary found at " + installBinary + ". Skipping installation.")
-        return
-
-    # Fetch the latest release asset URL from the GitHub API.
-    apiUrl = "https://api.github.com/repos/vgteam/vg/releases/latest"
-    req = urllib.request.Request(apiUrl, headers={"Accept": "application/vnd.github+json",
-                                                   "User-Agent": "dinara-install"})
-    with urllib.request.urlopen(req) as response:
-        release = json.loads(response.read().decode())
-
-    tag = release["tag_name"]
-    print("Latest vg release: " + tag)
-
-    # The prebuilt static Linux x86_64 binary is always named "vg" in the release assets.
-    assetUrl = None
-    for asset in release["assets"]:
-        if asset["name"] == "vg":
-            assetUrl = asset["browser_download_url"]
-            break
-
-    if assetUrl is None:
-        raise Exception("Could not find the 'vg' static binary asset in release " + tag)
-
-    print("Downloading vg from " + assetUrl + " ...")
-    urllib.request.urlretrieve(assetUrl, installBinary)
-    os.chmod(installBinary, 0o755)
-
-    print("vg " + tag + " installed at " + installBinary)
-
-
 # All installable targets in dependency order.
 # Each entry: (name, function, description)
 INSTALL_TARGETS = [
@@ -1004,9 +781,7 @@ INSTALL_TARGETS = [
     ("simd-minimizers",  installSimdMinimizers,    "SIMD minimizers library (Rust)"),
     ("bubble-finder",    installBubbleFinder,      "bubble finder library (Rust)"),
     ("theseus",          installTheseusLib,        "theseus-lib POA aligner (C++)"),
-    ("shasta2",          installShasta2,           "shasta2 library and abPOA"),
-    ("vg",               installVg,               "vg binary"),
-    ("snarls",           installSnarlFinderDeps,   "snarl finder dependencies (libhandlegraph, structures)"),
+    ("abpoa",            installAbpoa,             "abPOA POA aligner (static + shared)"),
 ]
 
 def main():
@@ -1017,8 +792,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  Install everything:          ./InstallPrerequisites-Ubuntu.py\n"
-               "  Install only shasta2:        ./InstallPrerequisites-Ubuntu.py --only shasta2\n"
-               "  Install multiple targets:    ./InstallPrerequisites-Ubuntu.py --only shasta2 snarls\n"
+               "  Install only abpoa:          ./InstallPrerequisites-Ubuntu.py --only abpoa\n"
+               "  Install multiple targets:    ./InstallPrerequisites-Ubuntu.py --only abpoa theseus\n"
                "  List available targets:      ./InstallPrerequisites-Ubuntu.py --list\n")
     parser.add_argument("--only", nargs="+", metavar="TARGET",
                         help="Install only the specified target(s). Skips base prerequisites unless 'base' is listed.")
