@@ -494,11 +494,11 @@ void ProjectedAlignment::constructQuickRawSparse()
         uint64_t cigarConsumed0 = 0;
         uint64_t cigarConsumed1 = 0;
         cigarStore->forEachOp(cigarOffset, cigarTokenCount, [&](uint8_t op, uint32_t len) {
-            switch(op) {
-                case 0: case 1: cigarConsumed0 += len; cigarConsumed1 += len; break;
-                case 2: cigarConsumed1 += len; break;
-                case 3: cigarConsumed0 += len; break;
-            }
+            // read0 is the query, read1 is the target. Decide consumption
+            // through the shared helpers so this check follows the single
+            // op convention definition and cannot drift from the producer.
+            if(opConsumesQuery(op))  cigarConsumed0 += len;  // read0
+            if(opConsumesTarget(op)) cigarConsumed1 += len;  // read1
         });
         DINARA_ASSERT(cigarConsumed0 == totalLength[0]);
         DINARA_ASSERT(cigarConsumed1 == totalLength[1]);

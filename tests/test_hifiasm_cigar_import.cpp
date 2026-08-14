@@ -20,6 +20,7 @@
 
 #include "catch.hpp"
 #include "HifiasmCigarImport.hpp"
+#include "HifiasmImportedCigarStore.hpp"
 #include "PafImport.hpp"
 
 #include <string>
@@ -277,4 +278,60 @@ TEST_CASE("import association: makePafEntry key survives the candidate round-tri
         // Strand is carried verbatim (same map bucket at store and lookup).
         REQUIRE(e.iv.isSameStrand == c.sameStrand);
     }
+}
+
+// HifiasmImportedCigarStore::add() must transpose op2<->op3 at ingest.
+//
+// hifiasm's exported CIGAR uses op2 = target-consuming and op3 = query-consuming
+// (the transpose of dinara's OverlapCigarStore convention, where op2/CigarOpIns
+// consumes the query and op3/CigarOpDel consumes the target). The store fixes
+// this at the single ingest boundary so the stored tokens follow dinara's
+// convention and stay consistent with the recorded qStart/qEnd/tStart/tEnd.
+//
+// This test would fail if the transpose in add() were removed: the stored
+// query/target consumption would no longer match the recorded overlap spans.
+TEST_CASE("HifiasmImportedCigarStore transposes op2/op3 at ingest") {
+    // A raw hifiasm CIGAR (its frame): 5 match, then op2 x3, then op3 x2, 4 match.
+    // Raw op2 consumes TARGET, raw op3 consumes QUERY. So on the raw tokens:
+    //   query-consuming = op0(5) + op3(2) + op0(4) = 11  -> qSpan
+    //   target-consuming = op0(5) + op2(3) + op0(4) = 12 -> tSpan
+    const vector<uint16_t> rawTokens = {
+        CigarToken(CigarOpMatch, 5).data,
+        CigarToken(CigarOpIns,   3).data,   // raw op2 = target-consuming
+        CigarToken(CigarOpDel,   2).data,   // raw op3 = query-consuming
+        CigarToken(CigarOpMatch, 4).data,
+    };
+    const uint32_t qStart = 0, qEnd = 11;   // query span (raw op3 + matches)
+    const uint32_t tStart = 0, tEnd = 12;   // target span (raw op2 + matches)
+
+    HifiasmImportedCigarStore store;
+    const uint64_t pairKey = (uint64_t(0) << 32) | uint64_t(1);
+    store.add(pairKey, /*isSameStrand*/ true,
+              span<const uint16_t>(rawTokens.data(), rawTokens.size()),
+              /*readIdQ*/ 0, /*readIdT*/ 1, qStart, qEnd, tStart, tEnd);
+
+    const auto* rec = store.find(pairKey, /*isSameStrand*/ true);
+    REQUIRE(rec != nullptr);
+
+    // Sum query/target consumption of the STORED tokens using dinara's helpers.
+    uint64_t storedQ = 0, storedT = 0;
+    OverlapCigarStore::forEachOp(store.tokensOf(*rec),
+        [&](uint8_t op, uint32_t len){
+            if(opConsumesQuery(op))  storedQ += len;
+            if(opConsumesTarget(op)) storedT += len;
+        });
+
+    // After the ingest transpose the stored tokens must be consistent with the
+    // recorded spans under dinara's convention.
+    REQUIRE(storedQ == qEnd - qStart);   // 11
+    REQUIRE(storedT == tEnd - tStart);   // 12
+
+    // Concretely, the two indel ops must have been swapped: op2 (raw target)
+    // became CigarOpDel and op3 (raw query) became CigarOpIns.
+    vector<CigarToken> stored(store.tokensOf(*rec).begin(), store.tokensOf(*rec).end());
+    REQUIRE(stored.size() == 4);
+    REQUIRE(stored[0].op() == CigarOpMatch); REQUIRE(stored[0].len() == 5);
+    REQUIRE(stored[1].op() == CigarOpDel);   REQUIRE(stored[1].len() == 3);
+    REQUIRE(stored[2].op() == CigarOpIns);   REQUIRE(stored[2].len() == 2);
+    REQUIRE(stored[3].op() == CigarOpMatch); REQUIRE(stored[3].len() == 4);
 }

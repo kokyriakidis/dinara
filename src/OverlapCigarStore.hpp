@@ -9,10 +9,11 @@
 //   op 2 = insertion  (bases in read0/query not in read1/target)
 //   op 3 = deletion   (bases in read1/target not in read0/query)
 //
-// This is the SAM/PAF convention and is IDENTICAL to hifiasm's internal
-// bit_extz_t CIGAR (see hifiasm cigar_check in Levenshtein_distance.h:
-// op 2 advances the query/p string, op 3 advances the target/t string), so
-// hifiasm CIGAR tokens can be consumed with no op remapping.
+// This is the SAM/PAF convention. NOTE: hifiasm's exported bit_extz_t CIGAR is
+// the TRANSPOSE of this for the indel ops (its op 2 consumes the target and its
+// op 3 consumes the query, verified against base content). Raw hifiasm tokens
+// are therefore op2<->op3 swapped when ingested; see
+// HifiasmImportedCigarStore::add().
 //
 // read0 is the query, read1 is the target. Use opConsumesQuery(op) /
 // opConsumesTarget(op) rather than testing raw op numbers, so this single

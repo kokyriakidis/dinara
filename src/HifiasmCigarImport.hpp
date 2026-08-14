@@ -4,13 +4,17 @@
 // Normalize a hifiasm per-overlap CIGAR into dinara's canonical read0/read1
 // frame.
 //
-// hifiasm emits one CIGAR per overlap in the ALIGNMENT frame:
+// This operates on tokens already in dinara's OverlapCigarStore convention
+// (op 0='=', 1='X', 2='I' consumes read0/query, 3='D' consumes read1/target).
+// hifiasm's raw export uses the TRANSPOSE of that for the indel ops, but the
+// swap is applied once at ingest in HifiasmImportedCigarStore::add(), so by the
+// time a CIGAR reaches this function op I already consumes the query and op D
+// the target.
+//
+// In that convention a hifiasm overlap's CIGAR is in the ALIGNMENT frame:
 //   - the query read (q_id) runs forward,
 //   - the target read (t_id) runs in the alignment orientation (forward for a
-//     same-strand overlap, reverse-complemented for a reverse overlap),
-//   - op I (CigarOpIns) consumes the query, op D (CigarOpDel) consumes the
-//     target. This is byte-identical to dinara's OverlapCigarStore convention
-//     (op 0='=',1='X',2='I' consumes read0/query,3='D' consumes read1/target).
+//     same-strand overlap, reverse-complemented for a reverse overlap).
 //
 // dinara canonicalizes every read pair to read0 = min(ReadId), read1 =
 // max(ReadId) (see makePafEntry / pafCandidateIntervals). read0 always runs

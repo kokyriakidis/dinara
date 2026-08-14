@@ -56,6 +56,16 @@ namespace dinara {
 
         // Append one overlap's CIGAR (raw hifiasm tokens) and its metadata.
         // Not thread-safe: call from a single thread after dedup.
+        //
+        // hifiasm's exported op2/op3 are the transpose of dinara's convention:
+        // in hifiasm's bit_extz_t frame op2 consumes the TARGET and op3 consumes
+        // the QUERY, whereas dinara's OverlapCigarStore defines op2 (CigarOpIns)
+        // as query-consuming and op3 (CigarOpDel) as target-consuming. Verified
+        // by base content: walking the raw tokens with op2=target/op3=query makes
+        // every op0 (match) column pair identical bases, while the opposite
+        // interpretation mismatches ~70% of them. Transpose op2<->op3 here, at
+        // the single ingest boundary, so every downstream consumer (and the
+        // recorded qStart/qEnd/tStart/tEnd spans) share dinara's convention.
         void add(uint64_t pairKey, bool isSameStrand,
                  span<const uint16_t> tokens,
                  uint32_t readIdQ, uint32_t readIdT,
@@ -72,7 +82,12 @@ namespace dinara {
             rec.tEnd = tEnd;
             rec.isSameStrand = isSameStrand;
             for(size_t i = 0; i < tokens.size(); ++i) {
-                arena.emplace_back(CigarToken(tokens[i]));
+                const CigarToken raw(tokens[i]);
+                const uint8_t op = raw.op();
+                const uint8_t dinaraOp =
+                    (op == CigarOpIns) ? CigarOpDel :
+                    (op == CigarOpDel) ? CigarOpIns : op;
+                arena.emplace_back(CigarToken(dinaraOp, raw.len()));
             }
             (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
         }
