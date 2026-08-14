@@ -21,8 +21,7 @@ endif()
 
 # Prefer the static zlib everywhere. The executable and tests link -static, so a
 # find_package(ZLIB) that resolves to the full libz.so path (e.g. via the
-# hifiasm_overlaps subdirectory's ZLIB::ZLIB) breaks the static link. The system
-# libz.a is PIC-compatible, so the shared Python module links against it too.
+# hifiasm_overlaps subdirectory's ZLIB::ZLIB) breaks the static link.
 # Must be set before any add_subdirectory() that calls find_package(ZLIB).
 set(ZLIB_USE_STATIC_LIBS ON)
 
@@ -42,11 +41,9 @@ message(STATUS "CMAKE_SYSTEM_NAME is " ${CMAKE_SYSTEM_NAME})
 
 # Decide what we want to build.
 option(BUILD_EXECUTABLE "Build the executable." ON)
-option(BUILD_PYTHON_MODULE "Build the Python module." ON)
 
 # Write out what we will actually build.
 message(STATUS "BUILD_EXECUTABLE is " ${BUILD_EXECUTABLE})
-message(STATUS "BUILD_PYTHON_MODULE is " ${BUILD_PYTHON_MODULE})
 
 
 
@@ -206,10 +203,6 @@ add_subdirectory(external/hifiasmCandidates)
 if(BUILD_EXECUTABLE)
     add_subdirectory(Executable)
 endif(BUILD_EXECUTABLE)
-
-if(BUILD_PYTHON_MODULE)
-    add_subdirectory(PythonModule)
-endif(BUILD_PYTHON_MODULE)
 
 # Tests
 include(CTest) # defines BUILD_TESTING option and enables CTest integration
