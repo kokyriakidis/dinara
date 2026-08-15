@@ -130,34 +130,3 @@ void Shasta2AnchorGraph::writeCsv(const string& fileName) const
     }
 }
 
-
-
-void Shasta2AnchorGraph::writeBubbleFinderGraph(const string& fileName, bool useForAssemblyOnly) const
-{
-    ofstream graphFile(fileName);
-    if(!graphFile) {
-        throw runtime_error("Cannot open " + fileName + " for writing.");
-    }
-
-    std::set<vertex_descriptor> verticesInOutput;
-    uint64_t edgeCount = 0;
-    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
-        const auto& edge = (*this)[e];
-        if(useForAssemblyOnly && !edge.useForAssembly) {
-            continue;
-        }
-        verticesInOutput.insert(source(e, *this));
-        verticesInOutput.insert(target(e, *this));
-        ++edgeCount;
-    }
-
-    graphFile << verticesInOutput.size() << " " << edgeCount << "\n";
-    BGL_FORALL_EDGES(e, *this, Shasta2AnchorGraph) {
-        const auto& edge = (*this)[e];
-        if(useForAssemblyOnly && !edge.useForAssembly) {
-            continue;
-        }
-        graphFile << source(e, *this) << " " << target(e, *this) << "\n";
-    }
-}
-
