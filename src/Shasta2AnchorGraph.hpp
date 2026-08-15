@@ -3,7 +3,7 @@
 // Shasta2AnchorGraph.hpp
 
 #include "AnchorWindows.hpp"
-#include "BidirectedAnchorGraph.hpp"
+
 #include "DinaraDetangle.hpp"
 #include "Reads.hpp"
 #include "Shasta2AnchorPair.hpp"
@@ -235,13 +235,6 @@ public:
 
     // Write the graph to GFA format.
     // If anchorWindows is provided, each link line gets a tp:Z: tag
-    // Convert to a Verkko-style bidirected graph. Each anchor pair
-    // (anchorId / 2) becomes one node. RC mirror edges are collapsed
-    // into single bidirected links. Only useForAssembly edges are included.
-    // Normalizes orientations so backbone chains appear as +/+ links.
-    BidirectedAnchorGraph toBidirected(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys) const;
 
     // classifying it as "intra", "endpoint", or "internal".
     void writeGfa(const string& fileName,

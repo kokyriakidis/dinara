@@ -24,16 +24,7 @@ namespace dinara {
             LocalAnchorGraphEdge>;
 
         class AnchorGraph;
-        class BidirectedAnchors;
         class LocalAnchorGraphDisplayOptions;
-
-        // Simple edge data for constructing from precomputed BidirectedAnchors subgraphs.
-        // from and to are canonical BidirectedAnchorIds (not doubled/oriented).
-        struct LocalBidirectedEdge {
-            uint64_t from;
-            uint64_t to;
-            uint64_t coverage;
-        };
     }
 }
 
@@ -114,17 +105,7 @@ public:
         uint64_t maxDistance,
         uint64_t minCoverage);
 
-    // Construct from a precomputed BidirectedAnchors local subgraph.
-    // AnchorIds here are canonical BidirectedAnchorIds (not doubled).
-    LocalAnchorGraph(
-        const BidirectedAnchors&,
-        const std::unordered_map<uint64_t, uint64_t>& nodeDistance,
-        const vector<LocalBidirectedEdge>& edges,
-        uint64_t maxDistance);
-
-    // Data source pointers (one or the other is set, not both).
     const Anchors* anchorsPtr = nullptr;
-    const BidirectedAnchors* bidirectedAnchorsPtr = nullptr;
 
     uint64_t maxDistance;
     std::map<AnchorId, vertex_descriptor> vertexMap;
@@ -155,7 +136,6 @@ private:
     string getEdgeUrl(AnchorId anchorId0, AnchorId anchorId1) const;
 
     // Get similarity info between referenceAnchorId and anchorId.
-    // For BidirectedAnchors, fills partial AnchorPairInfo (no offset data).
     void getAnchorPairInfo(AnchorId referenceAnchorId, AnchorId anchorId, AnchorPairInfo& info) const;
 
     // Html/svg output without using svg output created by Graphviz.

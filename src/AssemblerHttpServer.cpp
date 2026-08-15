@@ -237,8 +237,7 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectionalReadGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedReadGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreStringGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreUnitigGraph);
+
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph1);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphVertex);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphEdge);
@@ -253,11 +252,7 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorPair);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreJourney);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchor);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedJourney);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraphNode);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreBidirectedAnchorGraphPath);
+
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphNode);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphPath);
@@ -552,35 +547,6 @@ void Assembler::writeNavigation(ostream& html) const
         writeNavigation(html, "Read graph", items);
     }
 
-    // String graph menu.
-    bool stringGraphIsAvailable = false;
-    try {
-        checkStringGraphIsOpen();
-        stringGraphIsAvailable = true;
-    } catch(...) {
-    }
-
-    if(stringGraphIsAvailable) {
-        writeNavigation(html, "String graph", {
-            {"String graph", "exploreStringGraph"},
-            });
-    }
-
-    // Unitig graph menu (optional).
-    bool unitigGraphIsAvailable = false;
-    try {
-        checkUnitigGraphIsOpen();
-        unitigGraphIsAvailable = true;
-    } catch(...) {
-    }
-
-    if(unitigGraphIsAvailable) {
-        writeNavigation(html, "Unitig graph", {
-            {"Unitig graph", "exploreUnitigGraph"},
-            });
-    }
-
-
     // Marker graph menu.
     if(httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
         writeNavigation(html, "Marker graph", {
@@ -605,18 +571,10 @@ void Assembler::writeNavigation(ostream& html) const
             {"Journey", "exploreJourney"},
             {"Read following on anchors", "exploreReadFollowing"},
             {"Local anchor graph", "exploreLocalAnchorGraph"},
-            {"Bidirected Anchor", "exploreBidirectedAnchor"},
-            {"Bidirected Journey", "exploreBidirectedJourney"},
             });
 
         writeNavigation(html, "Anchor Graph", {
             {"Graph summary", "exploreAnchorGraph"},
-            });
-
-        writeNavigation(html, "Bidirected Anchor Graph", {
-            {"Graph summary", "exploreBidirectedAnchorGraph"},
-            {"Node", "exploreBidirectedAnchorGraphNode"},
-            {"Path", "exploreBidirectedAnchorGraphPath"},
             });
 
         writeNavigation(html, "Directed Anchor Graph", {
@@ -942,23 +900,6 @@ void Assembler::accessAllSoft()
         // Don't set allDataAreAvailable = false since this is optional.
     }
 
-    // String graph is optional.
-    try {
-        accessStringGraph();
-    } catch(const exception& e) {
-        cout << "The string graph is not accessible." << endl;
-        // Don't set allDataAreAvailable = false since this is optional.
-    }
-
-    // Unitig graph is optional (built from the cleaned string graph).
-    try {
-        accessUnitigGraph();
-    } catch(const exception& e) {
-        cout << "The unitig graph is not accessible." << endl;
-        // Don't set allDataAreAvailable = false since this is optional.
-    }
-
-
     // Marker graph. It is not accessed for mode 3, unless --MarkerGraph.alwaysSave is set.
     if(httpServerData.assemblerOptions->markerGraphOptions.alwaysSave) {
         try {
@@ -1013,12 +954,6 @@ void Assembler::accessAllSoft()
         } catch(const exception& e) {
             cout << "The mode 3 assembler is not accessible." << endl;
             allDataAreAvailable = false;
-        }
-
-        try {
-            accessBidirectedAnchors();
-        } catch(const exception& e) {
-            cout << "Bidirected anchors are not accessible." << endl;
         }
     }
 

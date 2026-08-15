@@ -21,9 +21,6 @@
 #include "MultithreadedObject.hpp"
 #include "BidirectionalReadGraph.hpp"
 #include "ReadGraph.hpp"
-#include "StringGraph.hpp"
-#include "UnitigGraph.hpp"
-#include "OrientedUnitigId.hpp"
 
 #include "ReadId.hpp"
 #include "OverlapCigarStore.hpp"
@@ -75,8 +72,6 @@ namespace dinara {
     class LocalMarkerGraph0;
     class LocalReadGraph;
     class LocalReadGraphTriangles;
-    class LocalStringGraph;
-    class LocalUnitigGraph;
     class LocalMarkerGraph0RequestParameters;
     class LongBaseSequences;
     class MarkerConnectivityGraph;
@@ -99,7 +94,6 @@ namespace dinara {
     namespace mode3 {
         class Anchors;
         class AnchorGraph;
-        class BidirectedAnchors;
         class DirectedAnchorGraph;
     }
 
@@ -503,19 +497,6 @@ public:
         uint64_t minAnchorCoverage,
         uint64_t maxAnchorCoverage,
         uint64_t threadCount);
-
-    // Create BRG-native anchors (no RC doubling) from self-RC marker
-    // graph vertices.  Returns a BidirectedAnchors object.
-    shared_ptr<mode3::BidirectedAnchors> createBidirectedAnchors(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t minEdgeCoverage,
-        uint64_t threadCount);
-
-    /// Save the bidirected anchor graph to GFA. Call after createBidirectedAnchors
-    /// and after each modification (transitive reduction, unitigify, etc.) to persist
-    /// the current state. Requires assembler.bidirectedAnchors to be set.
-    void saveAnchorGraph(const std::string& fileName, bool includePaths = false) const;
 
     // Create and run Verkko-style directed anchor graph resolution.
     void runDirectedAnchorGraphResolution();
@@ -1496,8 +1477,6 @@ private:
 	    ReadGraph readGraphAllAlignments;
 	    DirectedReadGraph directedReadGraph;
 	    BidirectionalReadGraph bidirectionalReadGraph;
-	    StringGraph stringGraph;
-	    UnitigGraph unitigGraph;
     void createReadGraph(
         uint32_t maxAlignmentCount,
         bool preferAlignedFraction);
@@ -1548,12 +1527,6 @@ private:
         double minDropRate = 0.2,
         double maxDropRate = 0.8,
         uint32_t maxShortTipReads = 3);
-    void accessStringGraph();
-    void accessStringGraphReadWrite();
-    void checkStringGraphIsOpen() const;
-    void accessUnitigGraph();
-    void accessUnitigGraphReadWrite();
-    void checkUnitigGraphIsOpen() const;
     void removeReadGraphBridges(uint64_t maxDistance);
     void analyzeReadGraph();
     void readGraphClustering();
@@ -1575,11 +1548,6 @@ private:
     void accessReadGraphAllAlignments();
     void accessReadGraphAllAlignmentsReadWrite();
     void checkReadGraphAllAlignmentsIsOpen() const;
-
-    // Read graph creation method 6: Uses CIGAR-based phasing (isDeleted0/isDeleted1 flags)
-    // instead of variant clustering. Provides Hifiasm-parity for ONT/HiFi data.
-    void createReadGraph6();
-    void createReadGraph6(uint64_t threadCount);
 
     // Create a read graph keeping all alignments without any filtering.
     // Use this together with marker graph vertex coverage thresholds
@@ -1694,55 +1662,7 @@ public:
 	    // alignments should be used in the read graph.
 	    void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
 	    void createDirectedReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
-	    void createStringGraphUsingSelectedAlignments(const vector<bool>& keepAlignment);
-    void createUnitigGraphFromStringGraph();
     void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
-    void rebuildReadGraphFromCurrentStringGraph(bool rebuildDirectedReadGraph = false);
-    uint64_t reduceStringGraphTransitiveHifiasm(uint32_t gapFuzz);
-    uint64_t cutStringGraphTips(uint32_t maxShortTipReads);
-    void cleanStringGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipReads);
-    void cleanStringGraphIterativeHifiasm(
-        uint32_t cleanRounds,
-        double minDropRate,
-        double maxDropRate,
-        uint32_t maxShortTipReads);
-    void cleanStringGraphPreCleanHifiasm(uint32_t maxShortTipReads);
-    void cleanStringGraphDropShortOverlaps(double lenRatio, uint32_t minOverlapLen, uint32_t maxShortTipReads);
-	    void cleanStringGraphDropOverlapRoundsHifiasm(
-	        uint32_t cleanRounds,
-	        double minDropRate,
-	        double maxDropRate,
-	        uint32_t maxShortTipReads,
-	        uint32_t finalMinOverlapLen);
-
-		    // ONT-only hifiasm parity: weak arc cutting (ul_clean_gfa: asg_arc_cut_weak) on the StringGraph.
-		    uint64_t cutStringGraphWeakArcsOntHifiasm(uint32_t maxExtReads, double lenRatio, uint32_t minDiff);
-		    // Hifiasm parity: `asg_iterative_semi_circ` (semi-circular edge cutting, plus optional chimeric-bubble cut).
-		    // `limLen` corresponds to hifiasm's LIM_LEN (100).
-		    // `normalLen` corresponds to hifiasm's `normal_len` / `max_tip` (typically maxShortTipReads).
-		    uint64_t cleanStringGraphBreakShortCycles(uint32_t limLen);
-		    uint64_t cleanStringGraphBreakShortCycles(uint32_t limLen, uint32_t normalLen);
-		    uint64_t cleanStringGraphRemoveSingleNodeBubbles(uint32_t maxShortTipReads);
-		    uint64_t cleanStringGraphChimericReads();
-		    uint64_t cleanStringGraphInexactOverlaps(uint32_t maxShortTipReads, uint32_t minDiff);
-		    uint64_t cleanStringGraphBubbleLinks(double lenRat, double secLenRat, uint32_t maxShortTipReads);
-		    uint64_t cleanStringGraphComplexBubbleLinks(double lenRat);
-		    uint64_t cleanStringGraphLargeIndelArcs(uint32_t maxShortTipReads, uint32_t minDiff);
-		    uint64_t cutStringGraphSemiCircular(uint32_t limLen);
-
-	    uint64_t transitiveReduceUnitigGraph(uint32_t gapFuzz);
-	    uint64_t cutUnitigGraphTips(uint32_t maxShortTipUnitigs);
-	    uint64_t removeUnitigGraphOneStepBubbles();
-	    void cleanUnitigGraphInitialHifiasm(uint32_t gapFuzz, uint32_t maxShortTipUnitigs);
-	    void cleanUnitigGraphPreCleanHifiasm(uint32_t maxShortTipUnitigs);
-	    void cleanUnitigGraphDropShortOverlaps(double dropRatio, uint32_t minOverlapLen);
-	    void cleanUnitigGraphDropOverlapRoundsHifiasm(
-        uint32_t cleanRounds,
-        double minDropRate,
-        double maxDropRate,
-        uint32_t maxShortTipUnitigs,
-        uint32_t finalMinOverlapLen);
-    uint64_t cleanUnitigGraphBreakShortCycles(uint32_t maxCycleUnitigs);
 
 
 
@@ -1816,22 +1736,7 @@ private:
             double timeout,
             LocalReadGraph&);
 
-	    bool createLocalStringGraph(
-	        const vector<OrientedReadId>& starts,
-	        uint32_t maxDistance,
-	        bool allowChimericReads,
-        bool followOutgoing,
-        bool followIncoming,
-        double timeout,
-        LocalStringGraph&);
 
-    bool createLocalUnitigGraph(
-        const vector<OrientedUnitigId>& starts,
-        uint32_t maxDistance,
-        bool followOutgoing,
-        bool followIncoming,
-        double timeout,
-        LocalUnitigGraph&);
 
     // Triangle analysis of the local read graph.
     // Returns a vector of triangles and their alignment residuals,
@@ -2573,8 +2478,6 @@ public:
     void exploreAlignmentGraph(const vector<string>&, ostream&);
     void exploreReadGraph(const vector<string>&, ostream&);
     void exploreBidirectionalReadGraph(const vector<string>&, ostream&);
-    void exploreStringGraph(const vector<string>&, ostream&);
-    void exploreUnitigGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);
     void exploreDirectedReadGraph(const vector<string>&, ostream&);
     static bool parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html);
@@ -2750,10 +2653,6 @@ public:
     // Mode 3 assembly.
     shared_ptr<Mode3Assembler> mode3Assembler;
     void accessMode3Assembler();
-
-    // BRG-native anchors (stored for HTTP server visualization).
-    shared_ptr<mode3::BidirectedAnchors> bidirectedAnchors;
-    void accessBidirectedAnchors();
 
     // Shasta2-style Anchors for Mode 3.
     std::shared_ptr<Shasta2Anchors> shasta2Anchors;
@@ -3140,13 +3039,6 @@ public:
     void exploreMode3AssemblyGraph(const vector<string>&, ostream&);
     void exploreSegment(const vector<string>&, ostream&);
     void exploreReadFollowingAssemblyGraph(const vector<string>&, ostream&);
-
-    // Http server functions for BRG-native anchors.
-    void exploreBidirectedAnchor(const vector<string>&, ostream&);
-    void exploreBidirectedJourney(const vector<string>&, ostream&);
-    void exploreBidirectedAnchorGraph(const vector<string>&, ostream&);
-    void exploreBidirectedAnchorGraphNode(const vector<string>&, ostream&);
-    void exploreBidirectedAnchorGraphPath(const vector<string>&, ostream&);
 
     // Http server function for the global AnchorGraph.
     void exploreAnchorGraph(const vector<string>&, ostream&);

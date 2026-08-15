@@ -235,11 +235,6 @@ public:
     uint64_t cutWeakStalks(uint64_t maxReadCount);
     void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
 
-    // Convert the assembly graph to a bidirected anchor graph.
-    BidirectedAnchorGraph toBidirected(
-        const std::vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys) const;
-
     // Compute compressed journeys in the Shasta2AssemblyGraph.
     void computeJourneys();
 

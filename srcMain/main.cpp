@@ -14,7 +14,7 @@
 #endif
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
-#include "mode3-BidirectedAnchor.hpp"
+
 #include "mode3-DirectedAnchors.hpp"
 #include "mode3-DirectedAnchorGraph.hpp"
 #include "mode3-AnchorGraph.hpp"
@@ -25,7 +25,7 @@
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AssemblyGraph.hpp"
-#include "BidirectedAnchorGraph.hpp"
+
 #include "DinaraDetangle.hpp"
 #include "WindowTransitions.hpp"
 #include "performanceLog.hpp"

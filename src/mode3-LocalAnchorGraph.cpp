@@ -1,6 +1,6 @@
 #include "mode3-LocalAnchorGraph.hpp"
 #include "mode3-AnchorGraph.hpp"
-#include "mode3-BidirectedAnchor.hpp"
+
 #include "computeLayout.hpp"
 #include "html.hpp"
 #include "HttpServer.hpp"
@@ -245,119 +245,35 @@ LocalAnchorGraph::LocalAnchorGraph(
 
 
 
-// Construct from a precomputed BidirectedAnchors local subgraph.
-LocalAnchorGraph::LocalAnchorGraph(
-    const BidirectedAnchors& bidirectedAnchors,
-    const std::unordered_map<uint64_t, uint64_t>& nodeDistance,
-    const vector<LocalBidirectedEdge>& edges,
-    uint64_t maxDistance) :
-    bidirectedAnchorsPtr(&bidirectedAnchors),
-    maxDistance(maxDistance)
-{
-    LocalAnchorGraph& graph = *this;
-
-    // Create vertices from the nodeDistance map.
-    for(const auto& [nodeId, distance] : nodeDistance) {
-        const AnchorId anchorId = AnchorId(nodeId);
-        const vertex_descriptor v = boost::add_vertex(
-            LocalAnchorGraphVertex(anchorId, distance), graph);
-        vertexMap.insert({anchorId, v});
-    }
-
-    // Create edges.
-    for(const LocalBidirectedEdge& edge : edges) {
-        const AnchorId anchorId0 = AnchorId(edge.from);
-        const AnchorId anchorId1 = AnchorId(edge.to);
-
-        auto it0 = vertexMap.find(anchorId0);
-        auto it1 = vertexMap.find(anchorId1);
-        if(it0 == vertexMap.end() or it1 == vertexMap.end()) {
-            continue;
-        }
-
-        LocalAnchorGraphEdge graphEdge;
-        graphEdge.coverage = edge.coverage;
-
-        // Populate partial AnchorPairInfo from BidirectedAnchors data.
-        // anchorId0 and anchorId1 are already canonical BidirectedAnchorIds.
-        graphEdge.info.totalA = bidirectedAnchors.coverage(anchorId0);
-        graphEdge.info.totalB = bidirectedAnchors.coverage(anchorId1);
-        graphEdge.info.common = bidirectedAnchors.countCommon(anchorId0, anchorId1);
-        graphEdge.info.onlyA = graphEdge.info.totalA > graphEdge.info.common ?
-            graphEdge.info.totalA - graphEdge.info.common : 0;
-        graphEdge.info.onlyB = graphEdge.info.totalB > graphEdge.info.common ?
-            graphEdge.info.totalB - graphEdge.info.common : 0;
-        graphEdge.info.offsetInBases = 0;
-        graphEdge.info.offsetInMarkers = 0;
-        graphEdge.info.onlyAShort = 0;
-        graphEdge.info.onlyBShort = 0;
-
-        add_edge(it0->second, it1->second, graphEdge, graph);
-    }
-}
-
-
 
 // Helper methods that dispatch based on data source.
 
 uint64_t LocalAnchorGraph::getVertexCoverage(AnchorId anchorId) const
 {
-    if(bidirectedAnchorsPtr) {
-        // anchorId is a canonical BidirectedAnchorId.
-        return bidirectedAnchorsPtr->coverage(anchorId);
-    } else {
-        return (*anchorsPtr)[anchorId].coverage();
-    }
+    return (*anchorsPtr)[anchorId].coverage();
 }
 
 string LocalAnchorGraph::getAnchorIdString(AnchorId anchorId) const
 {
-    if(bidirectedAnchorsPtr) {
-        // anchorId is a canonical BidirectedAnchorId.
-        return to_string(anchorId);
-    } else {
-        return anchorIdToString(anchorId);
-    }
+    return anchorIdToString(anchorId);
 }
 
 string LocalAnchorGraph::getAnchorUrl(AnchorId anchorId) const
 {
-    if(bidirectedAnchorsPtr) {
-        // anchorId is a canonical BidirectedAnchorId.
-        return "exploreBidirectedAnchorGraphNode?nodeId=" + to_string(anchorId);
-    } else {
-        return "exploreAnchor?anchorIdString=" + HttpServer::urlEncode(anchorIdToString(anchorId));
-    }
+    return "exploreAnchor?anchorIdString=" + HttpServer::urlEncode(anchorIdToString(anchorId));
 }
 
 string LocalAnchorGraph::getEdgeUrl(AnchorId anchorId0, AnchorId anchorId1) const
 {
-    if(bidirectedAnchorsPtr) {
-        return "";
-    } else {
-        return "exploreAnchorPair?"
-            "anchorIdAString=" + HttpServer::urlEncode(anchorIdToString(anchorId0)) + "&"
-            "anchorIdBString=" + HttpServer::urlEncode(anchorIdToString(anchorId1));
-    }
+    return "exploreAnchorPair?"
+        "anchorIdAString=" + HttpServer::urlEncode(anchorIdToString(anchorId0)) + "&"
+        "anchorIdBString=" + HttpServer::urlEncode(anchorIdToString(anchorId1));
 }
 
 void LocalAnchorGraph::getAnchorPairInfo(
     AnchorId referenceAnchorId, AnchorId anchorId, AnchorPairInfo& info) const
 {
-    if(bidirectedAnchorsPtr) {
-        // Both are canonical BidirectedAnchorIds.
-        info.totalA = bidirectedAnchorsPtr->coverage(referenceAnchorId);
-        info.totalB = bidirectedAnchorsPtr->coverage(anchorId);
-        info.common = bidirectedAnchorsPtr->countCommon(referenceAnchorId, anchorId);
-        info.onlyA = info.totalA > info.common ? info.totalA - info.common : 0;
-        info.onlyB = info.totalB > info.common ? info.totalB - info.common : 0;
-        info.offsetInBases = 0;
-        info.offsetInMarkers = 0;
-        info.onlyAShort = 0;
-        info.onlyBShort = 0;
-    } else {
-        anchorsPtr->analyzeAnchorPair(referenceAnchorId, anchorId, info);
-    }
+    anchorsPtr->analyzeAnchorPair(referenceAnchorId, anchorId, info);
 }
 
 
@@ -381,19 +297,11 @@ void LocalAnchorGraph::writeGraphviz(
     AnchorId referenceAnchorId = invalid<AnchorId>;
     uint64_t referenceAnchorIdCoverage = 0;
     if(options.vertexColoring == "byReadComposition") {
-        if(bidirectedAnchorsPtr) {
-            // Parse canonical anchor id (plain number).
-            const string& refStr = options.referenceAnchorIdString;
-            if(!refStr.empty()) {
-                referenceAnchorId = AnchorId(stoull(refStr));
-            }
-        } else {
-            referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
-            if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
-                throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
-                    ". Must be a number between 0 and " +
-                    to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
-            }
+        referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
+        if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
+            throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
+                ". Must be a number between 0 and " +
+                to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
         }
         referenceAnchorIdCoverage = getVertexCoverage(referenceAnchorId);
     }
@@ -518,9 +426,7 @@ void LocalAnchorGraph::writeGraphviz(
             << anchorId1String <<
             " " << edge.coverage << "/" << edge.info.common <<
             " loss " << std::fixed << std::setprecision(2) << loss;
-        if(!bidirectedAnchorsPtr) {
-            s << " offset " << edge.info.offsetInBases;
-        }
+        s << " offset " << edge.info.offsetInBases;
         s << "\"";
 
         // Label.
@@ -528,9 +434,7 @@ void LocalAnchorGraph::writeGraphviz(
             s << " label=\"" <<
                 edge.coverage << "/" << edge.info.common <<
                 "\\nLoss " << std::fixed << std::setprecision(2) << loss;
-            if(!bidirectedAnchorsPtr) {
-                s << "\\nOffset " << edge.info.offsetInBases;
-            }
+            s << "\\nOffset " << edge.info.offsetInBases;
             s << "\"";
         }
 
@@ -995,19 +899,11 @@ void LocalAnchorGraph::writeVertices(
     AnchorId referenceAnchorId = invalid<AnchorId>;
     uint64_t referenceAnchorIdCoverage = 0;
     if(options.vertexColoring == "byReadComposition") {
-        if(bidirectedAnchorsPtr) {
-            // Parse canonical anchor id (plain number).
-            const string& refStr = options.referenceAnchorIdString;
-            if(!refStr.empty()) {
-                referenceAnchorId = AnchorId(stoull(refStr));
-            }
-        } else {
-            referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
-            if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
-                throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
-                    ". Must be a number between 0 and " +
-                    to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
-            }
+        referenceAnchorId = anchorIdFromString(options.referenceAnchorIdString);
+        if((referenceAnchorId == invalid<AnchorId>) or (referenceAnchorId >= anchorsPtr->size())) {
+            throw runtime_error("Invalid reference anchor id " + options.referenceAnchorIdString +
+                ". Must be a number between 0 and " +
+                to_string(anchorsPtr->size() / 2 - 1) + " followed by + or -.");
         }
         referenceAnchorIdCoverage = getVertexCoverage(referenceAnchorId);
     }
@@ -1077,7 +973,7 @@ void LocalAnchorGraph::writeVertices(
             html << ", common " << info.common << ", J " <<
                 std::fixed << std::setprecision(2) << info.jaccard() <<
                 ", J' " << info.correctedJaccard();
-            if(info.common > 0 && !bidirectedAnchorsPtr) {
+            if(info.common > 0) {
                 html << ", offset " << info.offsetInBases;
             }
         }
