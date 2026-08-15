@@ -59,11 +59,6 @@ list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
-# AssemblerShasta2Anchors.cpp excluded: it is the only translation unit that
-# calls into libshasta2, which is no longer installed or linked. The Executable
-# already excludes it; the tests glob picks up srcMain/*.cpp so it must be
-# excluded here too.
-list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerShasta2Anchors\\.cpp$")
 # Theseus disabled: these files use fork-only theseus APIs (align_from,
 # multi-segment constructor) that upstream theseus-lib does not provide.
 # Excluded from the build until theseus usage is reworked. Callers are stubbed.

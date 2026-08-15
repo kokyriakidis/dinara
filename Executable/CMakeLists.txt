@@ -53,17 +53,6 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
 # faster and avoids the theseus fork's terminal-condition / quadratic-blowup
 # issues. The theseus-based version is retained in-tree for reference only.
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
-#
-# AssemblerShasta2Anchors.cpp excluded: it is the only translation unit that
-# calls into the real shasta2 library (shasta2::Anchors/AnchorGraph/AssemblyGraph
-# /Journeys/Markers/MarkerKmers/Options). Its entry points (createShasta2Anchors)
-# are already unused (all call sites commented out). Excluding it lets dinara
-# build without linking libshasta2. dinara's own ported Shasta2* classes
-# (src/Shasta2*.hpp) and the header-only shasta2 templates used by
-# Shasta2RestrictedAnchorGraph remain; the latter's only link dependency,
-# shasta2::handleFailedAssertion, is provided locally by src/Shasta2Assert.cpp.
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerShasta2Anchors\\.cpp$")
-
 # AssemblerHifiasmEC.cpp excluded: it was the only consumer of the removed
 # AlignedEvidenceStore (SNP/indel evidence streams). The overlap-phasing
 # pipeline now runs entirely off OverlapCigarStore, so the hifiasm EC parity
@@ -115,9 +104,9 @@ if(NOT ABPOA_LIB)
 endif()
 
 # shasta2 is intentionally NOT linked. dinara uses its own ported Shasta2*
-# classes (src/Shasta2*.hpp) plus header-only shasta2 templates; the only
-# translation unit that called into libshasta2 (AssemblerShasta2Anchors.cpp)
-# is excluded from the build above.
+# classes (src/Shasta2*.hpp) plus a small set of header-only shasta2 templates
+# (shasta2/AnchorGraph.hpp, shasta2/AnchorPair.hpp) used only to write the
+# shasta2-compatible external anchor/assembly graph in Shasta2*GraphExport.cpp.
 
 # Find theseus library (the kokyriakidis fork). No translation unit currently
 # built links theseus symbols: the theseus-using MSA prototypes

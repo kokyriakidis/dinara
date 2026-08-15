@@ -8,9 +8,7 @@
 #include "findConvergingVertex.hpp"
 #include "Shasta2GTest.hpp"
 #include "Shasta2LocalAssembly3.hpp"
-#include "Shasta2RestrictedAnchorGraph.hpp"
 #include "Shasta2SegmentStepSupport.hpp"
-#include "Shasta2Superbubble.hpp"
 #include "Shasta2TangleMatrix1.hpp"
 
 #include <boost/algorithm/string.hpp>
@@ -1226,60 +1224,6 @@ void Assembler::exploreShasta2TangleMatrix(const vector<string>& request, ostrea
     const Shasta2TangleMatrix1 tangleMatrix(assemblyGraph, entrances, exits, html);
     Shasta2GTest gTest(tangleMatrix.tangleMatrix, epsilon, false, false);
     gTest.writeHtml(html);
-
-
-
-    // Create a Shasta2RestrictedAnchorGraph for each element of the top hypothesis
-    // that is set to 1.
-    if(gTest.hypotheses.empty()) {
-        return;
-    }
-    const auto& bestConnectivityMatrix = gTest.hypotheses.front().connectivityMatrix;
-    for(uint64_t iEntrance=0; iEntrance<entrances.size(); iEntrance++) {
-        for(uint64_t iExit=0; iExit<exits.size(); iExit++) {
-            if(bestConnectivityMatrix[iEntrance][iExit]) {
-
-                const Shasta2AssemblyGraph::edge_descriptor eEntrance = entrances[iEntrance];
-                const Shasta2AssemblyGraph::edge_descriptor eExit = exits[iExit];
-
-                const Shasta2AssemblyGraphEdge& entranceEdge = assemblyGraph[eEntrance];
-                const Shasta2AssemblyGraphEdge& exitEdge = assemblyGraph[eExit];
-
-                const Shasta2AnchorId entranceAnchorId = entranceEdge.back().anchorPair.anchorIdB;
-                const Shasta2AnchorId exitAnchorId = exitEdge.front().anchorPair.anchorIdA;
-
-                if(entranceAnchorId == exitAnchorId) {
-                    html << "<br>The two anchors are coincident.";
-                } else {
-
-                    html << "<h4>Shasta2RestrictedAnchorGraph to connect entrance " <<
-                        entranceEdge.id <<
-                        " with exit " << exitEdge.id << "</h4>"
-                        "Last Shasta2AnchorId on entrance is " << shasta2AnchorIdToString(entranceAnchorId) <<
-                        "<br>First Shasta2AnchorId on exit is " << shasta2AnchorIdToString(exitAnchorId);
-
-
-                    Shasta2RestrictedAnchorGraph restrictedAnchorGraph(
-                        *shasta2Anchors, *shasta2Journeys, tangleMatrix, iEntrance, iExit, html);
-
-                    html << "<br>The final Shasta2RestrictedAnchorGraph has " << num_vertices(restrictedAnchorGraph) <<
-                        " vertices and " << num_edges(restrictedAnchorGraph) << " edges ";
-
-                    html << "<br>";
-                    restrictedAnchorGraph.writeOrientedReadsInVertices(html);
-
-                    // Find the optimal path in the Shasta2RestrictedAnchorGraph.
-                    vector<Shasta2RestrictedAnchorGraph::edge_descriptor> longestPath;
-                    restrictedAnchorGraph.findOptimalPath(entranceAnchorId, exitAnchorId, longestPath);
-
-                    // Write it out in Graphviz format.
-                    restrictedAnchorGraph.writeHtml(html, {entranceAnchorId, exitAnchorId});
-                }
-
-            }
-        }
-
-    }
 }
 
 

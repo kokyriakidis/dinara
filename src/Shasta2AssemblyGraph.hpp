@@ -24,8 +24,6 @@ namespace dinara {
         class Shasta2AssemblyGraphEdge;
         class Shasta2AssemblyGraphEdgeStep;
         class Shasta2AssemblyGraphOptions;
-        class Shasta2Superbubble;
-        class Shasta2SuperbubbleChain;
 
         using Shasta2AssemblyGraphBaseClass = boost::adjacency_list<
             boost::listS,
@@ -191,14 +189,10 @@ public:
     uint64_t nextVertexId = 0;
     uint64_t nextEdgeId = 0;
 
-    void simplifyAndAssemble();
     uint64_t compress();
     uint64_t compressDebugLevel = 0; // 1=minimal, 2=compact, 3=detailed.
-    uint64_t bubbleCleanup();
-    uint64_t phaseSuperbubbleChains();
 
-    // Graph cleaning steps, to be called after the initial compress()
-    // and before simplifyAndAssemble().
+    // Graph cleaning steps, to be called after the initial compress().
     // Adapted from MBG (Multiplex de Bruijn Graph assembler).
     uint64_t removeLowCoverageTips(
         double maxRemovableCoverage = 3.,
@@ -216,12 +210,6 @@ public:
     // Shorter tips are processed first so their removal can expose longer ones.
     uint64_t removeShortTips(uint32_t maxTipWindows = 3, uint64_t maxTipLength = 90000);
 
-    // Pop superbubbles by removing low-coverage alternative paths.
-    // Follows Verkko's approach (pop_bubbles_coverage_based.py).
-    uint64_t popSuperbubbles(
-        uint64_t maxBubbleSize = 10,
-        double maxPoppableCoverageFraction = 0.5);
-
     // Remove parallel edges between the same pair of vertices.
     // When multiple edges connect the same source to the same target,
     // keep the one with highest average coverage and remove the rest.
@@ -233,21 +221,12 @@ public:
     // follows a linear chain, and if it reaches a branch point
     // with the read union across all edges still <= maxReadCount, it is cut.
     uint64_t cutWeakStalks(uint64_t maxReadCount);
-    void phaseSuperbubbleChainsThreadFunction(uint64_t threadId);
 
     // Compute compressed journeys in the Shasta2AssemblyGraph.
     void computeJourneys();
 
     vector< vector<edge_descriptor> > compressedJourneys;
 
-
-
-    void findAndConnectAssemblyPaths();
-    bool canConnect(edge_descriptor, edge_descriptor) const;
-    void removeEmptyEdges();
-    void removeIsolatedVertices();
-    void removeLowN50Components(uint64_t minN50);
-    void assembleAll();
     void writeIntermediateStageIfRequested(const string& stage);
 
     // Export the assembly graph as a shasta2-compatible AnchorGraph.
@@ -291,43 +270,13 @@ public:
 
     void writeGfa(const string& fileName) const;
     void writeGfa(ostream&) const;
-    void writeFasta(const string& stage) const;
     void writeGraphviz(const string& fileName) const;
     void writeGraphviz(ostream&) const;
     void writeCsv(const string& fileName) const;
     void writeCsv(ostream&) const;
 
-    // Diagnostic (read-only): report candidate bridges between maximal 1-1
-    // linear segments, using read window-paths. A segment is an edge of this
-    // graph; its endpoint windows are the head (windowSequence.front()) and
-    // tail (windowSequence.back()). For each read, walk its window path
-    // (readWindows, raw window IDs) and record every transition from one
-    // segment's tail window to another segment's head window, accumulating
-    // distinct physical-read support. Reports how many segment pairs reads
-    // bridge and the per-tail target multiplicity (1 target vs many). Adds no
-    // edges. windowReads/readWindows come from the source Shasta2AnchorGraph.
-    void reportSegmentBridges(
-        const std::map<uint32_t, std::set<uint32_t>>& windowReads,
-        const std::map<uint32_t, vector<uint32_t>>& readWindows) const;
-
-    // Stage B.2: add confident bridge edges between maximal 1-1 segments.
-    // A bridge tail(segA)->head(segB) is added as a single-step edge from
-    // segA's target vertex to segB's source vertex when it is mutually-best
-    // (segA's best target is segB AND segB's best source is segA), both
-    // endpoints are non-ambiguous (best support > contradicting reads, or no
-    // contradiction), and support >= 2 (no single-read seed). The RC mirror
-    // bridge is added too. Direct link over the mess: the interior tangle is
-    // not materialized (no consensus sequence until assembleAll), connectivity
-    // only. Returns the number of bridge edges created (including mirrors).
-    uint64_t addConfidentBridges(
-        const std::map<uint32_t, vector<uint32_t>>& readWindows);
-
     void write(const string& stage);
     void check() const;
-    void clearSequence();
-
-    void findStrongComponents(vector< vector<vertex_descriptor> >&) const;
-    void colorStrongComponents() const;
 
     // Window-level information.
     // Populated by the constructor that takes anchorWindows.
@@ -360,13 +309,6 @@ public:
 
     // Check if window information is available.
     bool hasWindowInfo() const { return windowCount > 0; }
-
-    class PhaseSuperbubbleChainsData {
-    public:
-        shared_ptr< vector<Shasta2SuperbubbleChain> > superbubbleChains;
-        uint64_t totalChangeCount = 0;
-    };
-    PhaseSuperbubbleChainsData phaseSuperbubbleChainsData;
 
     friend class boost::serialization::access;
     template<class Archive> void serialize(Archive& ar, unsigned int /* version */)
@@ -403,37 +345,7 @@ public:
     mutable std::mutex mutex;
 
 private:
-    class Bubble {
-    public:
-        vertex_descriptor v0;
-        vertex_descriptor v1;
-        vector<edge_descriptor> edges;
-    };
-    uint64_t bubbleCleanupIteration(vector< pair<vertex_descriptor, vertex_descriptor> >& excludeList);
-    void findBubbles(vector<Bubble>&) const;
-    bool bubbleCleanup(const Bubble&);
-    bool analyzeBubble(
-        const Bubble&,
-        const vector<uint64_t> minRepeatCount,
-        vector< pair<uint64_t, uint64_t> >& similarPairs) const;
-    void findSuperbubbles(vector<Shasta2Superbubble>&) const;
-    void removeContainedSuperbubbles(vector<Shasta2Superbubble>&) const;
-    void findSuperbubbleChains(
-        const vector<Shasta2Superbubble>&,
-        vector<Shasta2SuperbubbleChain>&) const;
-    void findAssemblyPaths(vector< vector<edge_descriptor> >&) const;
-    void connectAssemblyPaths(const vector< vector<edge_descriptor> >&);
-    void writeSuperbubbles(const vector<Shasta2Superbubble>&, const string& fileName) const;
-    void writeSuperbubblesForBandage(const vector<Shasta2Superbubble>&, const string& fileName) const;
-    void writeSuperbubbleChains(const vector<Shasta2SuperbubbleChain>&, const string& fileName) const;
-    void writeSuperbubbleChainsForBandage(const vector<Shasta2SuperbubbleChain>&, const string& fileName) const;
     void writePerformanceStatistics(const string& message) const;
-    void assemble(edge_descriptor);
-    void assemble();
-    void assembleThreadFunction(uint64_t threadId);
-    void assembleStep(edge_descriptor, uint64_t);
-    static vector<dinara::Base> consensusSequence(
-        const vector< vector<dinara::Base> >& sequences);
 
     [[maybe_unused]] const Shasta2Anchors* anchorsPointer = 0;
     [[maybe_unused]] const Shasta2Journeys* journeysPointer = 0;

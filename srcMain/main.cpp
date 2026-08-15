@@ -69,7 +69,6 @@ using namespace dinara;
 
 
 // Shasta 2 Integration
-#include "AssemblerShasta2Anchors.hpp"
 #include "HetAnchorK.hpp"
 #include <atomic>
 #include <exception>

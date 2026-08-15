@@ -328,7 +328,6 @@ private:
     uint64_t n50;    
 
     friend class ReadLoader;
-    friend void createShasta2Anchors(Assembler&, const AssemblerOptions&, uint64_t);
 };
 
 #endif
