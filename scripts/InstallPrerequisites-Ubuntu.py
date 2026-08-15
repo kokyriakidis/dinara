@@ -737,6 +737,42 @@ def installTheseusLib():
     print("theseus-lib installed.")
 
 
+def installShasta2Headers():
+    # dinara does NOT link libshasta2, but several live translation units
+    # (e.g. Shasta2RestrictedAnchorGraph, the Shasta2*Export exporters, and
+    # AssemblerHttpServer-Shasta2Assembly) include shasta2's header-only
+    # templates via <shasta2/...> (CycleAvoider.hpp, SimpleMap.hpp,
+    # algorithm.hpp, longestPath.hpp, ...). Install just those headers; no
+    # library build is required.
+    installPath = os.path.join(INCLUDE_DIR, "shasta2")
+
+    if os.path.exists(installPath):
+        print("shasta2 headers already present at %s. Skipping." % installPath)
+        return
+
+    with tempfile.TemporaryDirectory() as temporaryDirectory:
+        print("Installing shasta2 headers using temporary directory", temporaryDirectory)
+
+        oldDirectory = os.getcwd()
+        os.chdir(temporaryDirectory)
+
+        # Use upstream paoloshasta/shasta2, pinned to the same commit the ported
+        # Shasta2* classes and exporters were derived from, so the header-only
+        # templates match dinara's expectations.
+        runCommand("git clone https://github.com/paoloshasta/shasta2.git")
+        runCommand("git -C shasta2 checkout 94389c2a6b1ff851f0302134dce386c133e64121")
+
+        # shasta2 has no header-install rule; its src/ holds every header dinara
+        # includes. Copy the header set (not the .cpp sources) into
+        # include/shasta2/ so <shasta2/Foo.hpp> resolves.
+        os.makedirs(installPath, exist_ok=True)
+        runCommand("cp shasta2/src/*.hpp " + installPath)
+
+        os.chdir(oldDirectory)
+
+    print("shasta2 headers installed at " + installPath)
+
+
 # All installable targets in dependency order.
 # Each entry: (name, function, description)
 INSTALL_TARGETS = [
@@ -747,6 +783,7 @@ INSTALL_TARGETS = [
     ("simd-minimizers",  installSimdMinimizers,    "SIMD minimizers library (Rust)"),
     ("theseus",          installTheseusLib,        "theseus-lib POA aligner (C++)"),
     ("abpoa",            installAbpoa,             "abPOA POA aligner (static + shared)"),
+    ("shasta2-headers",  installShasta2Headers,    "shasta2 header-only templates (no library)"),
 ]
 
 def main():
