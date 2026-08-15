@@ -196,6 +196,14 @@ message(STATUS "CURL link flags: ${CURL_LINK_FLAGS}")
 # hifiasm_overlaps exposing hifiasm_overlaps.h; used by the optional
 # --overlapsFromHifiasm path to generate read overlaps as PAF. Build only the
 # library, not its CLI executable.
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/hifiasmCandidates/CMakeLists.txt")
+    message(FATAL_ERROR
+        "The external/hifiasmCandidates submodule is missing or empty.\n"
+        "This repository uses git submodules. Initialize them with:\n"
+        "    git submodule update --init --recursive\n"
+        "Or clone with submodules next time:\n"
+        "    git clone --recurse-submodules https://github.com/kokyriakidis/dinara.git")
+endif()
 set(HIFIASM_OVERLAPS_BUILD_EXE OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/hifiasmCandidates)
 

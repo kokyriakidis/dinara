@@ -62,9 +62,14 @@
 
         <h3>Build commands</h3>
         <ol>
-            <li>Check out the Dinara repository (you need to have <code>git</code> installed on your machine)
+            <li>Check out the Dinara repository (you need to have <code>git</code> installed on your machine).
+                This repository uses git submodules, so clone with <code>--recurse-submodules</code>.
                 <pre>
-git clone https://github.com/kokyriakidis/dinara.git
+git clone --recurse-submodules https://github.com/kokyriakidis/dinara.git
+</pre>
+                If you already cloned without submodules, initialize them with:
+                <pre>
+git submodule update --init --recursive
 </pre>
             <li>Install <a href="Prerequisites.html">prerequisite packages</a>
                 <pre>
