@@ -682,7 +682,11 @@ def installAbpoa():
 
         runCommand("git clone https://github.com/yangao07/abPOA.git")
         # Pin to an exact release for reproducible builds.
-        runCommand("git -C abPOA checkout v1.5.3")
+        runCommand("git -C abPOA checkout v1.5.6")
+        # abpoa.h -> simd_instruction.h -> "simde/simde/x86/*.h", where simde is
+        # a git submodule. Without this init the simde tree is empty and every
+        # TU that includes <abpoa.h> fails to compile.
+        runCommand("git -C abPOA submodule update --init --recursive")
         os.chdir("abPOA")
 
         # Common compile flags (portable; no -march=native).
@@ -712,11 +716,17 @@ def installAbpoa():
         runCommand("cp lib/libabpoa.so " + os.path.join(LIB_DIR, "libabpoa.so"))
 
         # Install headers. Non-excluded TUs include both <abpoa.h> and
-        # "abpoa/abpoa.h", so populate both include/abpoa/ and include/abpoa.h.
+        # "abpoa/abpoa.h", so populate both include/abpoa/ and include/.
+        # Copy the FULL header set (not just abpoa.h) to BOTH locations:
+        # abpoa.h pulls in "simd_instruction.h" via a quoted include, which in
+        # turn includes the "simde/" tree. Copying only abpoa.h leaves those
+        # siblings unresolved and breaks any TU that does #include <abpoa.h>.
         if not os.path.exists(abpoaIncludeDir):
             os.makedirs(abpoaIncludeDir, exist_ok=True)
         runCommand("cp include/*.h " + abpoaIncludeDir)
-        runCommand("cp include/abpoa.h " + INCLUDE_DIR)
+        runCommand("cp -r include/simde " + abpoaIncludeDir)
+        runCommand("cp include/*.h " + INCLUDE_DIR)
+        runCommand("cp -r include/simde " + INCLUDE_DIR)
 
         os.chdir(oldDirectory)
 
