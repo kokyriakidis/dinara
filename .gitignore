@@ -1,9 +1,13 @@
 build/
 tests/build_tests/
 # Ignore external deps except the hifiasmCandidates submodule
-# (overlap detection library).
+# (overlap detection library) and the vendored Catch2 single header
+# (required to build the test suite).
 external/*
 !external/hifiasmCandidates/
+!external/catch2/
+external/catch2/*
+!external/catch2/catch.hpp
 
 # CMake build artifacts
 CMakeCache.txt
