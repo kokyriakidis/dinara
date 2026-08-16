@@ -2277,6 +2277,30 @@ void dinara::main::assemble(
     cout << timestamp << "Flagging contained reads..." << endl;
     assembler.flagContainedReads(1000, 0.8, 0, threadCount);
 
+    // ========================================================================
+    // Anchor-graph construction method selector (compile-time).
+    //
+    // USE_JOURNEY_ANCHOR_GRAPH = 1 -> pure journey-based anchor graph:
+    //   edges connect anchors that are consecutive in read journeys (the classic
+    //   mode3::AnchorGraph rule), with NO windows and NO het bubbles. The whole
+    //   window/het pipeline below is compiled out; the graph is built directly
+    //   from the (already chaining-filtered) journeys via the Shasta2AnchorGraph
+    //   (anchors, journeys, minEdgeCoverage, threadCount) constructor.
+    //
+    // USE_JOURNEY_ANCHOR_GRAPH = 0 -> the window + het-bubble pipeline (the long
+    //   block guarded by #if !USE_JOURNEY_ANCHOR_GRAPH below).
+    //
+    // Flip this to switch methods; the unused path is not built.
+    // ========================================================================
+    #define USE_JOURNEY_ANCHOR_GRAPH 1
+
+    // Shared across both methods. In the journey path these stay empty: an empty
+    // `anchorWindows` makes the assembly-graph stage fall back to length-only
+    // cleanup (windowCount == 0), and an empty drop map exports every anchor.
+    vector<AnchorWindow> anchorWindows;
+    vector<uint32_t> anchorDovetailWindow;
+
+#if !USE_JOURNEY_ANCHOR_GRAPH
     // Compute anchor windows.
     cout << timestamp << "Computing anchor windows..." << endl;
     // ========================================================================
@@ -2286,8 +2310,6 @@ void dinara::main::assemble(
     // then tiles the leftover unclaimed base spans into fragment windows.
     // Produces `anchorWindows` only — no inter-window edges, no transitions.
     // ========================================================================
-    vector<AnchorWindow> anchorWindows;
-    vector<uint32_t> anchorDovetailWindow;
     const uint64_t minCommonForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
@@ -2771,6 +2793,7 @@ void dinara::main::assemble(
              << aStructWindows.load() << " windows linear, "
              << aStructBubbles.load() << " het bubbles hom-flanked." << endl;
     }
+#endif // !USE_JOURNEY_ANCHOR_GRAPH  (end of window + het-bubble pipeline)
 
     // Global per-read journey tie resolution. shasta2 builds, for every oriented
     // read, the ordered list of ALL anchors that read belongs to (sorted by the
@@ -2921,6 +2944,25 @@ void dinara::main::assemble(
     // computed it above -- see the note there for why the result would be
     // identical either way.
     {
+#if USE_JOURNEY_ANCHOR_GRAPH
+        // Journey-based anchor graph: one edge per pair of anchors that are
+        // consecutive in some read's journey and reach the coverage threshold
+        // (classic mode3::AnchorGraph rule). No windows, no het bubbles, no
+        // inter-window / trim / het-tip passes. Reuse minInterWindowEdgeCoverage
+        // as the per-edge coverage threshold (it is the closest existing knob;
+        // the recorded pipeline runs it at 0 = keep every consecutive-pair edge).
+        static_cast<void>(anchorDovetailWindow);
+        const uint64_t minEdgeCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
+        cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
+             << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
+             << ")..." << endl;
+        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            minEdgeCoverage,
+            threadCount);
+#else
         if(!windowTransitionsComputed) {
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
                 &anchorDovetailWindow);
@@ -2981,6 +3023,7 @@ void dinara::main::assemble(
                     *shasta2Anchors, anchorWindows, *shasta2Journeys);
             if(hetTips == 0 && genTips == 0) break;
         }
+#endif // USE_JOURNEY_ANCHOR_GRAPH
 
         assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
         assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
