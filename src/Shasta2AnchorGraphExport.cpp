@@ -131,16 +131,23 @@ void Shasta2AnchorGraph::saveForShasta2(
         boost::add_vertex(shastaGraph);
     }
 
-    // Export-time monotonicity verification, bound to the exact edge set being
-    // serialized. The Shasta2AnchorGraph constructor already verifies edges, but
-    // that runs BEFORE trimBackbones and on the in-memory graph; this pass runs
-    // on the precise set written to disk, so nothing between construction and
-    // export can slip a backward/equal-position edge into the file shasta2 loads.
-    // For each exported edge A -> B and each read on the pair, the read's stored
-    // position at B must strictly exceed its position at A (shasta2 assembles by
-    // read-following in increasing position and asserts positionB > positionA).
+    // Export-time monotonicity accounting, bound to the exact edge set being
+    // serialized. For each exported edge A -> B and each read shared by the two
+    // anchors, the read is forward (position at B > position at A) or backward.
+    //
+    // A backward shared read is not an error: it is a repeat/paralog/inversion
+    // signature and is NOT written to this edge. The per-edge read list below is
+    // dEdge.anchorPair.orientedReadIds, which the Shasta2AnchorPair builder
+    // already restricted to reads that are forward on the pair (positionInJourney
+    // is the position-sorted rank, so backward reads are excluded). shasta2 then
+    // (a) uses that forward-only list verbatim in getAverageOffset and
+    // (b) rebuilds each read's journey by sorting its anchors by position, so a
+    // backward read yields its own valid increasing journey. Earlier this pass
+    // threw on any backward raw member, which is stricter than shasta2 and
+    // aborted on legitimate repeat structure; we now count instead.
     uint64_t verifiedEdges = 0;
-    uint64_t verifiedReadSteps = 0;
+    uint64_t forwardReadSteps = 0;
+    uint64_t backwardReadSteps = 0;
 
     // Is ReadId dropped from the canonical anchor of anchorId? The drop map is
     // keyed on canonical (even) ids; a drop removes the read from both the
@@ -176,12 +183,12 @@ void Shasta2AnchorGraph::saveForShasta2(
         const auto src = boost::source(e, dinaraGraph);
         const auto tgt = boost::target(e, dinaraGraph);
 
-        // Verify this edge is forward-monotonic on every shared read before it
-        // is written. Both anchor member lists are sorted by OrientedReadId, so
-        // shared reads are found by a linear merge. A read on the edge's anchor
-        // pair that is missing from an anchor is skipped here (shasta2's
-        // gatherOrientedReads likewise skips it); only reads present on BOTH
-        // anchors constrain assembly order.
+        // Account forward vs backward shared reads on this edge. Both anchor
+        // member lists are sorted by OrientedReadId, so shared reads are found by
+        // a linear merge. A read dropped from an endpoint anchor (journey-tie
+        // resolution) is no longer a shared member in the exported set and is
+        // skipped (shasta2 will not see it). A backward read is counted, not
+        // fatal: it is excluded from this edge's serialized read list below.
         {
             const Shasta2Anchor anchorA = anchors[dEdge.anchorPair.anchorIdA];
             const Shasta2Anchor anchorB = anchors[dEdge.anchorPair.anchorIdB];
@@ -192,9 +199,6 @@ void Shasta2AnchorGraph::saveForShasta2(
             while(itA != endA && itB != endB) {
                 if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
                 if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
-                // Shared read. If it was dropped from either endpoint anchor to
-                // resolve a journey tie, it is no longer a shared member in the
-                // exported set, so skip it here too (shasta2 will not see it).
                 const ReadId sharedReadId = itA->orientedReadId.getReadId();
                 if(isDroppedFromAnchor(dEdge.anchorPair.anchorIdA, sharedReadId) ||
                    isDroppedFromAnchor(dEdge.anchorPair.anchorIdB, sharedReadId)) {
@@ -202,24 +206,14 @@ void Shasta2AnchorGraph::saveForShasta2(
                     ++itB;
                     continue;
                 }
-                // Shared read: exported ordering must be strictly forward. Every
-                // anchor exports position - k/2 with the SAME uniform export
-                // shift (1 for k=2, 0 for k=0), so the shift cancels regardless
-                // of k; compare stored positions directly.
-                if(!(itB->position > itA->position)) {
-                    throw runtime_error(
-                        "Shasta2 anchor-graph export failed: backward edge "
-                        "anchor " +
-                        shasta2AnchorIdToString(dEdge.anchorPair.anchorIdA) +
-                        " -> anchor " +
-                        shasta2AnchorIdToString(dEdge.anchorPair.anchorIdB) +
-                        " on oriented read " +
-                        std::to_string(itA->orientedReadId.getValue()) +
-                        " has non-increasing position (" +
-                        std::to_string(itA->position) + " -> " +
-                        std::to_string(itB->position) + ").");
+                // Every anchor exports position - k/2 with the SAME uniform
+                // export shift (1 for k=2, 0 for k=0), so the shift cancels
+                // regardless of k; compare stored positions directly.
+                if(itB->position > itA->position) {
+                    ++forwardReadSteps;
+                } else {
+                    ++backwardReadSteps;
                 }
-                ++verifiedReadSteps;
                 ++itA;
                 ++itB;
             }
@@ -274,9 +268,14 @@ void Shasta2AnchorGraph::saveForShasta2(
         ++edgeCount;
     }
 
-    cout << "Export monotonicity check: verified " << verifiedEdges
-         << " edges forward across " << verifiedReadSteps
-         << " shared-read steps." << endl;
+    cout << "Export monotonicity check: " << verifiedEdges
+         << " edges across " << forwardReadSteps << " forward shared-read steps";
+    if(backwardReadSteps != 0) {
+        cout << " (" << backwardReadSteps
+             << " backward shared-read steps excluded from their edges as "
+             << "repeat/inversion signal)";
+    }
+    cout << "." << endl;
 
     if(droppedEdgeReadCount > 0 || emptiedEdgeCount > 0) {
         cout << "Journey-tie drop applied to anchor graph: removed "

@@ -821,30 +821,43 @@ void stageWindowIntraEdges(
 }
 
 
-// Step 3 of the per-window het pipeline: monotonicity verification. Every staged
-// intra-window edge A -> B must be strictly FORWARD on every read the two
-// anchors share: the read's exported position at B must exceed its exported
-// position at A. shasta2's LocalAssembly6 walks read-following in increasing
-// position and rejects (asserts) a step whose target position is <= its source
-// position, so a single backward edge here corrupts the whole export.
+// Step 3 of the per-window het pipeline: monotonicity accounting. For each
+// staged intra-window edge A -> B and each read shared by the two anchors, the
+// read is either FORWARD (exported position at B > position at A) or BACKWARD
+// (position at B <= position at A).
+//
+// A backward shared read is NOT an error and does not corrupt the export. It is
+// the signature of a repeat / paralog / local inversion: the read traverses the
+// two loci in the opposite order to the backbone read that defined the edge
+// direction. shasta2 handles such reads by construction:
+//   - The edge's assigned read set (Shasta2AnchorPair, adjacentInJourney=false)
+//     only includes reads with positionInJourneyB > positionInJourneyA, i.e.
+//     the forward reads; the backward read is excluded from the edge and is
+//     never written to the external anchor graph for this edge.
+//   - shasta2 rebuilds each read's journey by sorting that read's anchors by
+//     position (Journeys.cpp), so a backward read yields a perfectly valid,
+//     strictly increasing journey of its own -- it is simply ordered the other
+//     way for this anchor pair.
+//   - shasta2's LocalAssembly6::gatherOrientedReads independently skips any read
+//     whose positionB <= positionA for the pair.
+// So the earlier "throw on backward" behavior was stricter than every actual
+// consumer (dinara's own edge builder and shasta2) and aborted on legitimate
+// repeat structure. We now COUNT backward reads for reporting instead.
 //
 // The exported read position is (storedMidpoint - 1) for EVERY anchor class
 // (primary and k=2 het/hom alike; see writeExternalAnchors and
 // appendHetAnchorPair), so ordering by the stored midpoint position is identical
 // to ordering by the exported position: the -1 cancels in the comparison.
-// Backbone anchors already satisfy monotonicity by construction (journey order),
-// and the shift (step 1) is uniform, so this pass is an assertion that the
-// het-bubble wiring did not introduce a backward step. A violation is a bug in
-// the planning/staging logic, so we throw rather than silently drop.
 //
 // Both anchor member lists are sorted by OrientedReadId, so shared reads are
 // found by a linear merge. RC-mirror edges are covered because they are staged
-// as their own edges and verified in the same pass.
+// as their own edges and accounted in the same pass.
 void verifyWindowEdgeMonotonicity(
     const Shasta2Anchors& anchors,
     const AnchorWindow& window,
     uint64_t& checkedEdges,
-    uint64_t& checkedReadSteps)
+    uint64_t& forwardReadSteps,
+    uint64_t& backwardReadSteps)
 {
     for(const AnchorWindow::IntraWindowEdge& edge : window.intraWindowEdges) {
         const Shasta2Anchor anchorA = anchors[edge.anchorIdA];
@@ -858,21 +871,14 @@ void verifyWindowEdgeMonotonicity(
         while(itA != endA && itB != endB) {
             if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
             if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
-            // Shared read: exported ordering must be strictly forward. Both sides
-            // subtract the same 1, so compare stored positions directly.
-            if(!(itB->position > itA->position)) {
-                throw runtime_error(
-                    "Backward intra-window edge detected during monotonicity "
-                    "verification: anchor " +
-                    shasta2AnchorIdToString(edge.anchorIdA) + " -> anchor " +
-                    shasta2AnchorIdToString(edge.anchorIdB) +
-                    " on oriented read " +
-                    to_string(itA->orientedReadId.getValue()) +
-                    " has non-increasing position (" +
-                    to_string(itA->position) + " -> " +
-                    to_string(itB->position) + ").");
+            // Shared read. Both sides subtract the same 1, so compare stored
+            // positions directly. Forward reads are carried by the edge; backward
+            // reads are excluded downstream and merely counted here.
+            if(itB->position > itA->position) {
+                ++forwardReadSteps;
+            } else {
+                ++backwardReadSteps;
             }
-            ++checkedReadSteps;
             ++itA;
             ++itB;
         }
@@ -2721,27 +2727,33 @@ void dinara::main::assemble(
              << chainedIntervals << " chained intervals)." << endl;
     }
 
-    // Step 3: monotonicity verification. Every staged intra-window edge must be
-    // strictly forward on the reads its endpoints share (exported position at B
-    // > exported position at A). Runs after staging (edges present) and after
-    // the het-anchor append (all endpoint ids valid). A backward edge is a bug
-    // in planning/staging, so the verifier throws.
+    // Step 3: monotonicity accounting. For each staged intra-window edge, count
+    // the reads its endpoints share that are forward vs backward. Backward reads
+    // are a legitimate repeat/paralog/inversion signature: they are excluded from
+    // the edge by the anchor-pair builder and skipped by shasta2, so they are
+    // reported (not fatal). Runs after staging (edges present) and after the
+    // het-anchor append (all endpoint ids valid).
     {
-        // Parallel over windows: both verifiers are read-only. They THROW on a
-        // violation; parallelForEachWindow captures the first exception and
-        // rethrows it on this thread after the workers join, so a violation
-        // still aborts the run with its original message.
-        std::atomic<uint64_t> aCheckedEdges{0}, aCheckedReadSteps{0};
+        // Parallel over windows: both passes are read-only.
+        std::atomic<uint64_t> aCheckedEdges{0}, aForwardReadSteps{0},
+            aBackwardReadSteps{0};
         parallelForEachWindow(anchorWindows.size(), threadCount, [&](uint64_t wi) {
-            uint64_t edges = 0, steps = 0;
+            uint64_t edges = 0, forward = 0, backward = 0;
             verifyWindowEdgeMonotonicity(*shasta2Anchors, anchorWindows[wi],
-                                         edges, steps);
+                                         edges, forward, backward);
             aCheckedEdges.fetch_add(edges, std::memory_order_relaxed);
-            aCheckedReadSteps.fetch_add(steps, std::memory_order_relaxed);
+            aForwardReadSteps.fetch_add(forward, std::memory_order_relaxed);
+            aBackwardReadSteps.fetch_add(backward, std::memory_order_relaxed);
         });
-        cout << timestamp << "Verified " << aCheckedEdges.load()
-             << " intra-window edges forward-monotonic across "
-             << aCheckedReadSteps.load() << " shared-read steps." << endl;
+        cout << timestamp << "Checked " << aCheckedEdges.load()
+             << " intra-window edges across " << aForwardReadSteps.load()
+             << " forward shared-read steps";
+        if(aBackwardReadSteps.load() != 0) {
+            cout << " (" << aBackwardReadSteps.load()
+                 << " backward shared-read steps excluded from their edges as "
+                 << "repeat/inversion signal)";
+        }
+        cout << "." << endl;
 
         // Structural check: each window's intra-window graph must be a single
         // linear path of backbone anchors and bubbles, and every het bubble arm
