@@ -2389,6 +2389,24 @@ void dinara::main::assemble(
     //         own fast aligner) sparse-evidence pinning -- see
     //         projAlnDetectHetBubblesAllWindows, AssemblerWindowProjectedAlignmentLeafSnarls.cpp.
     {
+        // Het-bubble detection DISABLED by default. Overlap anchors are now
+        // produced upstream from myloasm SNPmers (open syncmers + SNPmers via
+        // the hifiasm second-pass / fakechain path), so dinara no longer needs
+        // to detect het bubbles here and append its own het anchors. Skipping
+        // this leaves every window's hetBubbles empty, which the downstream
+        // plan/append/stage passes already no-op on (see the empty-list guards),
+        // yielding a backbone-only anchor graph with zero het anchors.
+        //
+        // Re-enable for experiments by setting DINARA_ENABLE_HET_BUBBLES=1.
+        const bool hetBubblesEnabled = (getenv("DINARA_ENABLE_HET_BUBBLES") != nullptr);
+        if(!hetBubblesEnabled) {
+            cout << timestamp << "Het-bubble detection disabled "
+                    "(anchors come from myloasm SNPmers); leaving hetBubbles "
+                    "empty for " << anchorWindows.size()
+                 << " windows. Set DINARA_ENABLE_HET_BUBBLES=1 to re-enable."
+                 << endl;
+        }
+        else {
         const char* hetEngineEnv = getenv("DINARA_HET_ENGINE");
         const string hetEngine = (hetEngineEnv != nullptr) ? string(hetEngineEnv) : "";
         const bool useKsw2HetEngine = (hetEngine == "ksw2");
@@ -2533,6 +2551,7 @@ void dinara::main::assemble(
                  << " seconds=" << std::fixed << std::setprecision(2) << abpoaSecs
                  << std::defaultfloat << endl;
         }
+        }  // end else (hetBubblesEnabled)
     }
 
     // Verification-only timing comparison: cigarDetectSnpsInWindow reuses
