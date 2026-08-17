@@ -415,10 +415,11 @@ void AssemblerOptions::addConfigurableOptions()
         "If true, use myloasm's open syncmers + SNPmers as the marker position "
         "source (bundled myloasm SNPmer engine). SNPmers are detected from the "
         "global k-mer spectrum across all reads. Only the positions come from "
-        "myloasm; dinara still encodes its own canonical KmerId (length Kmers.k) "
-        "at each position, so the downstream index is unchanged. Makes anchors "
-        "and phasing run on syncmer+SNPmer positions while hifiasm still supplies "
-        "overlap pairs and intervals. Requires Kmers.k <= 21. Takes precedence "
+        "myloasm; dinara encodes its own canonical KmerId at a fixed k=20 "
+        "(myloasm's marker k=21 clipped, keeping the SNPmer middle base) at each "
+        "position, independent of Kmers.k, so the downstream index is unchanged. "
+        "Makes anchors and phasing run on syncmer+SNPmer positions while hifiasm "
+        "still supplies overlap pairs and intervals (k=51 HPC). Takes precedence "
         "over Kmers.useHifiasmMinimizers and Kmers.useSimdMinimizers.")
 
         ("Kmers.hifiasmMarkerSampleDist",

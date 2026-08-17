@@ -382,22 +382,29 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
 // pairs. The existing two-pass CSR store (findMarkersSimdMinimizersPass2)
 // derives strand 1 by reverse-complement and fills the memory-mapped vectors.
 void Assembler::findMarkersMyloasm(
-    uint64_t threadCount, int k,
+    uint64_t threadCount,
     const vector<string>& inputFileNames)
 {
     reads->checkReadsAreOpen();
 
-    // myloasm's marker k-mer is 21 (odd). dinara encodes a k-mer of length k at
-    // each myloasm position; for that encoded k-mer to be shared across reads at
-    // the same locus it must fit inside the 21-mer myloasm placed there, i.e.
-    // k <= 21. dinara already requires k even, so effectively k in {6..20}.
-    constexpr int myloasmMarkerK = 21;
-    if(k > myloasmMarkerK) {
-        throw runtime_error(
-            "Kmers.useMyloasmMarkers requires Kmers.k <= " +
-            std::to_string(myloasmMarkerK) + " (myloasm marker k), but k=" +
-            std::to_string(k) + ".");
-    }
+    // myloasm places markers with a k=21 open-syncmer / SNPmer scheme and matches
+    // them internally at k=20 (its 21-mer key clipped to 20 by masking the low
+    // 40 bits, which keeps the middle base so a SNPmer's two alleles stay
+    // distinct). We mirror that: dinara encodes its OWN canonical 20-mer at each
+    // myloasm position. Encode k is FIXED at 20 here, independent of Kmers.k --
+    // it is myloasm's internal marker k, not dinara's global k-mer length. This
+    // is deliberately decoupled from:
+    //   * hifiasm overlap detection, which runs at k=51 in HPC space on a
+    //     separate path (hifiasm_detect_overlaps_mem) and never reads this k; and
+    //   * Kmers.k, which stays at its own value for any non-myloasm use.
+    // The het base of a SNPmer (myloasm index 10, i.e. the 11th base of the
+    // 21-mer) lies inside [pos, pos+20), so the two alleles remain distinct in
+    // dinara's encoding too. dinara's MarkerKmers and the anchor builders
+    // re-extract and re-canonicalize k-mers from the read sequence, so using
+    // dinara's own 20-mer (rather than storing myloasm's masked key) keeps
+    // chaining and anchors self-consistent.
+    constexpr int k = 20;
+
     if(inputFileNames.empty()) {
         throw runtime_error(
             "Kmers.useMyloasmMarkers requires at least one --input read file "
@@ -406,9 +413,13 @@ void Assembler::findMarkersMyloasm(
 
     performanceLog << timestamp
         << "Finding markers using myloasm open syncmers + SNPmers (encode k="
-        << k << ") in " << reads->readCount() << " reads." << endl;
+        << k << ", myloasm marker k=21 clipped to 20) in "
+        << reads->readCount() << " reads." << endl;
     const auto tBegin = std::chrono::steady_clock::now();
 
+    // Marker encoding k is fixed at 20 on this path (see above); record it so
+    // downstream consumers (MarkerKmers, anchors) encode/re-extract at the same
+    // length. This overrides Kmers.k for the marker/anchor index only.
     assemblerInfo->k = k;
 
     // Create the markers and markerKmerIds data structures.
@@ -434,7 +445,9 @@ void Assembler::findMarkersMyloasm(
         << inputFileNames.size() << " input file(s)." << endl;
     const int rc = myloasm_index_reads(
         readFiles.data(), readFiles.size(),
-        /*kmer_size*/ myloasmMarkerK, /*c*/ 0, int(threadCount), &index);
+        // myloasm indexes at its native marker k=21 (its own default scheme);
+        // dinara then encodes a 20-mer at each returned position (k above).
+        /*kmer_size*/ 21, /*c*/ 0, int(threadCount), &index);
     if(rc != 0) {
         myloasm_read_index_free(&index);
         throw runtime_error(

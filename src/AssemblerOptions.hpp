@@ -193,9 +193,10 @@ public:
     // paths, so markers/markerKmerIds and every downstream consumer are
     // unchanged in shape. This makes dinara's anchors and phasing run on
     // syncmer+SNPmer positions while hifiasm still provides overlap pairs and
-    // intervals. Requires Kmers.k <= myloasm's marker k (21) so the encoded
-    // marker k-mer at a myloasm position is shared across reads. Takes
-    // precedence over useHifiasmMinimizers / useSimdMinimizers when set.
+    // intervals (k=51 HPC, a separate path). The marker encode k is FIXED at 20
+    // (myloasm's marker k=21 clipped, keeping the SNPmer's middle base), set
+    // internally and independent of Kmers.k. Takes precedence over
+    // useHifiasmMinimizers / useSimdMinimizers when set.
     bool useMyloasmMarkers;
 
     // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer

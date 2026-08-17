@@ -1800,12 +1800,13 @@ void dinara::main::assemble(
 
         if(markerSource == MarkerSource::MyloasmMarkers) {
             // myloasm open syncmers + SNPmers as the position source. hifiasm
-            // still supplies overlap pairs + intervals; this only changes what
-            // fills the marker table. No hifiasm minimizer filter is built or
-            // applied, so the shared frequency filter (applyKmerCountFilter)
-            // below runs normally. Encode k is dinara's Kmers.k.
-            assembler.findMarkersMyloasm(
-                threadCount, assemblerOptions.kmersOptions.k, inputFileNames);
+            // still supplies overlap pairs + intervals (k=51 HPC, separate
+            // path); this only changes what fills the marker table. No hifiasm
+            // minimizer filter is built or applied, so the shared frequency
+            // filter (applyKmerCountFilter) below runs normally. Encode k is
+            // fixed at 20 inside findMarkersMyloasm (myloasm's marker k clipped),
+            // independent of Kmers.k.
+            assembler.findMarkersMyloasm(threadCount, inputFileNames);
         } else {
             // Resolve and validate the marker-selection configuration once, up
             // front. This centralizes the two k-mer roles (select vs encode) and
