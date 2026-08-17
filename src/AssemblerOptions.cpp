@@ -418,9 +418,11 @@ void AssemblerOptions::addConfigurableOptions()
         "myloasm; dinara encodes its own canonical KmerId at a fixed k=20 "
         "(myloasm's marker k=21 clipped, keeping the SNPmer middle base) at each "
         "position, independent of Kmers.k, so the downstream index is unchanged. "
-        "Makes anchors and phasing run on syncmer+SNPmer positions while hifiasm "
-        "still supplies overlap pairs and intervals (k=51 HPC). Takes precedence "
-        "over Kmers.useHifiasmMinimizers and Kmers.useSimdMinimizers.")
+        "Makes anchors and phasing run on syncmer+SNPmer positions. Overlaps use "
+        "the hybrid path: hifiasm (k=51 HPC) supplies candidate pairs and "
+        "intervals, and myloasm's syncmers + SNPmers are chained (myloasm DP) "
+        "inside each interval. Takes precedence over Kmers.useHifiasmMinimizers "
+        "and Kmers.useSimdMinimizers.")
 
         ("Kmers.hifiasmMarkerSampleDist",
         value<int>(&kmersOptions.hifiasmMarkerSampleDist)->

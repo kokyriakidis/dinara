@@ -37,7 +37,7 @@
 // hifiasm candidate-overlap detector (submodule). C API used to generate read
 // overlaps (with aligned intervals and CIGARs) directly in memory.
 #include "hifiasm_overlaps.h"
-#include "myloasm_ffi.h"
+#include "fakechain_bridge.h"
 
 
 using namespace dinara;
@@ -1790,11 +1790,13 @@ void dinara::main::assemble(
     // Marker generation method selection.
     //
     // Kmers.useMyloasmMarkers defaults to true, so by default markers come from
-    // myloasm's open syncmers + SNPmers and overlaps are produced by myloasm's
-    // native all-vs-all overlapper (syncmer seeding + SNPmer identity). Open
+    // myloasm's open syncmers + SNPmers and overlaps are produced by the hybrid
+    // path: hifiasm (HPC) enumerates candidate read pairs + intervals, then
+    // myloasm's open syncmers + SNPmers are matched and chained (myloasm DP)
+    // inside each interval (fakechain bridge; see the overlap block below). Open
     // syncmers give context-free, error-robust seeds (a shared k-mer yields a
-    // shared seed regardless of neighbouring context), which is why this path is
-    // preferred over hifiasm's windowed minimizers. useMyloasmMarkers takes
+    // shared seed regardless of neighbouring context), which is why myloasm
+    // chaining is preferred over hifiasm base alignment. useMyloasmMarkers takes
     // precedence over Kmers.useHifiasmMinimizers / Kmers.useSimdMinimizers; set
     // it to false to fall back to the hifiasm/SIMD minimizer + hifiasm overlap
     // path. The source is resolved once into an explicit enum; see
@@ -2086,18 +2088,22 @@ void dinara::main::assemble(
     }
 
     if(markerSource == MarkerSource::MyloasmMarkers) {
-        // Myloasm-native overlap path (Kmers.useMyloasmMarkers).
+        // Hybrid overlap path (Kmers.useMyloasmMarkers): hifiasm finds candidate
+        // pairs, myloasm chains inside each interval.
         //
-        // myloasm_detect_overlaps runs myloasm's own all-vs-all overlapper end to
-        // end (restored in the myloasm crate's src/overlap.rs): index every
-        // read's syncmers, find candidate pairs by shared minimizers, chain with
-        // myloasm's DP, refine with SNPmers, and emit dovetail + containment
-        // overlaps. hifiasm is NOT involved -- this is the full myloasm overlap
-        // pipeline, replacing the earlier fakechain bridge (which used hifiasm to
-        // enumerate candidate pairs).
+        // fakechain_bridge_overlaps runs the two-pass pipeline:
+        //   1. hifiasm (HPC k=51) enumerates RAW candidate read pairs +
+        //      intervals only (raw_candidates=1, no base-level alignment/filter).
+        //   2. myloasm indexes every read with open syncmers + SNPmers (k=21).
+        //   3. For each candidate pair, fakechain_pair() clips markers to the
+        //      hifiasm interval, matches them (canonical key equality) and CHAINS
+        //      them with myloasm's own DP. The chained anchors' bounding interval
+        //      is what we hand to dinara.
+        // So hifiasm supplies the candidate pairs/intervals and myloasm's
+        // syncmer+SNPmer chaining runs inside them -- neither hifiasm base
+        // alignment nor myloasm's all-vs-all overlapper is used here.
         //
-        // Each MyloOverlap carries explicit forward-strand intervals on both
-        // reads plus the relative strand. We translate to an interval-only
+        // Each fakechain_overlap_t is translated to an interval-only
         // hifiasm_overlap_t (cigar_len=0, cigar=nullptr) so the existing importer
         // (importAlignmentCandidatesFromMemory) and downstream
         // deriveChainFromInterval consume it unchanged.
@@ -2114,82 +2120,75 @@ void dinara::main::assemble(
             readFiles.push_back(f.c_str());
         }
 
+        fakechain_bridge_opt_t fcOpt;
+        fakechain_bridge_opt_init(&fcOpt);
+        fcOpt.ovlp.threads = int(threadCount);
+
+        fakechain_overlap_t* fcOv = nullptr;
+        uint64_t nFcOv = 0;
+        char* names = nullptr;
+        uint64_t* nameOff = nullptr;
+        uint64_t nReads = 0;
         performanceLog << timestamp
-            << "Generating overlaps with myloasm's native all-vs-all overlapper "
-            << "(syncmers + SNPmers) from " << inputFileNames.size()
-            << " input file(s)." << endl;
+            << "Generating overlaps with the hybrid path: hifiasm candidate "
+            << "pairs (HPC), chained by myloasm syncmers + SNPmers from "
+            << inputFileNames.size() << " input file(s)." << endl;
         cout << timestamp
-            << "Generating overlaps with myloasm's native all-vs-all overlapper "
-            << "(syncmers + SNPmers) from " << inputFileNames.size()
-            << " input file(s)." << endl;
-
-        // Default the dinara myloasm path to the unfiltered overlapper:
-        // disable myloasm's contained-read removal and its SNPmer same-strain
-        // identity gate so every syncmer-seeded candidate overlap is emitted
-        // (hifiasm-raw-candidate-like). dinara re-flags containment downstream
-        // (flagContainedReads), so redundancy is still handled later. These are
-        // set with overwrite=0, so an explicitly exported
-        // MYLOASM_NO_CONTAINMENT_REMOVAL / MYLOASM_NO_SAME_STRAIN_FILTER (e.g.
-        // "0" to re-enable a filter) still takes precedence. The myloasm FFI
-        // reads these env vars (see ffi.rs: myloasm_detect_overlaps).
-        setenv("MYLOASM_NO_CONTAINMENT_REMOVAL", "1", 0);
-        setenv("MYLOASM_NO_SAME_STRAIN_FILTER", "1", 0);
-
-        MyloOverlaps mylo = {};
-        // kmer_size/c/threads = 0,0,threads: myloasm defaults (k=21, c=11).
-        const int rc = myloasm_detect_overlaps(
-            readFiles.data(), readFiles.size(),
-            /*kmer_size*/ 0, /*c*/ 0, int(threadCount), &mylo);
+            << "Generating overlaps with the hybrid path: hifiasm candidate "
+            << "pairs (HPC), chained by myloasm syncmers + SNPmers from "
+            << inputFileNames.size() << " input file(s)." << endl;
+        const int rc = fakechain_bridge_overlaps(
+            readFiles.data(), int(readFiles.size()), &fcOpt,
+            &fcOv, &nFcOv,
+            /*out_anchors*/ nullptr, /*out_n_anchors*/ nullptr,
+            &names, &nameOff, &nReads);
         if(rc != 0) {
-            myloasm_overlaps_free(&mylo);
+            fakechain_bridge_free(fcOv, nullptr, names, nameOff);
             throw runtime_error(
-                "myloasm native overlap detection failed (code "
-                + to_string(rc) + ").");
+                "hybrid (hifiasm candidates + myloasm chaining) overlap "
+                "detection failed (code " + to_string(rc) + ").");
         }
 
-        // Translate MyloOverlap -> interval-only hifiasm_overlap_t.
+        // Translate fakechain overlaps to interval-only hifiasm_overlap_t.
         // block_len drives the importer's floor filter (>= 200) and its
-        // keep-longest dedup; use the larger of the two read spans as a proxy
-        // for aligned length. is_same_strand is the inverse of MyloOverlap.reverse.
-        // No CIGAR is produced (cigar_len = 0), so downstream
-        // computeBaseAlignmentsAndStore derives the marker chain from this
-        // interval (deriveChainFromInterval).
+        // keep-longest dedup; use the larger of the query/target chain spans as
+        // a proxy for aligned length. No CIGAR is produced (cigar_len = 0), so
+        // downstream computeBaseAlignmentsAndStore derives the marker chain from
+        // this interval (deriveChainFromInterval) or, failing that, recomputes
+        // with A*PA2.
         vector<hifiasm_overlap_t> ov;
-        ov.reserve(mylo.n_overlaps);
-        for(uint64_t i = 0; i < mylo.n_overlaps; i++) {
-            const MyloOverlap& m = mylo.overlaps[i];
-            const uint32_t qSpan = (m.end1 > m.start1) ? (m.end1 - m.start1) : 0;
-            const uint32_t tSpan = (m.end2 > m.start2) ? (m.end2 - m.start2) : 0;
+        ov.reserve(nFcOv);
+        for(uint64_t i = 0; i < nFcOv; i++) {
+            const fakechain_overlap_t& f = fcOv[i];
+            const uint32_t qSpan = (f.q_end > f.q_start) ? (f.q_end - f.q_start) : 0;
+            const uint32_t tSpan = (f.t_end > f.t_start) ? (f.t_end - f.t_start) : 0;
             hifiasm_overlap_t o = {};
-            o.q_id = m.read_i;
-            o.t_id = m.read_j;
-            o.q_start = m.start1;
-            o.q_end = m.end1;
-            o.t_start = m.start2;
-            o.t_end = m.end2;
-            o.n_match = m.shared_minimizers;
+            o.q_id = f.q_id;
+            o.t_id = f.t_id;
+            o.q_start = f.q_start;
+            o.q_end = f.q_end;
+            o.t_start = f.t_start;
+            o.t_end = f.t_end;
+            o.n_match = f.n_anchor;
             o.block_len = std::max(qSpan, tSpan);
-            o.is_same_strand = (m.reverse == 0) ? 1 : 0;
+            o.is_same_strand = f.is_same_strand;
             o.cigar_offset = 0;
             o.cigar_len = 0;
             o.cigar_t_start = 0;
             ov.push_back(o);
         }
 
-        // The importer expects uint64_t name offsets with n_reads+1 entries;
-        // MyloOverlaps.name_offsets is size_t[n_reads+1] (identical on 64-bit).
-        const uint64_t* nameOff =
-            reinterpret_cast<const uint64_t*>(mylo.name_offsets);
-
-        performanceLog << timestamp << "myloasm produced " << mylo.n_overlaps
-            << " overlaps over " << mylo.n_reads << " reads (native)." << endl;
-        cout << timestamp << "myloasm produced " << mylo.n_overlaps
-            << " overlaps over " << mylo.n_reads << " reads (native)." << endl;
+        performanceLog << timestamp << "hybrid path produced " << nFcOv
+            << " overlaps over " << nReads << " reads (hifiasm candidates + "
+            << "myloasm chaining)." << endl;
+        cout << timestamp << "hybrid path produced " << nFcOv
+            << " overlaps over " << nReads << " reads (hifiasm candidates + "
+            << "myloasm chaining)." << endl;
 
         assembler.importAlignmentCandidatesFromMemory(
-            ov.data(), ov.size(), mylo.names, nameOff, mylo.n_reads,
+            ov.data(), ov.size(), names, nameOff, nReads,
             /*cigar*/ nullptr, /*cigarLen*/ 0, threadCount);
-        myloasm_overlaps_free(&mylo);
+        fakechain_bridge_free(fcOv, nullptr, names, nameOff);
 
     } else {
         hifiasm_ovlp_opt_t hifiOpt = {};
