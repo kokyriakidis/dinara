@@ -1803,9 +1803,18 @@ void dinara::main::assemble(
             // still supplies overlap pairs + intervals (k=51 HPC, separate
             // path); this only changes what fills the marker table. No hifiasm
             // minimizer filter is built or applied, so the shared frequency
-            // filter (applyKmerCountFilter) below runs normally. Encode k is
-            // fixed at 20 inside findMarkersMyloasm (myloasm's marker k clipped),
-            // independent of Kmers.k.
+            // filter (applyKmerCountFilter) below runs normally.
+            //
+            // The marker/anchor index is encoded at k=20 (myloasm's marker k=21
+            // clipped). findMarkersMyloasm sets assemblerInfo->k = 20. Every
+            // downstream consumer -- the KmerChecker, MarkerKmers
+            // (createMarkerKmers), mode3 Anchors, and extractKmer -- reads
+            // assemblerInfo->k, so it must STAY 20. createKmerChecker below
+            // resets it to kmersOptions.k (default 50); we re-pin it to 20 right
+            // after that block (see myloasmEncodeK re-pin). Leaving it at 50
+            // makes MarkerKmers extract 50-mers at positions only valid for k=20
+            // (position + 50 > baseCount assertion). hifiasm overlap detection is
+            // unaffected (separate k=51 HPC path that never reads this value).
             assembler.findMarkersMyloasm(threadCount, inputFileNames);
         } else {
             // Resolve and validate the marker-selection configuration once, up
@@ -1949,8 +1958,17 @@ void dinara::main::assemble(
         // marker or marker-graph vertex. The function rebuilds both markers and
         // markerKmerIds from the pre-filtered arrays, preserving only marker
         // positions whose matching k-mer id passes.
-        const bool filterRepeatKmers = true;
-        const bool filterLowComplexity = true;
+        // The repeat and low-complexity predicates are calibrated for dinara's
+        // default marker k (~50): filterLowComplexity requires >= 24 distinct
+        // 3-mers in a k-mer. The myloasm path encodes markers at k=20, which has
+        // at most 20-3+1 = 18 distinct 3-mers, so EVERY k=20 marker would be
+        // rejected as low-complexity (observed: 0 / N markers kept), leaving an
+        // empty assembly graph. Disable both k~50-tuned predicates on the
+        // myloasm path; the frequency prune [minFreq, maxFreq] and palindrome
+        // filter still apply.
+        const bool onMyloasmPath = (markerSource == MarkerSource::MyloasmMarkers);
+        const bool filterRepeatKmers = !onMyloasmPath;
+        const bool filterLowComplexity = !onMyloasmPath;
         if(hifiasmMarkerFilterApplied) {
             // The hifiasm overlap-path filter (high-occurrence k-mer filter +
             // distance subsampling) already selected the markers, exactly as
@@ -1995,6 +2013,23 @@ void dinara::main::assemble(
         // Compute k-mer histogram to get coverageHet (needed by phasing).
         // The SIMD path does this via countKmersFromMarkerKmerIds.
         assembler.countKmersFromMarkerKmerIds(threadCount);
+    }
+
+    // On the myloasm path the marker/anchor index is encoded at k=20, but
+    // createKmerChecker (called in both branches above) reset assemblerInfo->k to
+    // kmersOptions.k (default 50). Re-pin it to 20 so MarkerKmers, mode3 Anchors
+    // and extractKmer all use the length the markers were placed for; otherwise
+    // MarkerKmers extracts 50-mers at positions only valid for k=20 and trips
+    // the "position + length <= baseCount" assertion. hifiasm's k=51 HPC overlap
+    // detection is a separate path and is unaffected.
+    if(markerSource == MarkerSource::MyloasmMarkers) {
+        constexpr uint64_t myloasmEncodeK = 20;
+        if(assembler.assemblerInfo->k != myloasmEncodeK) {
+            cout << timestamp << "Kmers.useMyloasmMarkers: pinning marker k="
+                << myloasmEncodeK << " (was " << assembler.assemblerInfo->k
+                << " after KmerChecker) for MarkerKmers/anchors." << endl;
+            assembler.assemblerInfo->k = myloasmEncodeK;
+        }
     }
 
     // Filter reads whose marker span covers less than the threshold fraction
