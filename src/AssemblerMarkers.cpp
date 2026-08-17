@@ -19,6 +19,11 @@ using namespace dinara;
 // to simd-minimizers). Positions are still resolved to canonical KmerIds here.
 #include "hifiasm_overlaps.h"
 
+// myloasm marker bridge: open syncmers + SNPmers as a marker POSITION source.
+// SNPmers are detected from the global k-mer spectrum, so this is a single
+// whole-run call. Only positions are used; KmerIds are encoded by dinara.
+#include "myloasm_ffi.h"
+
 // Standard library.
 #include "fstream.hpp"
 #include <algorithm>
@@ -351,6 +356,200 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
             std::vector<std::pair<uint32_t, KmerId>>().swap(staged);
         }
     }
+}
+
+
+// ============================================================================
+// MYLOASM MARKER IMPLEMENTATION (open syncmers + SNPmers as position source)
+// ============================================================================
+//
+// Design: hifiasm still finds overlap pairs + intervals; this only changes what
+// fills the marker table. myloasm supplies marker POSITIONS (open syncmers +
+// SNPmers, the latter detected from the global k-mer spectrum across all reads),
+// and dinara encodes its OWN canonical KmerId (length assemblerInfo->k) at each
+// position -- exactly as the simd/hifiasm marker paths do. So markers,
+// markerKmerIds, MarkerKmers and every downstream consumer keep the same shape
+// and the same "KmerId == canonical k-mer re-extracted from the read" invariant.
+// deriveChainFromInterval then chains syncmer+SNPmer anchors inside hifiasm's
+// intervals with no change, and anchors/phasing inherit SNPmer positions.
+//
+// Because SNPmer detection is global, myloasm_index_reads is a single whole-run
+// call (not per-read). We map each myloasm read back to a dinara ReadId by name
+// (dinara stores the first header token; myloasm returns the same base id),
+// merge that read's syncmer + SNPmer positions, sort + deduplicate by position,
+// drop positions where pos + k would run off the read, encode dinara's KmerId at
+// each surviving position, and stage the forward-strand (position, KmerId)
+// pairs. The existing two-pass CSR store (findMarkersSimdMinimizersPass2)
+// derives strand 1 by reverse-complement and fills the memory-mapped vectors.
+void Assembler::findMarkersMyloasm(
+    uint64_t threadCount, int k,
+    const vector<string>& inputFileNames)
+{
+    reads->checkReadsAreOpen();
+
+    // myloasm's marker k-mer is 21 (odd). dinara encodes a k-mer of length k at
+    // each myloasm position; for that encoded k-mer to be shared across reads at
+    // the same locus it must fit inside the 21-mer myloasm placed there, i.e.
+    // k <= 21. dinara already requires k even, so effectively k in {6..20}.
+    constexpr int myloasmMarkerK = 21;
+    if(k > myloasmMarkerK) {
+        throw runtime_error(
+            "Kmers.useMyloasmMarkers requires Kmers.k <= " +
+            std::to_string(myloasmMarkerK) + " (myloasm marker k), but k=" +
+            std::to_string(k) + ".");
+    }
+    if(inputFileNames.empty()) {
+        throw runtime_error(
+            "Kmers.useMyloasmMarkers requires at least one --input read file "
+            "(myloasm re-reads the inputs to detect SNPmers).");
+    }
+
+    performanceLog << timestamp
+        << "Finding markers using myloasm open syncmers + SNPmers (encode k="
+        << k << ") in " << reads->readCount() << " reads." << endl;
+    const auto tBegin = std::chrono::steady_clock::now();
+
+    assemblerInfo->k = k;
+
+    // Create the markers and markerKmerIds data structures.
+    markers->createNew(largeDataName("Markers"), largeDataPageSize);
+    markerKmerIds->createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
+
+    if(threadCount == 0) {
+        threadCount = std::thread::hardware_concurrency();
+    }
+
+    const uint64_t readCount = reads->readCount();
+
+    // --- Single whole-run FFI call: detect SNPmers + index every read. --------
+    vector<const char*> readFiles;
+    readFiles.reserve(inputFileNames.size());
+    for(const string& f: inputFileNames) {
+        readFiles.push_back(f.c_str());
+    }
+
+    MyloReadIndex index;
+    performanceLog << timestamp
+        << "Indexing reads with myloasm (syncmers + SNPmers) from "
+        << inputFileNames.size() << " input file(s)." << endl;
+    const int rc = myloasm_index_reads(
+        readFiles.data(), readFiles.size(),
+        /*kmer_size*/ myloasmMarkerK, /*c*/ 0, int(threadCount), &index);
+    if(rc != 0) {
+        myloasm_read_index_free(&index);
+        throw runtime_error(
+            "myloasm_index_reads failed (code " + std::to_string(rc) + ").");
+    }
+    performanceLog << timestamp
+        << "myloasm indexed " << index.n_reads << " reads (marker k="
+        << index.k << ")." << endl;
+
+    // --- Stage forward-strand (position, KmerId) per dinara ReadId. -----------
+    // Encoding runs here (myloasm returns one big index; the per-position k-mer
+    // extraction is cheap relative to the FFI's global counting).
+    findMarkersSimdMinimizersData.k = k;
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.resize(readCount);
+
+    uint64_t unmatchedReads = 0;
+    uint64_t totalStaged = 0;
+    std::vector<uint32_t> positions;
+    for(size_t r = 0; r < index.n_reads; r++) {
+        const MyloReadMarkers& mr = index.reads[r];
+
+        // Map myloasm read (by name) to a dinara ReadId. The name is the first
+        // header token, not NUL-terminated; use (ptr,len) directly.
+        const span<const char> name(mr.name, mr.name + mr.name_len);
+        const ReadId readId = reads->getReadId(name);
+        if(readId == invalidReadId) {
+            ++unmatchedReads;
+            continue;
+        }
+
+        const LongBaseSequenceView read = reads->getRead(readId);
+        const uint64_t baseCount = read.baseCount;
+
+        // Merge syncmer + SNPmer positions (both are forward-strand starts).
+        positions.clear();
+        positions.reserve(mr.n_syncmers + mr.n_snpmers);
+        for(size_t i = 0; i < mr.n_syncmers; i++) {
+            positions.push_back(mr.syncmers[i].pos);
+        }
+        for(size_t i = 0; i < mr.n_snpmers; i++) {
+            positions.push_back(mr.snpmers[i].pos);
+        }
+        if(positions.empty()) {
+            continue;
+        }
+
+        // Sort + dedup by position. A locus that is both a syncmer and a SNPmer
+        // yields one marker; the encoded KmerId is a pure function of position,
+        // so deduping by position loses nothing.
+        std::sort(positions.begin(), positions.end());
+        positions.erase(
+            std::unique(positions.begin(), positions.end()), positions.end());
+
+        std::vector<std::pair<uint32_t, KmerId>>& staged =
+            findMarkersSimdMinimizersData.stagedMarkers[readId];
+        staged.reserve(positions.size());
+        for(const uint32_t position: positions) {
+            // Drop markers whose encoded k-mer would run past the read end.
+            if(uint64_t(position) + uint64_t(k) > baseCount) {
+                continue;
+            }
+            Kmer kmer;
+            extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+            staged.emplace_back(position, kmer.id(uint64_t(k)));
+        }
+        totalStaged += staged.size();
+    }
+
+    myloasm_read_index_free(&index);
+
+    if(unmatchedReads != 0) {
+        performanceLog << timestamp
+            << "WARNING: " << unmatchedReads
+            << " myloasm reads did not match a dinara read by name and were "
+            << "skipped." << endl;
+    }
+    performanceLog << timestamp
+        << "Staged " << totalStaged << " myloasm markers (forward strand)."
+        << endl;
+
+    // --- Two-pass CSR store (reuse the simd path's pass 2). -------------------
+    // Pass 1: count from the staged sizes (single pass, cheap; no re-sketch).
+    markers->beginPass1(2 * readCount);
+    markerKmerIds->beginPass1(2 * readCount);
+    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
+        const uint64_t count64 =
+            findMarkersSimdMinimizersData.stagedMarkers[readId].size();
+        markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+        markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+        markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+        markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+    }
+
+    // Pass 2: store markers + derive strand 1 (identical to the simd path).
+    markers->beginPass2();
+    markerKmerIds->beginPass2();
+    const uint64_t batchSize = 100;
+    setupLoadBalancing(readCount, batchSize);
+    runThreads(&Assembler::findMarkersSimdMinimizersPass2, threadCount);
+    markers->endPass2(false);
+    markerKmerIds->endPass2(false);
+
+    // Release staging memory.
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.shrink_to_fit();
+
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double(
+        (std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
+    performanceLog << timestamp
+        << "Finding markers using myloasm syncmers + SNPmers completed in "
+        << tTotal << " s." << endl;
+    cout << "Created " << markers->totalSize()
+        << " markers using myloasm syncmers + SNPmers." << endl;
 }
 
 

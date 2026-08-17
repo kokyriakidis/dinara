@@ -288,6 +288,11 @@ public:
         bool useHifiasm = true,
         const void* hifiasmFilter = nullptr, int hifiasmSampleDist = 0,
         int sketchK = 0, int sketchW = 0);
+    // Marker positions from myloasm open syncmers + SNPmers (global SNPmer
+    // detection). Only positions come from myloasm; KmerIds are encoded here at
+    // length k, reusing the simd path's pass-2 store. See AssemblerMarkers.cpp.
+    void findMarkersMyloasm(uint64_t threadCount, int k,
+        const vector<string>& inputFileNames);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 

@@ -184,6 +184,20 @@ public:
     // benchmark hifiasm's seed selection against simd-minimizers.
     bool useHifiasmMinimizers;
 
+    // Use myloasm's open syncmers + SNPmers as the marker POSITION source
+    // (bundled myloasm SNPmer engine, via myloasm_index_reads in the hifiasm
+    // submodule). SNPmers are detected from the global k-mer spectrum across all
+    // reads, so this is a single whole-run call (not per-read). Only the marker
+    // POSITIONS are taken from myloasm; dinara still encodes its own canonical
+    // KmerId (length Kmers.k) at each position exactly as on the other marker
+    // paths, so markers/markerKmerIds and every downstream consumer are
+    // unchanged in shape. This makes dinara's anchors and phasing run on
+    // syncmer+SNPmer positions while hifiasm still provides overlap pairs and
+    // intervals. Requires Kmers.k <= myloasm's marker k (21) so the encoded
+    // marker k-mer at a myloasm position is shared across reads. Takes
+    // precedence over useHifiasmMinimizers / useSimdMinimizers when set.
+    bool useMyloasmMarkers;
+
     // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer
     // filters so markers match the seeds hifiasm uses for overlap detection:
     // a high-occurrence k-mer filter (built over the input reads, no-HPC) plus

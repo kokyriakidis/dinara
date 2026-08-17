@@ -409,6 +409,18 @@ void AssemblerOptions::addConfigurableOptions()
         "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
         "simd-minimizers instead.")
 
+        ("Kmers.useMyloasmMarkers",
+        value<bool>(&kmersOptions.useMyloasmMarkers)->
+        default_value(false),
+        "If true, use myloasm's open syncmers + SNPmers as the marker position "
+        "source (bundled myloasm SNPmer engine). SNPmers are detected from the "
+        "global k-mer spectrum across all reads. Only the positions come from "
+        "myloasm; dinara still encodes its own canonical KmerId (length Kmers.k) "
+        "at each position, so the downstream index is unchanged. Makes anchors "
+        "and phasing run on syncmer+SNPmer positions while hifiasm still supplies "
+        "overlap pairs and intervals. Requires Kmers.k <= 21. Takes precedence "
+        "over Kmers.useHifiasmMinimizers and Kmers.useSimdMinimizers.")
+
         ("Kmers.hifiasmMarkerSampleDist",
         value<int>(&kmersOptions.hifiasmMarkerSampleDist)->
         default_value(500),
@@ -1478,6 +1490,7 @@ void KmersOptions::write(ostream& s) const
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
     s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
+    s << "useMyloasmMarkers = " << convertBoolToPythonString(useMyloasmMarkers) << "\n";
     s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
 }
