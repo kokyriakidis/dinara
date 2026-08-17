@@ -456,6 +456,14 @@ void Assembler::findMarkersMyloasm(
     performanceLog << timestamp
         << "myloasm indexed " << index.n_reads << " reads (marker k="
         << index.k << ")." << endl;
+    cout << timestamp << "myloasm indexed " << index.n_reads
+        << " reads (marker k=" << index.k << "); dinara read count "
+        << readCount << "." << endl;
+    if(index.n_reads == 0) {
+        cout << "WARNING: myloasm_index_reads returned 0 reads. No markers will "
+            "be created. Check that --input points at the read file(s) myloasm "
+            "can parse (FASTA/FASTQ, optionally gzipped)." << endl;
+    }
 
     // --- Stage forward-strand (position, KmerId) per dinara ReadId. -----------
     // Encoding runs here (myloasm returns one big index; the per-position k-mer
@@ -524,10 +532,29 @@ void Assembler::findMarkersMyloasm(
             << "WARNING: " << unmatchedReads
             << " myloasm reads did not match a dinara read by name and were "
             << "skipped." << endl;
+        cout << timestamp << "WARNING: " << unmatchedReads << " of "
+            << index.n_reads << " myloasm reads did not match a dinara read by "
+            << "name and were skipped." << endl;
+        // Show a few example myloasm names to diagnose a naming-scheme mismatch
+        // (e.g. suffixes, whitespace) versus dinara's stored first-token names.
+        const size_t nShow = std::min<size_t>(index.n_reads, 5);
+        for(size_t s = 0; s < nShow; s++) {
+            const MyloReadMarkers& mr = index.reads[s];
+            cout << "  myloasm read name example: '"
+                << string(mr.name, mr.name_len) << "'" << endl;
+        }
     }
     performanceLog << timestamp
         << "Staged " << totalStaged << " myloasm markers (forward strand)."
         << endl;
+    cout << timestamp << "Staged " << totalStaged
+        << " myloasm markers (forward strand) across "
+        << (index.n_reads - unmatchedReads) << " matched reads." << endl;
+    if(totalStaged == 0) {
+        cout << "WARNING: 0 myloasm markers staged. All downstream anchors will "
+            "be empty. Likely causes: read-name mismatch (see above), or myloasm "
+            "produced no syncmers/SNPmers for these reads." << endl;
+    }
 
     // --- Two-pass CSR store (reuse the simd path's pass 2). -------------------
     // Pass 1: count from the staged sizes (single pass, cheap; no re-sketch).
