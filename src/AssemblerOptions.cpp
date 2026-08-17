@@ -411,8 +411,8 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Kmers.useMyloasmMarkers",
         value<bool>(&kmersOptions.useMyloasmMarkers)->
-        default_value(false),
-        "If true, use myloasm's open syncmers + SNPmers as the marker position "
+        default_value(true),
+        "If true (default), use myloasm's open syncmers + SNPmers as the marker position "
         "source (bundled myloasm SNPmer engine). SNPmers are detected from the "
         "global k-mer spectrum across all reads. Only the positions come from "
         "myloasm; dinara encodes its own canonical KmerId at a fixed k=20 "

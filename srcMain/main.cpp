@@ -1789,12 +1789,15 @@ void dinara::main::assemble(
 
     // Marker generation method selection.
     //
-    // The SIMD minimizer path is the main path and is taken by default because
-    // Marker generation. Kmers.useHifiasmMinimizers defaults to true, so by
-    // default markers come from hifiasm's own no-HPC sketcher plus the
-    // overlap-path minimizer filter, and the marker seeds match the seeds
-    // hifiasm uses for overlaps (this is what pairs with the PAF/hifiasm overlap
-    // path). The source is resolved once into an explicit enum; see
+    // Kmers.useMyloasmMarkers defaults to true, so by default markers come from
+    // myloasm's open syncmers + SNPmers and overlaps are produced by myloasm's
+    // native all-vs-all overlapper (syncmer seeding + SNPmer identity). Open
+    // syncmers give context-free, error-robust seeds (a shared k-mer yields a
+    // shared seed regardless of neighbouring context), which is why this path is
+    // preferred over hifiasm's windowed minimizers. useMyloasmMarkers takes
+    // precedence over Kmers.useHifiasmMinimizers / Kmers.useSimdMinimizers; set
+    // it to false to fall back to the hifiasm/SIMD minimizer + hifiasm overlap
+    // path. The source is resolved once into an explicit enum; see
     // resolveMarkerSource / MarkerSource for the precedence rules.
     const MarkerSource markerSource =
         resolveMarkerSource(assemblerOptions.kmersOptions);
@@ -2119,6 +2122,18 @@ void dinara::main::assemble(
             << "Generating overlaps with myloasm's native all-vs-all overlapper "
             << "(syncmers + SNPmers) from " << inputFileNames.size()
             << " input file(s)." << endl;
+
+        // Default the dinara myloasm path to the unfiltered overlapper:
+        // disable myloasm's contained-read removal and its SNPmer same-strain
+        // identity gate so every syncmer-seeded candidate overlap is emitted
+        // (hifiasm-raw-candidate-like). dinara re-flags containment downstream
+        // (flagContainedReads), so redundancy is still handled later. These are
+        // set with overwrite=0, so an explicitly exported
+        // MYLOASM_NO_CONTAINMENT_REMOVAL / MYLOASM_NO_SAME_STRAIN_FILTER (e.g.
+        // "0" to re-enable a filter) still takes precedence. The myloasm FFI
+        // reads these env vars (see ffi.rs: myloasm_detect_overlaps).
+        setenv("MYLOASM_NO_CONTAINMENT_REMOVAL", "1", 0);
+        setenv("MYLOASM_NO_SAME_STRAIN_FILTER", "1", 0);
 
         MyloOverlaps mylo = {};
         // kmer_size/c/threads = 0,0,threads: myloasm defaults (k=21, c=11).
