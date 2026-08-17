@@ -2450,6 +2450,30 @@ void dinara::main::assemble(
     cout << timestamp << "Flagging contained reads..." << endl;
     assembler.flagContainedReads(1000, 0.8, 0, threadCount);
 
+    // ========================================================================
+    // Anchor-graph construction method selector (compile-time).
+    //
+    // USE_JOURNEY_ANCHOR_GRAPH = 1 -> pure journey-based anchor graph:
+    //   edges connect anchors that are consecutive in read journeys (the classic
+    //   mode3::AnchorGraph rule), with NO windows and NO het bubbles. The whole
+    //   window/het pipeline below is compiled out; the graph is built directly
+    //   from the (already chaining-filtered) journeys via the Shasta2AnchorGraph
+    //   (anchors, journeys, minEdgeCoverage, threadCount) constructor.
+    //
+    // USE_JOURNEY_ANCHOR_GRAPH = 0 -> the window + het-bubble pipeline (the long
+    //   block guarded by #if !USE_JOURNEY_ANCHOR_GRAPH below).
+    //
+    // Flip this to switch methods; the unused path is not built.
+    // ========================================================================
+    #define USE_JOURNEY_ANCHOR_GRAPH 1
+
+    // Shared across both methods. In the journey path these stay empty: an empty
+    // `anchorWindows` makes the assembly-graph stage fall back to length-only
+    // cleanup (windowCount == 0), and an empty drop map exports every anchor.
+    vector<AnchorWindow> anchorWindows;
+    vector<uint32_t> anchorDovetailWindow;
+
+#if !USE_JOURNEY_ANCHOR_GRAPH
     // Compute anchor windows.
     cout << timestamp << "Computing anchor windows..." << endl;
     // ========================================================================
@@ -2459,8 +2483,6 @@ void dinara::main::assemble(
     // then tiles the leftover unclaimed base spans into fragment windows.
     // Produces `anchorWindows` only — no inter-window edges, no transitions.
     // ========================================================================
-    vector<AnchorWindow> anchorWindows;
-    vector<uint32_t> anchorDovetailWindow;
     const uint64_t minCommonForBackbone =
         assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone;
     const uint64_t maxSkipForBackbone =
@@ -2963,6 +2985,7 @@ void dinara::main::assemble(
              << aStructWindows.load() << " windows linear, "
              << aStructBubbles.load() << " het bubbles hom-flanked." << endl;
     }
+#endif // !USE_JOURNEY_ANCHOR_GRAPH  (end of window + het-bubble pipeline)
 
     // Global per-read journey tie resolution. shasta2 builds, for every oriented
     // read, the ordered list of ALL anchors that read belongs to (sorted by the
@@ -3113,6 +3136,25 @@ void dinara::main::assemble(
     // computed it above -- see the note there for why the result would be
     // identical either way.
     {
+#if USE_JOURNEY_ANCHOR_GRAPH
+        // Journey-based anchor graph: one edge per pair of anchors that are
+        // consecutive in some read's journey and reach the coverage threshold
+        // (classic mode3::AnchorGraph rule). No windows, no het bubbles, no
+        // inter-window / trim / het-tip passes. Reuse minInterWindowEdgeCoverage
+        // as the per-edge coverage threshold (it is the closest existing knob;
+        // the recorded pipeline runs it at 0 = keep every consecutive-pair edge).
+        static_cast<void>(anchorDovetailWindow);
+        const uint64_t minEdgeCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
+        cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
+             << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
+             << ")..." << endl;
+        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            minEdgeCoverage,
+            threadCount);
+#else
         if(!windowTransitionsComputed) {
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
                 &anchorDovetailWindow);
@@ -3173,6 +3215,7 @@ void dinara::main::assemble(
                     *shasta2Anchors, anchorWindows, *shasta2Journeys);
             if(hetTips == 0 && genTips == 0) break;
         }
+#endif // USE_JOURNEY_ANCHOR_GRAPH
 
         assembler.shasta2AnchorGraph->writeGfa("Shasta2AnchorGraph.gfa", &anchorWindows);
         assembler.shasta2AnchorGraph->writeCsv("Shasta2AnchorGraph.csv");
@@ -3223,7 +3266,20 @@ void dinara::main::assemble(
 
         // Iterative tip removal + compress. Shorter tips are processed first so
         // their removal can expose longer ones; loop until nothing changes.
-        {
+        //
+        // removeShortTips gates each tip on BOTH a window-span cap
+        // (maxTipWindows) and a byte-length cap (maxTipLength). The window span
+        // is the primary topological guardrail. On the journey-based anchor
+        // graph there are NO windows (anchorWindows is empty), so every edge's
+        // windowSequence is empty and the window guard degenerates to a constant
+        // 0 <= maxTipWindows -- always true -- leaving only the far-too-permissive
+        // length cap (2 * averageReadLength). With no long, window-anchored
+        // backbone to protect, that length-only cascade peels the entire graph to
+        // 0 segments. So skip window-based tip removal when there are no windows;
+        // the compressed graph is written as-is. (Journey-path tip cleanup, if
+        // wanted, needs a topology-aware metric rather than window span -- see
+        // Shasta2AssemblyGraph::removeShortTips.)
+        if(!anchorWindows.empty()) {
             const uint32_t maxTipWindows = 3;
             const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
             for(uint64_t cleanRound = 0; ; cleanRound++) {
@@ -3232,6 +3288,10 @@ void dinara::main::assemble(
                 shasta2AssemblyGraph->compress();
                 if(changeCount == 0) break;
             }
+        } else {
+            cout << timestamp << "No anchor windows (journey-based graph): "
+                 << "skipping window-based tip removal for the cleaned graph."
+                 << endl;
         }
         shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
         cout << timestamp << "Wrote Shasta2AssemblyGraph.gfa / -cleaned.gfa" << endl;
