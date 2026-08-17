@@ -399,9 +399,36 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                             norm.read1Start, norm.read1End,
                             directAlignment.ordinals);
                     }
+                } else if(rec != nullptr) {
+                    // Interval-only record (myloasm marker overlap path): the
+                    // pair has a validated interval but no base CIGAR. Reframe
+                    // the interval into the read0/read1 canonical frame exactly
+                    // as above (normalizeHifiasmCigar produces empty tokens here)
+                    // and derive the marker chain from it. constructQuickRawSparse
+                    // below then builds the per-segment CIGAR from that chain with
+                    // A*PA2 -- the same base alignment the hifiasm path gets for
+                    // free, but computed from myloasm's interval.
+                    const uint32_t qLen =
+                        uint32_t(reads->getRead(ReadId(rec->readIdQ)).baseCount);
+                    const uint32_t tLen =
+                        uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
+                    const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
+                        hifiasmImportedCigarStore.tokensOf(*rec),
+                        rec->readIdQ, rec->readIdT,
+                        rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
+                        qLen, tLen, rec->isSameStrand);
+                    deriveChainFromInterval(
+                        orientedReadIds,
+                        norm.read0Start, norm.read0End,
+                        norm.read1Start, norm.read1End,
+                        directAlignment.ordinals);
                 }
                 if(!usedHifiasmCigar) {
-                    // No usable CIGAR: recompute with A*PA2.
+                    // No usable CIGAR: build the base alignment from the derived
+                    // marker chain (interval-only path) or, if no chain exists,
+                    // recompute from scratch. constructQuickRawSparse walks
+                    // directAlignment.ordinals; on the interval-only path this is
+                    // the chain from deriveChainFromInterval above.
                     projectedAlignment.constructQuickRawSparse();
                 }
             }

@@ -395,6 +395,31 @@ void Assembler::importAlignmentCandidatesFromMemory(
         }
         cout << timestamp << "Imported hifiasm CIGARs for " << cigarOverlaps
              << " overlaps (" << cigarLen << " tokens)." << endl;
+    } else {
+        // Interval-only import (myloasm marker overlap path): no base CIGAR is
+        // supplied. Store each surviving overlap's interval with ZERO CIGAR
+        // tokens so computeBaseAlignmentsAndStore can find the pair, reframe the
+        // interval (normalizeHifiasmCigar works with empty tokens), derive the
+        // marker chain from it (deriveChainFromInterval), and build the CIGAR
+        // per-segment with A*PA2 (constructQuickRawSparse). Without this record
+        // the pair has no interval, deriveChainFromInterval is never called, and
+        // the empty-ordinals guard downstream would drop every myloasm overlap.
+        uint64_t intervalOverlaps = 0;
+        hifiasmImportedCigarStore.reserve(entries.size(), 0);
+        for(const PafEntry& e : entries) {
+            if(e.sourceIndex == uint64_t(-1)) continue;
+            const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
+            const ReadId readId0 = hifiToDinara[o.q_id];
+            const ReadId readId1 = hifiToDinara[o.t_id];
+            hifiasmImportedCigarStore.add(
+                e.key, o.is_same_strand != 0,
+                span<const uint16_t>(),   // no tokens: interval-only record
+                uint32_t(readId0), uint32_t(readId1),
+                o.q_start, o.q_end, o.t_start, o.t_end);
+            ++intervalOverlaps;
+        }
+        cout << timestamp << "Imported interval-only overlaps (no CIGAR) for "
+             << intervalOverlaps << " pairs." << endl;
     }
 
     const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(

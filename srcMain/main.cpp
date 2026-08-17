@@ -37,6 +37,7 @@
 // hifiasm candidate-overlap detector (submodule). C API used to generate read
 // overlaps (with aligned intervals and CIGARs) directly in memory.
 #include "hifiasm_overlaps.h"
+#include "fakechain_bridge.h"
 
 
 using namespace dinara;
@@ -1769,7 +1770,14 @@ void dinara::main::assemble(
     std::unique_ptr<HifiasmReadStore> hifiasmStore;
     const bool hifiasmStoreUsable =
         (assemblerOptions.readsOptions.representation == 0) &&
-        (assembler.getReads().readCount() > 0);
+        (assembler.getReads().readCount() > 0) &&
+        // The myloasm path never uses the hifiasm store: findMarkersMyloasm and
+        // the fakechain overlap bridge both read the input files directly, and
+        // the bridge internally resets/repopulates hifiasm's process-global
+        // R_INF (reset_read_store). Loading our own store here would be leaked by
+        // that reset and then double-freed by ~HifiasmReadStore at scope exit
+        // (destory_All_reads on a store the bridge already replaced).
+        !assemblerOptions.kmersOptions.useMyloasmMarkers;
     if(hifiasmStoreUsable) {
         performanceLog << timestamp
             << "Loading " << assembler.getReads().readCount()
@@ -1799,11 +1807,13 @@ void dinara::main::assemble(
         bool hifiasmMarkerFilterApplied = false;
 
         if(markerSource == MarkerSource::MyloasmMarkers) {
-            // myloasm open syncmers + SNPmers as the position source. hifiasm
-            // still supplies overlap pairs + intervals (k=51 HPC, separate
-            // path); this only changes what fills the marker table. No hifiasm
-            // minimizer filter is built or applied, so the shared frequency
-            // filter (applyKmerCountFilter) below runs normally.
+            // myloasm open syncmers + SNPmers as the position source. On this
+            // path overlaps also come from myloasm markers: the fakechain bridge
+            // (see the overlap block below) uses hifiasm only to enumerate raw
+            // candidate read pairs, then matches + chains myloasm markers with
+            // myloasm's own DP. No hifiasm minimizer filter is built or applied,
+            // so the shared frequency filter (applyKmerCountFilter) below runs
+            // normally.
             //
             // The marker/anchor index is encoded at k=20 (myloasm's marker k=21
             // clipped). findMarkersMyloasm sets assemblerInfo->k = 20. Every
@@ -2072,7 +2082,105 @@ void dinara::main::assemble(
             "(or a loaded read store).");
     }
 
-    {
+    if(markerSource == MarkerSource::MyloasmMarkers) {
+        // Myloasm-only overlap path (Kmers.useMyloasmMarkers).
+        //
+        // fakechain_bridge_overlaps runs the full myloasm-marker overlap
+        // pipeline: hifiasm supplies RAW candidate read pairs + intervals only
+        // (raw_candidates=1, base alignment skipped), then myloasm's open
+        // syncmers + SNPmers (myloasm_index_reads, k=21) are matched between each
+        // pair and chained with myloasm's own DP (myloasm_chain). The chained
+        // anchors' bounding interval is what we hand to dinara. This replaces
+        // hifiasm's base-level alignment/chaining with myloasm's marker chaining;
+        // hifiasm is still used to enumerate candidate pairs (the myloasm FFI has
+        // no all-vs-all overlapper).
+        //
+        // We translate each fakechain_overlap_t into an interval-only
+        // hifiasm_overlap_t (cigar_len=0, cigar=nullptr) so the existing importer
+        // (importAlignmentCandidatesFromMemory) and downstream
+        // deriveChainFromInterval consume it unchanged.
+        if(inputFileNames.empty()) {
+            throw runtime_error(
+                "The myloasm overlap path requires at least one --input read "
+                "file (myloasm re-reads the inputs; the read store path is not "
+                "supported here).");
+        }
+
+        vector<const char*> readFiles;
+        readFiles.reserve(inputFileNames.size());
+        for(const string& f: inputFileNames) {
+            readFiles.push_back(f.c_str());
+        }
+
+        fakechain_bridge_opt_t fcOpt;
+        fakechain_bridge_opt_init(&fcOpt);
+        fcOpt.ovlp.threads = int(threadCount);
+
+        fakechain_overlap_t* fcOv = nullptr;
+        uint64_t nFcOv = 0;
+        char* names = nullptr;
+        uint64_t* nameOff = nullptr;
+        uint64_t nReads = 0;
+        performanceLog << timestamp
+            << "Generating overlaps with myloasm markers (syncmers + SNPmers, "
+            << "chained by myloasm DP) from " << inputFileNames.size()
+            << " input file(s)." << endl;
+        cout << timestamp
+            << "Generating overlaps with myloasm markers (syncmers + SNPmers, "
+            << "chained by myloasm DP) from " << inputFileNames.size()
+            << " input file(s)." << endl;
+        const int rc = fakechain_bridge_overlaps(
+            readFiles.data(), int(readFiles.size()), &fcOpt,
+            &fcOv, &nFcOv,
+            /*out_anchors*/ nullptr, /*out_n_anchors*/ nullptr,
+            &names, &nameOff, &nReads);
+        if(rc != 0) {
+            fakechain_bridge_free(fcOv, nullptr, names, nameOff);
+            throw runtime_error(
+                "myloasm marker overlap detection failed (code "
+                + to_string(rc) + ").");
+        }
+
+        // Translate fakechain overlaps to interval-only hifiasm_overlap_t.
+        // block_len drives the importer's floor filter (>= 200) and its
+        // keep-longest dedup; use the larger of the query/target chain spans as
+        // a proxy for aligned length. No CIGAR is produced (cigar_len = 0), so
+        // downstream computeBaseAlignmentsAndStore derives the marker chain from
+        // this interval (deriveChainFromInterval) or, failing that, recomputes
+        // with A*PA2.
+        vector<hifiasm_overlap_t> ov;
+        ov.reserve(nFcOv);
+        for(uint64_t i = 0; i < nFcOv; i++) {
+            const fakechain_overlap_t& f = fcOv[i];
+            const uint32_t qSpan = (f.q_end > f.q_start) ? (f.q_end - f.q_start) : 0;
+            const uint32_t tSpan = (f.t_end > f.t_start) ? (f.t_end - f.t_start) : 0;
+            hifiasm_overlap_t o = {};
+            o.q_id = f.q_id;
+            o.t_id = f.t_id;
+            o.q_start = f.q_start;
+            o.q_end = f.q_end;
+            o.t_start = f.t_start;
+            o.t_end = f.t_end;
+            o.n_match = f.n_anchor;
+            o.block_len = std::max(qSpan, tSpan);
+            o.is_same_strand = f.is_same_strand;
+            o.cigar_offset = 0;
+            o.cigar_len = 0;
+            o.cigar_t_start = 0;
+            ov.push_back(o);
+        }
+
+        performanceLog << timestamp << "myloasm markers produced " << nFcOv
+            << " overlaps over " << nReads << " reads (in memory)." << endl;
+        cout << timestamp << "myloasm markers produced " << nFcOv
+            << " overlaps over " << nReads << " reads (in memory)." << endl;
+
+        assembler.importAlignmentCandidatesFromMemory(
+            ov.data(), ov.size(), names, nameOff, nReads,
+            /*cigar*/ nullptr, /*cigarLen*/ 0, threadCount);
+        fakechain_bridge_free(fcOv, nullptr, names, nameOff);
+
+    } else {
         hifiasm_ovlp_opt_t hifiOpt = {};
         hifiOpt.threads = int(threadCount);
 
