@@ -1799,6 +1799,19 @@ void dinara::main::assemble(
     // MarkerSource for the precedence rules.
     const MarkerSource markerSource =
         resolveMarkerSource(assemblerOptions.kmersOptions);
+
+    // The overlap-path minimizer filter is built during marker selection (inside
+    // the block below) but must OUTLIVE it: overlap detection reuses the very
+    // same filter so the overlapper does not rebuild its own high-occurrence
+    // table (one fewer yak count pass) and seeds against the identical set the
+    // markers were selected from. Hoisted here so it survives to the overlap
+    // block; destroyed once overlaps are generated. overlapSeedK/W carry the
+    // no-HPC selection k/w the filter was built at, so the overlapper sketches
+    // in the SAME space (its native chain anchors then land on dinara markers).
+    hifiasm_filter_t* overlapReuseFilter = nullptr;
+    int overlapSeedK = 0;
+    int overlapSeedW = 0;
+
     if(markerSource != MarkerSource::LegacyKmer) {
         // The hifiasm overlap-path filter handle (simd/hifiasm paths only) and
         // whether it was applied. Declared here so the shared post-processing
@@ -1967,11 +1980,18 @@ void dinara::main::assemble(
 
         // writeReadMarkerGapDiagnostic("afterFrequencyFilter", ReadId(3729));
 
-        // The marker filter handle is no longer needed once markers are built.
-        if(hifiasmMarkerFilter != nullptr) {
-            hifiasm_filter_destroy(hifiasmMarkerFilter);
-            hifiasmMarkerFilter = nullptr;
-        }
+        // Hand the marker filter to overlap detection instead of freeing it
+        // here: the overlapper reuses this exact no-HPC filter (built at
+        // selectK/selectW) so it skips its own filter-build pass and seeds in
+        // the same space as the markers. Ownership transfers to
+        // overlapReuseFilter; it is destroyed after overlaps are generated.
+        // selectK==selectW==encodeK on this path (no-HPC marker space), which is
+        // also the k/w the overlapper must sketch at for its native chain
+        // anchors to coincide with dinara's markers.
+        overlapReuseFilter = hifiasmMarkerFilter;
+        overlapSeedK = markerCfg.selectK;
+        overlapSeedW = markerCfg.selectW;
+        hifiasmMarkerFilter = nullptr;
 
         // Initialize KmerChecker for HttpServer diagnostics (optional).
         cout << "Initializing KmerChecker for diagnostics." << endl;
@@ -2045,6 +2065,24 @@ void dinara::main::assemble(
         assemblerOptions.overlapCandidatesOptions.hifiasmRawCandidates;
     hifiOpt.raw_candidates = rawCandidates ? 1 : 0;
 
+    // Run overlap detection in dinara's marker space: NO homopolymer compression
+    // and the SAME k/w the markers were selected at (no-HPC selectK/selectW).
+    // This unifies the overlapper with the marker sketch so (a) the reused
+    // filter's k-mer counts correspond to the minimizers being filtered and
+    // (b) hifiasm's native chain anchors land exactly on dinara marker
+    // positions. Falls back to hifiasm's tuned HPC defaults only when no marker
+    // filter is available (legacy path).
+    if(overlapReuseFilter != nullptr) {
+        hifiOpt.no_hpc       = 1;
+        hifiOpt.k_mer_length = overlapSeedK;
+        hifiOpt.mz_win       = overlapSeedW;
+        hifiOpt.filter       = overlapReuseFilter;
+        performanceLog << timestamp
+            << "Overlap detection: no-HPC, k=" << overlapSeedK
+            << ", w=" << overlapSeedW
+            << ", reusing prebuilt marker filter." << endl;
+    }
+
     hifiasm_overlap_t* ov = nullptr;
     uint64_t nOv = 0;
     char* names = nullptr;
@@ -2056,6 +2094,11 @@ void dinara::main::assemble(
     // (NULL out-params); dinara discards the CIGAR regardless.
     uint16_t** cigarOut = rawCandidates ? nullptr : &cigar;
     uint64_t* cigarLenOut = rawCandidates ? nullptr : &cigarLen;
+    // Native dense chain anchors: hifiasm's own colinear-DP chain per overlap,
+    // used in place of re-deriving the chain from dinara's markers. Only the
+    // store path exposes it (the file path leaves it NULL/0).
+    uint64_t* chain = nullptr;
+    uint64_t chainLen = 0;
     int rc;
     if(useHifiasmStore) {
         performanceLog << timestamp
@@ -2063,7 +2106,8 @@ void dinara::main::assemble(
             << "loaded read store" << (rawCandidates ? " (raw candidates, no "
                "base alignment)." : ".") << endl;
         rc = hifiasm_detect_overlaps_from_store(
-            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, cigarOut, cigarLenOut);
+            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, cigarOut, cigarLenOut,
+            &chain, &chainLen);
     } else {
         performanceLog << timestamp
             << "Generating overlaps with hifiasm (in memory) from "
@@ -2091,15 +2135,28 @@ void dinara::main::assemble(
     // Interval-only import: hifiasm supplies the candidate PAIRS and their
     // query/target INTERVALS, but we DISCARD hifiasm's base CIGAR (pass
     // nullptr/0). dinara re-derives each overlap's marker chain from its own
-    // non-HPC minimizer markers inside that interval box
-    // (deriveChainFromInterval in computeBaseAlignmentsAndStore), then builds
-    // the per-segment CIGAR with A*PA2. This keeps hifiasm as the sole source
-    // of candidate pairs + intervals while the chain stays confined to the
-    // interval, with no dependency on hifiasm's own base alignment.
+    // hifiasm's own native dense chain anchors (its colinear-DP seeds, exported
+    // per overlap), mapped directly to marker ordinals in
+    // computeBaseAlignmentsAndStore. Because overlap detection runs no-HPC at the
+    // marker k, each anchor lands on a marker 1:1, so no re-chaining is needed;
+    // deriveChainFromInterval remains only as a fallback for pairs with no native
+    // chain. dinara then builds the per-segment CIGAR with A*PA2. This keeps
+    // hifiasm as the sole source of candidate pairs, intervals, AND chains.
     assembler.importAlignmentCandidatesFromMemory(
         ov, nOv, names, nameOff, nReads,
-        /*cigar*/ nullptr, /*cigarLen*/ 0, threadCount);
+        /*cigar*/ nullptr, /*cigarLen*/ 0,
+        /*chain*/ chain, /*chainLen*/ chainLen, threadCount);
     hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
+    free(chain);  // native chain arena (plain uint64_t array; owned by caller)
+    chain = nullptr;
+
+    // The overlap-path filter (reused from marker selection) is no longer needed
+    // once overlaps are generated. Destroyed here rather than in the marker
+    // block so it survived to be reused by overlap detection above.
+    if(overlapReuseFilter != nullptr) {
+        hifiasm_filter_destroy(overlapReuseFilter);
+        overlapReuseFilter = nullptr;
+    }
 
     // Compute base-level pairwise alignments for all overlaps and store
     // the resulting CIGARs. These are used downstream for CIGAR-based

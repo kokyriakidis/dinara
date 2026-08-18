@@ -357,6 +357,24 @@ public:
         uint32_t read1Begin, uint32_t read1End,
         vector< array<uint32_t, 2> >& ordinals) const;
 
+    // Map hifiasm's native dense chain anchors to marker ordinals for one
+    // overlap, replacing deriveChainFromInterval on the native-chain path. Each
+    // anchor is packed (q_start<<32)|t_start in hifiasm's query-forward /
+    // target-alignment frame; readIdQ/readIdT identify hifiasm's query/target
+    // dinara ReadIds (used to detect the read0/read1 swap and reverse strand).
+    // Because overlap detection runs no-HPC at selectK==encodeK, every marker
+    // spans exactly markerK bases and each anchor position matches a marker START
+    // exactly (1:1), so anchors map by direct position lookup -- no chaining DP.
+    // Anchors whose position has no marker (e.g. filtered high-occurrence) are
+    // skipped. Emits strictly-increasing ordinals into `ordinals` (cleared
+    // first).
+    void mapNativeChainToOrdinals(
+        const array<OrientedReadId, 2>& orientedReadIds,
+        uint32_t readIdQ, uint32_t readIdT,
+        bool isSameStrand,
+        span<const uint64_t> anchors,
+        vector< array<uint32_t, 2> >& ordinals) const;
+
     // Lightweight marker-chain materialization for marker-graph prototypes.
     // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
     void performPhasing(uint64_t threadCount);
@@ -1026,6 +1044,12 @@ public:
         uint64_t readCountFromHifiasm,
         const uint16_t* cigar,
         uint64_t cigarLen,
+        // Native dense chain-anchor arena (packed (q_start<<32)|t_start) shared
+        // by all overlaps via hifiasm_overlap_t::chain_offset/chain_len. Pass
+        // chain == nullptr to skip native-chain import (falls back to
+        // deriveChainFromInterval).
+        const uint64_t* chain,
+        uint64_t chainLen,
         uint64_t threadCount = 0);
 
 private:

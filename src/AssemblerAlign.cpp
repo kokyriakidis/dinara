@@ -289,6 +289,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
     uint64_t readCountFromHifiasm,
     const uint16_t* cigar,
     uint64_t cigarLen,
+    const uint64_t* chain,
+    uint64_t chainLen,
     uint64_t threadCount)
 {
     cout << timestamp << "Importing " << overlapCount
@@ -418,6 +420,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     if(cigar != nullptr) {
         uint64_t cigarOverlaps = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), cigarLen);
+        if(chain != nullptr) hifiasmImportedCigarStore.reserveChain(chainLen);
         for(const PafEntry& e : entries) {
             if(e.sourceIndex == uint64_t(-1)) continue;
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
@@ -431,6 +434,12 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 uint32_t(readId0), uint32_t(readId1),
                 o.q_start, o.q_end, o.t_start, o.t_end);
             ++cigarOverlaps;
+            if(chain != nullptr && o.chain_len > 0 &&
+               o.chain_offset + o.chain_len <= chainLen) {
+                hifiasmImportedCigarStore.addChain(
+                    e.key, o.is_same_strand != 0,
+                    span<const uint64_t>(chain + o.chain_offset, size_t(o.chain_len)));
+            }
         }
         cout << timestamp << "Imported hifiasm CIGARs for " << cigarOverlaps
              << " overlaps (" << cigarLen << " tokens)." << endl;
@@ -444,7 +453,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
         // the pair has no interval, deriveChainFromInterval is never called, and
         // the empty-ordinals guard downstream would drop every overlap.
         uint64_t intervalOverlaps = 0;
+        uint64_t chainOverlaps = 0, chainAnchorsTotal = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), 0);
+        if(chain != nullptr) hifiasmImportedCigarStore.reserveChain(chainLen);
         for(const PafEntry& e : entries) {
             if(e.sourceIndex == uint64_t(-1)) continue;
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
@@ -456,9 +467,24 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 uint32_t(readId0), uint32_t(readId1),
                 o.q_start, o.q_end, o.t_start, o.t_end);
             ++intervalOverlaps;
+            // Attach hifiasm's native dense chain for this pair (query-forward /
+            // target-alignment frame). Consumed in place of
+            // deriveChainFromInterval.
+            if(chain != nullptr && o.chain_len > 0 &&
+               o.chain_offset + o.chain_len <= chainLen) {
+                hifiasmImportedCigarStore.addChain(
+                    e.key, o.is_same_strand != 0,
+                    span<const uint64_t>(chain + o.chain_offset, size_t(o.chain_len)));
+                ++chainOverlaps;
+                chainAnchorsTotal += o.chain_len;
+            }
         }
         cout << timestamp << "Imported interval-only overlaps (no CIGAR) for "
              << intervalOverlaps << " pairs." << endl;
+        if(chain != nullptr) {
+            cout << timestamp << "Imported native chain for " << chainOverlaps
+                 << " pairs (" << chainAnchorsTotal << " anchors)." << endl;
+        }
     }
 
     const double seconds = 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(

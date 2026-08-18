@@ -154,6 +154,108 @@ void Assembler::deriveChainFromInterval(
     hifiasm_chain_free(kept);
 }
 
+void Assembler::mapNativeChainToOrdinals(
+    const array<OrientedReadId, 2>& orientedReadIds,
+    uint32_t readIdQ, uint32_t readIdT,
+    bool isSameStrand,
+    span<const uint64_t> anchors,
+    vector< array<uint32_t, 2> >& ordinals) const
+{
+    ordinals.clear();
+    if(anchors.empty()) return;
+
+    // Markers are position-sorted ascending in each oriented frame; ordinal ==
+    // index. Look up an ordinal by exact marker-START position via binary search.
+    constexpr uint32_t invalidOrdinalLocal = std::numeric_limits<uint32_t>::max();
+    const auto markers0  = (*markers)[orientedReadIds[0].getValue()];
+    const auto markers1  = (*markers)[orientedReadIds[1].getValue()];
+    const auto kmerIds0  = (*markerKmerIds)[orientedReadIds[0].getValue()];
+    const auto kmerIds1  = (*markerKmerIds)[orientedReadIds[1].getValue()];
+    auto findOrdinal = [&](const span<const CompressedMarker>& m,
+                           uint32_t pos) -> uint32_t {
+        uint32_t lo = 0, hi = uint32_t(m.size());
+        while(lo < hi) {
+            const uint32_t mid = lo + ((hi - lo) >> 1);
+            const uint32_t p = m[mid].position;
+            if(p < pos) lo = mid + 1;
+            else if(p > pos) hi = mid;
+            else return mid;               // exact hit
+        }
+        return invalidOrdinalLocal;        // no marker at this position
+    };
+
+    // Anchor positions are hifiasm-query-forward (q_start) and target in
+    // ALIGNMENT orientation (t_start). Convert to positions on
+    // orientedReadIds[0]/[1], matching normalizeHifiasmCigar's frame exactly:
+    //   read0 = min(ReadId). No swap (readIdQ < readIdT) => read0 = query.
+    //   markers1 already live in orientedReadIds[1]'s strand (RC for reverse),
+    //   which IS hifiasm's alignment orientation for the target, so on the
+    //   no-swap path both positions map directly with no RC math. Only the
+    //   swap+reverse path needs the (len - pos - markerK) flip, because there
+    //   read0/read1 are forced to strand 0 / strand 1 opposite to hifiasm's
+    //   orientation. markerK is constant (no-HPC, selectK==encodeK).
+    const uint32_t markerK = uint32_t(assemblerInfo->k);
+    const bool swap = (readIdQ > readIdT);
+    const uint32_t qLen = uint32_t(reads->getRead(ReadId(readIdQ)).baseCount);
+    const uint32_t tLen = uint32_t(reads->getRead(ReadId(readIdT)).baseCount);
+    auto flip = [&](uint32_t pos, uint32_t len) -> uint32_t {
+        return (len >= pos + markerK) ? (len - pos - markerK) : invalidOrdinalLocal;
+    };
+
+    ordinals.reserve(anchors.size());
+    for(const uint64_t a : anchors) {
+        const uint32_t qPos = uint32_t(a >> 32);
+        const uint32_t tPos = uint32_t(a & 0xffffffffu);
+
+        uint32_t pos0, pos1;
+        if(!swap) {
+            pos0 = qPos;                                   // read0 = query fwd
+            pos1 = tPos;                                   // read1 = target aln-orient
+        } else if(isSameStrand) {
+            pos0 = tPos;                                   // read0 = target fwd
+            pos1 = qPos;                                   // read1 = query fwd
+        } else {
+            pos0 = flip(tPos, tLen);                       // read0 = target fwd
+            pos1 = flip(qPos, qLen);                       // read1 = query RC
+        }
+        if(pos0 == invalidOrdinalLocal || pos1 == invalidOrdinalLocal) continue;
+
+        const uint32_t ord0 = findOrdinal(markers0, pos0);
+        const uint32_t ord1 = findOrdinal(markers1, pos1);
+        if(ord0 == invalidOrdinalLocal || ord1 == invalidOrdinalLocal) continue;
+
+        // Self-verification: a genuine anchor is the SAME k-mer on both reads in
+        // these oriented frames, so their marker KmerIds must match. Skip any
+        // anchor that does not agree (guards against off-by-one/frame drift and
+        // the rare position collision).
+        if(kmerIds0[ord0] != kmerIds1[ord1]) continue;
+
+        ordinals.push_back({ord0, ord1});
+    }
+
+    if(ordinals.size() <= 1) return;
+
+    // swap+reverse maps the (increasing,increasing) hifiasm chain to
+    // (decreasing,decreasing); all other frames preserve increasing order.
+    // Normalize to strictly increasing in read0, then drop any residue that is
+    // not also strictly increasing in read1 (the downstream marker-chain walk
+    // requires a monotone chain).
+    std::sort(ordinals.begin(), ordinals.end(),
+        [](const array<uint32_t,2>& x, const array<uint32_t,2>& y) {
+            return x[0] < y[0];
+        });
+    vector< array<uint32_t,2> > mono;
+    mono.reserve(ordinals.size());
+    int64_t prev0 = -1, prev1 = -1;
+    for(const auto& p : ordinals) {
+        if(int64_t(p[0]) <= prev0 || int64_t(p[1]) <= prev1) continue;
+        mono.push_back(p);
+        prev0 = int64_t(p[0]);
+        prev1 = int64_t(p[1]);
+    }
+    ordinals.swap(mono);
+}
+
 void Assembler::computeBaseAlignmentsAndStore(
     const AlignOptions& alignOptions,
     uint64_t threadCount
@@ -415,11 +517,21 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                     // reframed for reverse overlaps). No chaining DP -- the box is
                     // colinear.
                     if(usedHifiasmCigar) {
-                        deriveChainFromInterval(
-                            orientedReadIds,
-                            norm.read0Start, norm.read0End,
-                            norm.read1Start, norm.read1End,
-                            directAlignment.ordinals);
+                        const span<const uint64_t> nativeChain =
+                            hifiasmImportedCigarStore.chainOf(*rec);
+                        if(!nativeChain.empty()) {
+                            mapNativeChainToOrdinals(
+                                orientedReadIds,
+                                rec->readIdQ, rec->readIdT, rec->isSameStrand,
+                                nativeChain, directAlignment.ordinals);
+                        }
+                        if(directAlignment.ordinals.empty()) {
+                            deriveChainFromInterval(
+                                orientedReadIds,
+                                norm.read0Start, norm.read0End,
+                                norm.read1Start, norm.read1End,
+                                directAlignment.ordinals);
+                        }
                     }
                 } else if(rec != nullptr) {
                     // Interval-only record: hifiasm supplied the candidate pair
@@ -433,16 +545,31 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                         uint32_t(reads->getRead(ReadId(rec->readIdQ)).baseCount);
                     const uint32_t tLen =
                         uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
-                    const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
-                        hifiasmImportedCigarStore.tokensOf(*rec),
-                        rec->readIdQ, rec->readIdT,
-                        rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
-                        qLen, tLen, rec->isSameStrand);
-                    deriveChainFromInterval(
-                        orientedReadIds,
-                        norm.read0Start, norm.read0End,
-                        norm.read1Start, norm.read1End,
-                        directAlignment.ordinals);
+                    // Prefer hifiasm's native dense chain (its own colinear-DP
+                    // anchors) when present: map anchor positions directly to
+                    // marker ordinals (no re-chaining). Fall back to deriving the
+                    // chain from the interval only when no native chain was
+                    // imported for this pair.
+                    const span<const uint64_t> nativeChain =
+                        hifiasmImportedCigarStore.chainOf(*rec);
+                    if(!nativeChain.empty()) {
+                        mapNativeChainToOrdinals(
+                            orientedReadIds,
+                            rec->readIdQ, rec->readIdT, rec->isSameStrand,
+                            nativeChain, directAlignment.ordinals);
+                    }
+                    if(directAlignment.ordinals.empty()) {
+                        const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
+                            hifiasmImportedCigarStore.tokensOf(*rec),
+                            rec->readIdQ, rec->readIdT,
+                            rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
+                            qLen, tLen, rec->isSameStrand);
+                        deriveChainFromInterval(
+                            orientedReadIds,
+                            norm.read0Start, norm.read0End,
+                            norm.read1Start, norm.read1End,
+                            directAlignment.ordinals);
+                    }
                 }
                 if(!usedHifiasmCigar) {
                     if(computeCigar) {

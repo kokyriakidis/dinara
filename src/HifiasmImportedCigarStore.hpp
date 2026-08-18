@@ -40,10 +40,17 @@ namespace dinara {
             uint32_t tStart = 0;
             uint32_t tEnd = 0;
             bool isSameStrand = true;
+            // Native dense chain anchors for this overlap (hifiasm's colinear-DP
+            // seeds), each packed (q_start<<32)|t_start in the query-forward /
+            // target-alignment-orientation frame. Slice into chainArena.
+            // chainCount == 0 when no native chain was imported for this pair.
+            uint64_t chainOffset = 0;
+            uint32_t chainCount = 0;
         };
 
         void clear() {
             arena.clear();
+            chainArena.clear();
             sameStrand.clear();
             reverseStrand.clear();
         }
@@ -52,6 +59,10 @@ namespace dinara {
             sameStrand.reserve(overlapCount);
             reverseStrand.reserve(overlapCount);
             arena.reserve(arenaTokens);
+        }
+
+        void reserveChain(size_t chainAnchors) {
+            chainArena.reserve(chainAnchors);
         }
 
         // Append one overlap's CIGAR (raw hifiasm tokens) and its metadata.
@@ -92,6 +103,20 @@ namespace dinara {
             (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
         }
 
+        // Attach the native chain anchors to an already-added record (same
+        // pairKey/strand). Copies the packed (q_start<<32)|t_start anchors into
+        // the chain arena. Not thread-safe; call from the single ingest thread.
+        void addChain(uint64_t pairKey, bool isSameStrand,
+                      span<const uint64_t> anchors) {
+            auto& m = isSameStrand ? sameStrand : reverseStrand;
+            auto it = m.find(pairKey);
+            if(it == m.end()) return;
+            it->second.chainOffset = chainArena.size();
+            it->second.chainCount = uint32_t(anchors.size());
+            for(size_t i = 0; i < anchors.size(); ++i)
+                chainArena.push_back(anchors[i]);
+        }
+
         // Look up the CIGAR record for a candidate. Returns nullptr if absent.
         const Record* find(uint64_t pairKey, bool isSameStrand) const {
             const auto& m = isSameStrand ? sameStrand : reverseStrand;
@@ -104,11 +129,18 @@ namespace dinara {
             return { arena.data() + rec.cigarOffset, rec.cigarTokenCount };
         }
 
+        // Native chain-anchor slice for a record (empty if none imported).
+        span<const uint64_t> chainOf(const Record& rec) const {
+            return { chainArena.data() + rec.chainOffset, rec.chainCount };
+        }
+
         bool empty() const { return sameStrand.empty() && reverseStrand.empty(); }
 
     private:
         // Flat token arena (native hifiasm frame).
         std::vector<CigarToken> arena;
+        // Flat native-chain anchor arena (packed (q_start<<32)|t_start).
+        std::vector<uint64_t> chainArena;
         std::unordered_map<uint64_t, Record> sameStrand;
         std::unordered_map<uint64_t, Record> reverseStrand;
     };
