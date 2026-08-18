@@ -2327,11 +2327,16 @@ void dinara::main::assemble(
     //   (anchors, journeys, minEdgeCoverage, threadCount) constructor.
     //
     // USE_JOURNEY_ANCHOR_GRAPH = 0 -> the window + het-bubble pipeline (the long
-    //   block guarded by #if !USE_JOURNEY_ANCHOR_GRAPH below).
+    //   block guarded by #if !USE_JOURNEY_ANCHOR_GRAPH below). This is the
+    //   DEFAULT: anchors are grouped into windows, inter-window edges are built,
+    //   and window-based cleanup (tip/short-segment removal) runs. Het-bubble
+    //   detection within this path stays independently gated off (see the
+    //   DINARA_ENABLE_HET_BUBBLES / DINARA_HET_ENGINE env vars below), so with
+    //   the defaults the window graph is backbone-only (0 het bubbles).
     //
     // Flip this to switch methods; the unused path is not built.
     // ========================================================================
-    #define USE_JOURNEY_ANCHOR_GRAPH 1
+    #define USE_JOURNEY_ANCHOR_GRAPH 0
 
     // Shared across both methods. In the journey path these stay empty: an empty
     // `anchorWindows` makes the assembly-graph stage fall back to length-only
