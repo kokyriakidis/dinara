@@ -313,6 +313,7 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
     const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
         size_t(alignOptions.minAlignedMarkerCount) : 0;
     const double maxErrorRate = alignOptions.maxErrorRate;
+    const bool computeCigar = alignOptions.computeBaseAlignmentCigar;
     const int64_t dpMatchScore = alignOptions.overlapDpMatchScore;
     const int64_t dpMismatchScore = alignOptions.overlapDpMismatchScore;
     const int64_t dpGapOpen1 = alignOptions.overlapDpGapOpen1;
@@ -444,12 +445,19 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                         directAlignment.ordinals);
                 }
                 if(!usedHifiasmCigar) {
-                    // No usable CIGAR: build the base alignment from the derived
-                    // marker chain (interval-only path) or, if no chain exists,
-                    // recompute from scratch. constructQuickRawSparse walks
-                    // directAlignment.ordinals; on the interval-only path this is
-                    // the chain from deriveChainFromInterval above.
-                    projectedAlignment.constructQuickRawSparse();
+                    if(computeCigar) {
+                        // Build the base alignment from the derived marker chain
+                        // (interval-only path). constructQuickRawSparse walks
+                        // directAlignment.ordinals; on the interval-only path
+                        // this is the chain from deriveChainFromInterval above.
+                        projectedAlignment.constructQuickRawSparse();
+                    } else {
+                        // Base alignment disabled (Align.computeBaseAlignmentCigar
+                        // false): keep only the marker-ordinal chain and its
+                        // span; no A*PA2, no CIGAR. Downstream graph construction
+                        // uses the ordinal chain, not the base CIGAR.
+                        projectedAlignment.constructChainOnly();
+                    }
                 }
             }
             if(collectProjectedTiming) {

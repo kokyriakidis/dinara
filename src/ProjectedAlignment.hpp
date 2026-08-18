@@ -173,6 +173,14 @@ public:
     void constructQuickRaw();
     void constructQuickRawSparse();
 
+    // Chain-only "construction": fill the alignment SPAN (cigarRead0/1Start/End
+    // from the first/last marker pair) and zero the base-level statistics
+    // WITHOUT running any base alignment (no A*PA2, no per-segment CIGAR, nothing
+    // pushed to cigarStore). Used when only the marker-ordinal chain is needed
+    // downstream and the base CIGAR would be wasted work. errorRate() is 0 here
+    // (totalEditDistance == 0), so the error-rate filter is a no-op on this path.
+    void constructChainOnly();
+
     // Fill the sparse diffs, statistics and CIGAR from a pre-computed hifiasm
     // CIGAR (already normalized into dinara's read0/read1 canonical frame),
     // clipped to the marker interval [read0Begin, read0End) on read0. This

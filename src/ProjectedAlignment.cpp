@@ -429,6 +429,44 @@ void ProjectedAlignment::constructQuickRawSparse()
 
 
 
+void ProjectedAlignment::constructChainOnly()
+{
+    // No base alignment: derive only the span from the chain endpoints and
+    // leave the base-level statistics at zero. Deliberately does NOT touch
+    // cigarStore (no beginAlignment / no tokens), so cigarOffset stays invalid
+    // and downstream CIGAR consumers see "no CIGAR" for this alignment.
+    sparseMismatches.clear();
+    sparseIndels.clear();
+
+    totalLength = {0, 0};
+    totalLengthRle = {0, 0};
+    totalEditDistance = 0;
+    totalEditDistanceRle = 0;
+    mismatchCount = 0;
+    mismatchCountRle = 0;
+    totalIndelBaseCount = 0;
+    totalGapEventCount = 0;
+    totalDpScore = 0;
+    hasLargeIndel = false;
+    cigarOffset = uint32_t(-1);
+    cigarTokenCount = 0;
+
+    // Span from the first/last aligned marker pair (oriented-read coordinates),
+    // identical to how constructQuickRawSparse records the boundary positions.
+    if(alignment.ordinals.size() >= 2) {
+        const auto lastIdx = alignment.ordinals.size() - 1;
+        cigarRead0Start = markers[0][alignment.ordinals[0][0]].position + kHalf;
+        cigarRead1Start = markers[1][alignment.ordinals[0][1]].position + kHalf;
+        cigarRead0End   = markers[0][alignment.ordinals[lastIdx][0]].position + kHalf;
+        cigarRead1End   = markers[1][alignment.ordinals[lastIdx][1]].position + kHalf;
+        // Span lengths, so errorRate() (edit/len0) stays well-defined (== 0).
+        totalLength[0] = cigarRead0End - cigarRead0Start;
+        totalLength[1] = cigarRead1End - cigarRead1Start;
+    }
+}
+
+
+
 bool ProjectedAlignment::constructFromHifiasmCigar(
     span<const CigarToken> normalizedTokens,
     uint32_t read0Anchor,

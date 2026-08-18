@@ -586,6 +586,17 @@ void AssemblerOptions::addConfigurableOptions()
         "Maximum overlap error rate (edit distance / query length). "
         "Matches hifiasm's max_ov_diff_ec (0.07 for ONT, 0.04 for HiFi).")
 
+        ("Align.computeBaseAlignmentCigar",
+        value<bool>(&alignOptions.computeBaseAlignmentCigar)->
+        default_value(false),
+        "If true, compute and store a base-level A*PA2 CIGAR per overlap and "
+        "derive base statistics (edit distance, mismatches, indels, error "
+        "rate). If false (default), skip base alignment: keep only the "
+        "marker-ordinal chain and its span. Downstream graph construction reads "
+        "the ordinal chain, not the CIGAR, so this is wasted work unless a "
+        "CIGAR-based consumer (phasing/MSA) is enabled. The error-rate filter "
+        "is inactive when this is false.")
+
         ("Align.overlapDp.matchScore",
         value<int64_t>(&alignOptions.overlapDpMatchScore)->
         default_value(2),
@@ -1539,6 +1550,8 @@ void AlignOptions::write(ostream& s) const
     s << "minAlignedMarkerCount = " << minAlignedMarkerCount << "\n";
     s << "minAlignedFraction = " << minAlignedFraction << "\n";
     s << "maxErrorRate = " << maxErrorRate << "\n";
+    s << "computeBaseAlignmentCigar = " <<
+        convertBoolToPythonString(computeBaseAlignmentCigar) << "\n";
     s << "overlapDp.matchScore = " << overlapDpMatchScore << "\n";
     s << "overlapDp.mismatchScore = " << overlapDpMismatchScore << "\n";
     s << "overlapDp.gapOpen1 = " << overlapDpGapOpen1 << "\n";

@@ -304,6 +304,16 @@ public:
     bool suppressContainments;
     double maxErrorRate;
 
+    // When true, compute a base-level alignment (per-segment A*PA2 CIGAR) for
+    // each overlap and store it, deriving base statistics (edit distance,
+    // mismatches, indels, error rate). When false (default), skip base
+    // alignment entirely: only the marker-ordinal chain and its span are kept.
+    // Downstream marker/read-graph construction reads the ordinal chain, not the
+    // base CIGAR, so the CIGAR is wasted work unless a base-level consumer (e.g.
+    // CIGAR-based phasing/MSA) is enabled. The A*PA2 implementation is retained;
+    // this flag only gates whether it runs.
+    bool computeBaseAlignmentCigar = false;
+
     // Overlap/base DP scoring parameters (used to compute AlignmentInfo::dpScore from a base-level CIGAR).
     // These should be configured to match hifiasm's overlap-alignment scoring model.
     // Current hifiasm overlap scoring is single-affine: gapCost(k) = O1 + k*E1.
