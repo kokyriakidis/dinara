@@ -37,7 +37,6 @@
 // hifiasm candidate-overlap detector (submodule). C API used to generate read
 // overlaps (with aligned intervals and CIGARs) directly in memory.
 #include "hifiasm_overlaps.h"
-#include "fakechain_bridge.h"
 
 
 using namespace dinara;
@@ -1518,10 +1517,21 @@ struct MarkerSelectionConfig {
         c.useHifiasm = k.useHifiasmMinimizers;
         c.encodeK    = k.k;
         c.sampleDist = k.hifiasmMarkerSampleDist;
-        // Position selection is pinned to hifiasm's tuned overlap-path k/w so
-        // marker seeds match overlap seeds (see struct comment).
-        c.selectK    = HIFIASM_OVLP_K;
-        c.selectW    = HIFIASM_OVLP_W;
+        // Position selection is pinned to dinara's encoding k (selectK ==
+        // encodeK), so each marker is the FULL canonical minimizer, not a
+        // non-centered sub-window of a longer selection k-mer. This matters for
+        // strand symmetry: with selectK > encodeK the encoded k-mer is the
+        // PREFIX of the selection k-mer on the forward strand, which is the
+        // SUFFIX on the reverse strand, so a marker and its reverse-complement
+        // describe different k-mers and reverse-strand overlaps fail to share
+        // any KmerId (measured: ~70% of RC candidates dropped). With
+        // selectK == encodeK, RC(marker) is exactly the same k-mer on the other
+        // strand. dinara re-chains inside each hifiasm interval with its own DP
+        // (deriveChainFromInterval), so marker seeds no longer need to match
+        // hifiasm's internal 51-mer overlap seeds; only the candidate pairs and
+        // intervals come from hifiasm, and those are independent of this k.
+        c.selectK    = c.encodeK;
+        c.selectW    = c.encodeK;
         // The filter needs a read source (in-memory store or input files).
         c.useFilter  = c.useHifiasm && (storeUsable || haveInputFiles);
 
@@ -1578,13 +1588,10 @@ struct MarkerSelectionConfig {
 // source is hifiasm when Kmers.useHifiasmMinimizers is true, otherwise
 // simd-minimizers. The legacy method runs only when neither SIMD flag selects
 // the SIMD path.
-enum class MarkerSource { MyloasmMarkers, HifiasmMinimizers, SimdMinimizers, LegacyKmer };
+enum class MarkerSource { HifiasmMinimizers, SimdMinimizers, LegacyKmer };
 
 inline MarkerSource resolveMarkerSource(const KmersOptions& k)
 {
-    // myloasm markers (open syncmers + SNPmers) take precedence: when set, they
-    // are the position source regardless of the minimizer flags.
-    if(k.useMyloasmMarkers) return MarkerSource::MyloasmMarkers;
     const bool simdPath = k.useHifiasmMinimizers || k.useSimdMinimizers;
     if(!simdPath) return MarkerSource::LegacyKmer;
     return k.useHifiasmMinimizers
@@ -1770,14 +1777,7 @@ void dinara::main::assemble(
     std::unique_ptr<HifiasmReadStore> hifiasmStore;
     const bool hifiasmStoreUsable =
         (assemblerOptions.readsOptions.representation == 0) &&
-        (assembler.getReads().readCount() > 0) &&
-        // The myloasm path never uses the hifiasm store: findMarkersMyloasm and
-        // the fakechain overlap bridge both read the input files directly, and
-        // the bridge internally resets/repopulates hifiasm's process-global
-        // R_INF (reset_read_store). Loading our own store here would be leaked by
-        // that reset and then double-freed by ~HifiasmReadStore at scope exit
-        // (destory_All_reads on a store the bridge already replaced).
-        !assemblerOptions.kmersOptions.useMyloasmMarkers;
+        (assembler.getReads().readCount() > 0);
     if(hifiasmStoreUsable) {
         performanceLog << timestamp
             << "Loading " << assembler.getReads().readCount()
@@ -1789,140 +1789,114 @@ void dinara::main::assemble(
 
     // Marker generation method selection.
     //
-    // Kmers.useMyloasmMarkers defaults to true, so by default markers come from
-    // myloasm's open syncmers + SNPmers and overlaps are produced by the hybrid
-    // path: hifiasm (HPC) enumerates candidate read pairs + intervals, then
-    // myloasm's open syncmers + SNPmers are matched and chained (myloasm DP)
-    // inside each interval (fakechain bridge; see the overlap block below). Open
-    // syncmers give context-free, error-robust seeds (a shared k-mer yields a
-    // shared seed regardless of neighbouring context), which is why myloasm
-    // chaining is preferred over hifiasm base alignment. useMyloasmMarkers takes
-    // precedence over Kmers.useHifiasmMinimizers / Kmers.useSimdMinimizers; set
-    // it to false to fall back to the hifiasm/SIMD minimizer + hifiasm overlap
-    // path. The source is resolved once into an explicit enum; see
-    // resolveMarkerSource / MarkerSource for the precedence rules.
+    // Markers come from hifiasm's no-HPC minimizer sketcher (default) or the
+    // simd-minimizers library, selected by Kmers.useHifiasmMinimizers /
+    // Kmers.useSimdMinimizers; with both off the legacy k-mer method is used.
+    // Overlaps always come from hifiasm: it enumerates candidate read pairs +
+    // intervals, and dinara re-derives each overlap's marker chain inside that
+    // interval (interval-only import; see the overlap block below). The source
+    // is resolved once into an explicit enum; see resolveMarkerSource /
+    // MarkerSource for the precedence rules.
     const MarkerSource markerSource =
         resolveMarkerSource(assemblerOptions.kmersOptions);
     if(markerSource != MarkerSource::LegacyKmer) {
         // The hifiasm overlap-path filter handle (simd/hifiasm paths only) and
         // whether it was applied. Declared here so the shared post-processing
         // tail (histogram, frequency filter, cleanup) works for every source,
-        // including the myloasm path where no such filter exists.
+        // including the legacy k-mer path where no such filter exists.
         hifiasm_filter_t* hifiasmMarkerFilter = nullptr;
         bool hifiasmMarkerFilterApplied = false;
 
-        if(markerSource == MarkerSource::MyloasmMarkers) {
-            // myloasm open syncmers + SNPmers as the position source. On this
-            // path overlaps also come from myloasm markers: the fakechain bridge
-            // (see the overlap block below) uses hifiasm only to enumerate raw
-            // candidate read pairs, then matches + chains myloasm markers with
-            // myloasm's own DP. No hifiasm minimizer filter is built or applied,
-            // so the shared frequency filter (applyKmerCountFilter) below runs
-            // normally.
-            //
-            // The marker/anchor index is encoded at k=20 (myloasm's marker k=21
-            // clipped). findMarkersMyloasm sets assemblerInfo->k = 20. Every
-            // downstream consumer -- the KmerChecker, MarkerKmers
-            // (createMarkerKmers), mode3 Anchors, and extractKmer -- reads
-            // assemblerInfo->k, so it must STAY 20. createKmerChecker below
-            // resets it to kmersOptions.k (default 50); we re-pin it to 20 right
-            // after that block (see myloasmEncodeK re-pin). Leaving it at 50
-            // makes MarkerKmers extract 50-mers at positions only valid for k=20
-            // (position + 50 > baseCount assertion). hifiasm overlap detection is
-            // unaffected (separate k=51 HPC path that never reads this value).
-            assembler.findMarkersMyloasm(threadCount, inputFileNames);
-        } else {
-            // Resolve and validate the marker-selection configuration once, up
-            // front. This centralizes the two k-mer roles (select vs encode) and
-            // the two filtering stages (high-occurrence filter + distance
-            // subsampling), and turns previously-silent misconfigurations (encode
-            // k > select k, sampleDist <= window, or no read source for the filter)
-            // into explicit failures. See MarkerSelectionConfig.
-            const MarkerSelectionConfig markerCfg = MarkerSelectionConfig::resolve(
-                assemblerOptions.kmersOptions, useHifiasmStore,
-                !inputFileNames.empty());
+        // Resolve and validate the marker-selection configuration once, up
+        // front. This centralizes the two k-mer roles (select vs encode) and
+        // the two filtering stages (high-occurrence filter + distance
+        // subsampling), and turns previously-silent misconfigurations (encode
+        // k > select k, sampleDist <= window, or no read source for the filter)
+        // into explicit failures. See MarkerSelectionConfig.
+        const MarkerSelectionConfig markerCfg = MarkerSelectionConfig::resolve(
+            assemblerOptions.kmersOptions, useHifiasmStore,
+            !inputFileNames.empty());
 
-            // Build hifiasm's overlap-path minimizer filter (no-HPC high-occurrence
-            // k-mer filter). Built once and shared read-only across all marker
-            // threads; the handle is a standalone hash of k-mer values (no read
-            // store), so it is safe to share and outlives this call until destroyed
-            // below. The filter is keyed by (k, w): the filtered sketch looks up
-            // each minimizer's hash in it, so it MUST be built at the SELECTION k/w
-            // (markerCfg.selectK/W), not dinara's encoding k. When the filter is
-            // applied, the redundant downstream marker frequency prune
-            // (applyKmerCountFilter) is skipped so the marker set is exactly the
-            // filter + subsampling sketch output (parity with the overlap path).
-            if(markerCfg.useFilter) {
-                hifiasm_filter_opt_t filterOpt = {};
-                filterOpt.threads = int(threadCount);
-                filterOpt.k_mer_length = markerCfg.selectK; // match the selection sketch
-                filterOpt.mz_win = markerCfg.selectW;       // w
-                filterOpt.is_hpc = 0;        // dinara markers are no-HPC
-                filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
+        // Build hifiasm's overlap-path minimizer filter (no-HPC high-occurrence
+        // k-mer filter). Built once and shared read-only across all marker
+        // threads; the handle is a standalone hash of k-mer values (no read
+        // store), so it is safe to share and outlives this call until destroyed
+        // below. The filter is keyed by (k, w): the filtered sketch looks up
+        // each minimizer's hash in it, so it MUST be built at the SELECTION k/w
+        // (markerCfg.selectK/W), not dinara's encoding k. When the filter is
+        // applied, the redundant downstream marker frequency prune
+        // (applyKmerCountFilter) is skipped so the marker set is exactly the
+        // filter + subsampling sketch output (parity with the overlap path).
+        if(markerCfg.useFilter) {
+            hifiasm_filter_opt_t filterOpt = {};
+            filterOpt.threads = int(threadCount);
+            filterOpt.k_mer_length = markerCfg.selectK; // match the selection sketch
+            filterOpt.mz_win = markerCfg.selectW;       // w
+            filterOpt.is_hpc = 0;        // dinara markers are no-HPC
+            filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
 
-                if(useHifiasmStore) {
-                    performanceLog << timestamp
-                        << "Building hifiasm overlap-path minimizer filter (no-HPC, "
-                        << "k=" << markerCfg.selectK << ", w=" << markerCfg.selectW
-                        << ") from in-memory read store." << endl;
-                    hifiasmMarkerFilter = hifiasm_build_filter_from_store(&filterOpt);
-                } else {
-                    performanceLog << timestamp
-                        << "Building hifiasm overlap-path minimizer filter (no-HPC, "
-                        << "k=" << markerCfg.selectK << ", w=" << markerCfg.selectW
-                        << ") over " << inputFileNames.size() << " input file(s)."
-                        << endl;
-
-                    vector<const char*> markerReadFiles;
-                    markerReadFiles.reserve(inputFileNames.size());
-                    for(const string& f: inputFileNames) {
-                        markerReadFiles.push_back(f.c_str());
-                    }
-                    hifiasmMarkerFilter = hifiasm_build_filter(
-                        markerReadFiles.data(), int(markerReadFiles.size()),
-                        &filterOpt);
-                }
-                if(hifiasmMarkerFilter == nullptr) {
-                    throw runtime_error(
-                        "Failed to build hifiasm minimizer filter for markers.");
-                }
+            if(useHifiasmStore) {
                 performanceLog << timestamp
-                    << "hifiasm minimizer filter built." << endl;
-            }
+                    << "Building hifiasm overlap-path minimizer filter (no-HPC, "
+                    << "k=" << markerCfg.selectK << ", w=" << markerCfg.selectW
+                    << ") from in-memory read store." << endl;
+                hifiasmMarkerFilter = hifiasm_build_filter_from_store(&filterOpt);
+            } else {
+                performanceLog << timestamp
+                    << "Building hifiasm overlap-path minimizer filter (no-HPC, "
+                    << "k=" << markerCfg.selectK << ", w=" << markerCfg.selectW
+                    << ") over " << inputFileNames.size() << " input file(s)."
+                    << endl;
 
-            // Sanity: on the hifiasm path resolve() guarantees a filter, so a null
-            // handle here means the invariant was violated. Fail loudly rather than
-            // silently sketching unfiltered markers.
-            if(markerCfg.useHifiasm && hifiasmMarkerFilter == nullptr) {
+                vector<const char*> markerReadFiles;
+                markerReadFiles.reserve(inputFileNames.size());
+                for(const string& f: inputFileNames) {
+                    markerReadFiles.push_back(f.c_str());
+                }
+                hifiasmMarkerFilter = hifiasm_build_filter(
+                    markerReadFiles.data(), int(markerReadFiles.size()),
+                    &filterOpt);
+            }
+            if(hifiasmMarkerFilter == nullptr) {
                 throw runtime_error(
-                    "Internal error: hifiasm marker path active but no "
-                    "overlap-path filter was built (would produce unfiltered "
-                    "markers).");
+                    "Failed to build hifiasm minimizer filter for markers.");
             }
-
             performanceLog << timestamp
-                << "Marker selection: source="
-                << (markerCfg.useHifiasm ? "hifiasm-minimizers" : "simd-minimizers")
-                << ", selectK=" << markerCfg.selectK
-                << ", selectW=" << markerCfg.selectW
-                << ", encodeK=" << markerCfg.encodeK
-                << ", sampleDist=" << markerCfg.sampleDist
-                << ", filter=" << (hifiasmMarkerFilter ? "on" : "off")
-                << "." << endl;
-
-            assembler.findMarkersSimdMinimizers(
-                threadCount,
-                markerCfg.encodeK,  // marker-encoding k (dinara indexes this)
-                markerCfg.encodeK,  // marker-encoding w
-                markerCfg.useHifiasm,
-                hifiasmMarkerFilter,
-                markerCfg.sampleDist,
-                markerCfg.selectK,   // hifiasm position-selection k (tuned)
-                markerCfg.selectW);  // hifiasm position-selection w (tuned)
-
-            // Whether the overlap-path filter was actually applied to the markers.
-            hifiasmMarkerFilterApplied = (hifiasmMarkerFilter != nullptr);
+                << "hifiasm minimizer filter built." << endl;
         }
+
+        // Sanity: on the hifiasm path resolve() guarantees a filter, so a null
+        // handle here means the invariant was violated. Fail loudly rather than
+        // silently sketching unfiltered markers.
+        if(markerCfg.useHifiasm && hifiasmMarkerFilter == nullptr) {
+            throw runtime_error(
+                "Internal error: hifiasm marker path active but no "
+                "overlap-path filter was built (would produce unfiltered "
+                "markers).");
+        }
+
+        performanceLog << timestamp
+            << "Marker selection: source="
+            << (markerCfg.useHifiasm ? "hifiasm-minimizers" : "simd-minimizers")
+            << ", selectK=" << markerCfg.selectK
+            << ", selectW=" << markerCfg.selectW
+            << ", encodeK=" << markerCfg.encodeK
+            << ", sampleDist=" << markerCfg.sampleDist
+            << ", filter=" << (hifiasmMarkerFilter ? "on" : "off")
+            << "." << endl;
+
+        assembler.findMarkersSimdMinimizers(
+            threadCount,
+            markerCfg.encodeK,  // marker-encoding k (dinara indexes this)
+            markerCfg.encodeK,  // marker-encoding w
+            markerCfg.useHifiasm,
+            hifiasmMarkerFilter,
+            markerCfg.sampleDist,
+            markerCfg.selectK,   // hifiasm position-selection k (tuned)
+            markerCfg.selectW);  // hifiasm position-selection w (tuned)
+
+        // Whether the overlap-path filter was actually applied to the markers.
+        hifiasmMarkerFilterApplied = (hifiasmMarkerFilter != nullptr);
 
         // Compute histogram using the pre-calculated KmerIds. Still needed even
         // when the hf filter is active: it fills coverageHet/coverageHom, which
@@ -1973,17 +1947,8 @@ void dinara::main::assemble(
         // marker or marker-graph vertex. The function rebuilds both markers and
         // markerKmerIds from the pre-filtered arrays, preserving only marker
         // positions whose matching k-mer id passes.
-        // The repeat and low-complexity predicates are calibrated for dinara's
-        // default marker k (~50): filterLowComplexity requires >= 24 distinct
-        // 3-mers in a k-mer. The myloasm path encodes markers at k=20, which has
-        // at most 20-3+1 = 18 distinct 3-mers, so EVERY k=20 marker would be
-        // rejected as low-complexity (observed: 0 / N markers kept), leaving an
-        // empty assembly graph. Disable both k~50-tuned predicates on the
-        // myloasm path; the frequency prune [minFreq, maxFreq] and palindrome
-        // filter still apply.
-        const bool onMyloasmPath = (markerSource == MarkerSource::MyloasmMarkers);
-        const bool filterRepeatKmers = !onMyloasmPath;
-        const bool filterLowComplexity = !onMyloasmPath;
+        const bool filterRepeatKmers = true;
+        const bool filterLowComplexity = true;
         if(hifiasmMarkerFilterApplied) {
             // The hifiasm overlap-path filter (high-occurrence k-mer filter +
             // distance subsampling) already selected the markers, exactly as
@@ -2030,23 +1995,6 @@ void dinara::main::assemble(
         assembler.countKmersFromMarkerKmerIds(threadCount);
     }
 
-    // On the myloasm path the marker/anchor index is encoded at k=20, but
-    // createKmerChecker (called in both branches above) reset assemblerInfo->k to
-    // kmersOptions.k (default 50). Re-pin it to 20 so MarkerKmers, mode3 Anchors
-    // and extractKmer all use the length the markers were placed for; otherwise
-    // MarkerKmers extracts 50-mers at positions only valid for k=20 and trips
-    // the "position + length <= baseCount" assertion. hifiasm's k=51 HPC overlap
-    // detection is a separate path and is unaffected.
-    if(markerSource == MarkerSource::MyloasmMarkers) {
-        constexpr uint64_t myloasmEncodeK = 20;
-        if(assembler.assemblerInfo->k != myloasmEncodeK) {
-            cout << timestamp << "Kmers.useMyloasmMarkers: pinning marker k="
-                << myloasmEncodeK << " (was " << assembler.assemblerInfo->k
-                << " after KmerChecker) for MarkerKmers/anchors." << endl;
-            assembler.assemblerInfo->k = myloasmEncodeK;
-        }
-    }
-
     // Filter reads whose marker span covers less than the threshold fraction
     // of the read length. Reads with sparse markers contribute noise.
     if(assemblerOptions.kmersOptions.minMarkerSpanFraction > 0.0) {
@@ -2087,211 +2035,71 @@ void dinara::main::assemble(
             "(or a loaded read store).");
     }
 
-    if(markerSource == MarkerSource::MyloasmMarkers) {
-        // Hybrid overlap path (Kmers.useMyloasmMarkers): hifiasm finds candidate
-        // pairs, myloasm chains inside each interval.
-        //
-        // fakechain_bridge_overlaps runs the two-pass pipeline:
-        //   1. hifiasm (HPC k=51) enumerates RAW candidate read pairs +
-        //      intervals only (raw_candidates=1, no base-level alignment/filter).
-        //   2. myloasm indexes every read with open syncmers + SNPmers (k=21).
-        //   3. For each candidate pair, fakechain_pair() clips markers to the
-        //      hifiasm interval, matches them (canonical key equality) and CHAINS
-        //      them with myloasm's own DP. The chained anchors' bounding interval
-        //      is what we hand to dinara.
-        // So hifiasm supplies the candidate pairs/intervals and myloasm's
-        // syncmer+SNPmer chaining runs inside them -- neither hifiasm base
-        // alignment nor myloasm's all-vs-all overlapper is used here.
-        //
-        // Each fakechain_overlap_t is translated to an interval-only
-        // hifiasm_overlap_t (cigar_len=0, cigar=nullptr) so the existing importer
-        // (importAlignmentCandidatesFromMemory) and downstream
-        // deriveChainFromInterval consume it unchanged.
-        if(inputFileNames.empty()) {
-            throw runtime_error(
-                "The myloasm overlap path requires at least one --input read "
-                "file (myloasm re-reads the inputs; the read store path is not "
-                "supported here).");
-        }
+    hifiasm_ovlp_opt_t hifiOpt = {};
+    hifiOpt.threads = int(threadCount);
+    // Raw candidates: skip hifiasm's base-level alignment pass (no CIGAR
+    // computed). dinara re-derives each overlap's chain from its own markers in
+    // the interval, so hifiasm's CIGAR is unused; computing it is wasted work.
+    // Coordinates stay in raw read space. See OverlapCandidates.hifiasmRawCandidates.
+    const bool rawCandidates =
+        assemblerOptions.overlapCandidatesOptions.hifiasmRawCandidates;
+    hifiOpt.raw_candidates = rawCandidates ? 1 : 0;
+
+    hifiasm_overlap_t* ov = nullptr;
+    uint64_t nOv = 0;
+    char* names = nullptr;
+    uint64_t* nameOff = nullptr;
+    uint64_t nReads = 0;
+    uint16_t* cigar = nullptr;
+    uint64_t cigarLen = 0;
+    // On the raw-candidate path hifiasm computes no CIGAR, so request none
+    // (NULL out-params); dinara discards the CIGAR regardless.
+    uint16_t** cigarOut = rawCandidates ? nullptr : &cigar;
+    uint64_t* cigarLenOut = rawCandidates ? nullptr : &cigarLen;
+    int rc;
+    if(useHifiasmStore) {
+        performanceLog << timestamp
+            << "Generating overlaps with hifiasm (in memory) from the "
+            << "loaded read store" << (rawCandidates ? " (raw candidates, no "
+               "base alignment)." : ".") << endl;
+        rc = hifiasm_detect_overlaps_from_store(
+            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, cigarOut, cigarLenOut);
+    } else {
+        performanceLog << timestamp
+            << "Generating overlaps with hifiasm (in memory) from "
+            << inputFileNames.size() << " input file(s)"
+            << (rawCandidates ? " (raw candidates, no base alignment)." : ".")
+            << endl;
 
         vector<const char*> readFiles;
         readFiles.reserve(inputFileNames.size());
         for(const string& f: inputFileNames) {
             readFiles.push_back(f.c_str());
         }
-
-        fakechain_bridge_opt_t fcOpt;
-        fakechain_bridge_opt_init(&fcOpt);
-        fcOpt.ovlp.threads = int(threadCount);
-        // Require both chain spans to reach this many RAW read bases before a
-        // candidate becomes a dinara overlap. Enforced in the bridge on the
-        // fakechain result (raw coordinates), so short overlaps never enter the
-        // importer.
-        fcOpt.min_overlap_len = 1000;
-
-        fakechain_overlap_t* fcOv = nullptr;
-        uint64_t nFcOv = 0;
-        char* names = nullptr;
-        uint64_t* nameOff = nullptr;
-        uint64_t nReads = 0;
-        performanceLog << timestamp
-            << "Generating overlaps with the hybrid path: hifiasm candidate "
-            << "pairs (HPC), chained by myloasm syncmers + SNPmers from "
-            << inputFileNames.size() << " input file(s)." << endl;
-        cout << timestamp
-            << "Generating overlaps with the hybrid path: hifiasm candidate "
-            << "pairs (HPC), chained by myloasm syncmers + SNPmers from "
-            << inputFileNames.size() << " input file(s)." << endl;
-        const int rc = fakechain_bridge_overlaps(
-            readFiles.data(), int(readFiles.size()), &fcOpt,
-            &fcOv, &nFcOv,
-            /*out_anchors*/ nullptr, /*out_n_anchors*/ nullptr,
-            &names, &nameOff, &nReads);
-        if(rc != 0) {
-            fakechain_bridge_free(fcOv, nullptr, names, nameOff);
-            throw runtime_error(
-                "hybrid (hifiasm candidates + myloasm chaining) overlap "
-                "detection failed (code " + to_string(rc) + ").");
-        }
-
-        // Dovetail gate (ported from myloasm's dovetail_possibility). A chained
-        // overlap is only useful for assembly if it could be a dovetail or a
-        // containment: the chain must reach within kDovetailHang RAW bases of an
-        // END of EACH read. myloasm tests every anchor for end-proximity on both
-        // reads; because the chain endpoints (f.q_start/q_end, f.t_start/t_end)
-        // are the extreme anchor positions, that per-anchor test reduces exactly
-        // to "either end of the chain is near either end of the read", evaluated
-        // per read. Overlaps that sit interior to both reads (internal matches,
-        // usually repeats) are dropped here so they never become candidates.
-        // 0 disables the gate; myloasm's native value is OVERLAP_HANG_LENGTH=350.
-        constexpr uint32_t kDovetailHang = 350;
-
-        // Resolve each hifiasm read id -> raw (non-HPC) read length once, via the
-        // hifiasm name table -> dinara ReadId (same resolution the importer uses).
-        // Raw length matches the fakechain positions' coordinate frame.
-        const Reads& fcReads = assembler.getReads();
-        vector<uint32_t> hifiRawLen(nReads, 0);
-        for(uint64_t i = 0; i < nReads; i++) {
-            const uint64_t b = nameOff[i];
-            const uint64_t e = nameOff[i + 1];
-            const ReadId rid =
-                fcReads.getReadId(span<const char>(names + b, size_t(e - b)));
-            if(rid != invalidReadId)
-                hifiRawLen[i] = uint32_t(fcReads.getReadRawSequenceLength(rid));
-        }
-
-        // True if [start,end) reaches within `hang` bases of either end of a
-        // read of length `len` (i.e. the chain could extend off that end).
-        auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
-                          uint32_t hang) -> bool {
-            return start < hang || (len > 0 && end + hang > len);
-        };
-
-        // Translate fakechain overlaps to interval-only hifiasm_overlap_t.
-        // block_len drives the importer's floor filter (>= 200) and its
-        // keep-longest dedup; use the larger of the query/target chain spans as
-        // a proxy for aligned length. No CIGAR is produced (cigar_len = 0), so
-        // downstream computeBaseAlignmentsAndStore derives the marker chain from
-        // this interval (deriveChainFromInterval) or, failing that, recomputes
-        // with A*PA2.
-        vector<hifiasm_overlap_t> ov;
-        ov.reserve(nFcOv);
-        uint64_t droppedNonDovetail = 0;
-        for(uint64_t i = 0; i < nFcOv; i++) {
-            const fakechain_overlap_t& f = fcOv[i];
-            const uint32_t qSpan = (f.q_end > f.q_start) ? (f.q_end - f.q_start) : 0;
-            const uint32_t tSpan = (f.t_end > f.t_start) ? (f.t_end - f.t_start) : 0;
-
-            // Dovetail gate: require end-proximity on BOTH reads. Skip when a
-            // read length is unknown (0) so a name-resolution miss never
-            // silently drops a real overlap.
-            if(kDovetailHang > 0 &&
-               f.q_id < nReads && f.t_id < nReads &&
-               hifiRawLen[f.q_id] > 0 && hifiRawLen[f.t_id] > 0) {
-                const bool qNear =
-                    nearEnd(f.q_start, f.q_end, hifiRawLen[f.q_id], kDovetailHang);
-                const bool tNear =
-                    nearEnd(f.t_start, f.t_end, hifiRawLen[f.t_id], kDovetailHang);
-                if(!(qNear && tNear)) {
-                    ++droppedNonDovetail;
-                    continue;
-                }
-            }
-
-            hifiasm_overlap_t o = {};
-            o.q_id = f.q_id;
-            o.t_id = f.t_id;
-            o.q_start = f.q_start;
-            o.q_end = f.q_end;
-            o.t_start = f.t_start;
-            o.t_end = f.t_end;
-            o.n_match = f.n_anchor;
-            o.block_len = std::max(qSpan, tSpan);
-            o.is_same_strand = f.is_same_strand;
-            o.cigar_offset = 0;
-            o.cigar_len = 0;
-            o.cigar_t_start = 0;
-            ov.push_back(o);
-        }
-
-        performanceLog << timestamp << "hybrid path produced " << nFcOv
-            << " overlaps over " << nReads << " reads (hifiasm candidates + "
-            << "myloasm chaining); dovetail gate dropped " << droppedNonDovetail
-            << " non-dovetail/internal overlaps, " << ov.size() << " kept." << endl;
-        cout << timestamp << "hybrid path produced " << nFcOv
-            << " overlaps over " << nReads << " reads (hifiasm candidates + "
-            << "myloasm chaining); dovetail gate dropped " << droppedNonDovetail
-            << " non-dovetail/internal overlaps, " << ov.size() << " kept." << endl;
-
-        assembler.importAlignmentCandidatesFromMemory(
-            ov.data(), ov.size(), names, nameOff, nReads,
-            /*cigar*/ nullptr, /*cigarLen*/ 0, threadCount);
-        fakechain_bridge_free(fcOv, nullptr, names, nameOff);
-
-    } else {
-        hifiasm_ovlp_opt_t hifiOpt = {};
-        hifiOpt.threads = int(threadCount);
-
-        hifiasm_overlap_t* ov = nullptr;
-        uint64_t nOv = 0;
-        char* names = nullptr;
-        uint64_t* nameOff = nullptr;
-        uint64_t nReads = 0;
-        uint16_t* cigar = nullptr;
-        uint64_t cigarLen = 0;
-        int rc;
-        if(useHifiasmStore) {
-            performanceLog << timestamp
-                << "Generating overlaps with hifiasm (in memory) from the "
-                << "loaded read store." << endl;
-            rc = hifiasm_detect_overlaps_from_store(
-                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, &cigar, &cigarLen);
-        } else {
-            performanceLog << timestamp
-                << "Generating overlaps with hifiasm (in memory) from "
-                << inputFileNames.size() << " input file(s)." << endl;
-
-            vector<const char*> readFiles;
-            readFiles.reserve(inputFileNames.size());
-            for(const string& f: inputFileNames) {
-                readFiles.push_back(f.c_str());
-            }
-            rc = hifiasm_detect_overlaps_mem(
-                readFiles.data(), int(readFiles.size()),
-                &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, &cigar, &cigarLen);
-        }
-        if(rc != 0) {
-            hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
-            throw runtime_error("hifiasm in-memory overlap detection failed (code "
-                + to_string(rc) + ").");
-        }
-        performanceLog << timestamp << "hifiasm produced " << nOv
-            << " overlaps over " << nReads << " reads (in memory)." << endl;
-
-        assembler.importAlignmentCandidatesFromMemory(
-            ov, nOv, names, nameOff, nReads, cigar, cigarLen, threadCount);
-        hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
+        rc = hifiasm_detect_overlaps_mem(
+            readFiles.data(), int(readFiles.size()),
+            &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads, cigarOut, cigarLenOut);
     }
+    if(rc != 0) {
+        hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
+        throw runtime_error("hifiasm in-memory overlap detection failed (code "
+            + to_string(rc) + ").");
+    }
+    performanceLog << timestamp << "hifiasm produced " << nOv
+        << " overlaps over " << nReads << " reads (in memory)." << endl;
+
+    // Interval-only import: hifiasm supplies the candidate PAIRS and their
+    // query/target INTERVALS, but we DISCARD hifiasm's base CIGAR (pass
+    // nullptr/0). dinara re-derives each overlap's marker chain from its own
+    // non-HPC minimizer markers inside that interval box
+    // (deriveChainFromInterval in computeBaseAlignmentsAndStore), then builds
+    // the per-segment CIGAR with A*PA2. This keeps hifiasm as the sole source
+    // of candidate pairs + intervals while the chain stays confined to the
+    // interval, with no dependency on hifiasm's own base alignment.
+    assembler.importAlignmentCandidatesFromMemory(
+        ov, nOv, names, nameOff, nReads,
+        /*cigar*/ nullptr, /*cigarLen*/ 0, threadCount);
+    hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
 
     // Compute base-level pairwise alignments for all overlaps and store
     // the resulting CIGARs. These are used downstream for CIGAR-based
@@ -2642,20 +2450,16 @@ void dinara::main::assemble(
     //         own fast aligner) sparse-evidence pinning -- see
     //         projAlnDetectHetBubblesAllWindows, AssemblerWindowProjectedAlignmentLeafSnarls.cpp.
     {
-        // Het-bubble detection DISABLED by default. Overlap anchors are now
-        // produced upstream from myloasm SNPmers (open syncmers + SNPmers via
-        // the hifiasm second-pass / fakechain path), so dinara no longer needs
-        // to detect het bubbles here and append its own het anchors. Skipping
-        // this leaves every window's hetBubbles empty, which the downstream
-        // plan/append/stage passes already no-op on (see the empty-list guards),
-        // yielding a backbone-only anchor graph with zero het anchors.
+        // Het-bubble detection DISABLED by default. Skipping it leaves every
+        // window's hetBubbles empty, which the downstream plan/append/stage
+        // passes already no-op on (see the empty-list guards), yielding a
+        // backbone-only anchor graph with zero het anchors.
         //
         // Re-enable for experiments by setting DINARA_ENABLE_HET_BUBBLES=1.
         const bool hetBubblesEnabled = (getenv("DINARA_ENABLE_HET_BUBBLES") != nullptr);
         if(!hetBubblesEnabled) {
-            cout << timestamp << "Het-bubble detection disabled "
-                    "(anchors come from myloasm SNPmers); leaving hetBubbles "
-                    "empty for " << anchorWindows.size()
+            cout << timestamp << "Het-bubble detection disabled; leaving "
+                    "hetBubbles empty for " << anchorWindows.size()
                  << " windows. Set DINARA_ENABLE_HET_BUBBLES=1 to re-enable."
                  << endl;
         }

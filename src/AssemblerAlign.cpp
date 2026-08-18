@@ -311,6 +311,26 @@ void Assembler::importAlignmentCandidatesFromMemory(
         hifiToDinara[i] = reads->getReadId(span<const char>(names + b, size_t(e - b)));
     }
 
+    // Overlap length + dovetail gates applied to hifiasm's candidate overlaps
+    // before they become dinara candidates. hifiasm overlap
+    // coordinates (q_start/q_end, t_start/t_end) are RAW forward-strand read
+    // coordinates (the PAF path reports them alongside the raw read length), so
+    // these are base-count tests:
+    //   - kMinOverlapLen: keep only when BOTH the query and target spans reach
+    //     this many bases.
+    //   - kDovetailHang: keep only when the aligned interval reaches within this
+    //     many bases of an END of EACH read (dovetail test with hang=350),
+    //     dropping internal /
+    //     repeat matches interior to both reads.
+    // 0 disables a gate. The dovetail test fails OPEN when a read length is
+    // unknown, so a name-resolution miss never silently drops a real overlap.
+    constexpr uint32_t kMinOverlapLen = 1000;
+    constexpr uint32_t kDovetailHang  = 350;
+    auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
+                      uint32_t hang) -> bool {
+        return start < hang || (len > 0 && end + hang > len);
+    };
+
     // Build PafEntry records in parallel, mirroring the per-record filtering of
     // the PAF importer (block length floor, distinct, non-palindromic).
     const uint64_t batch = std::max<uint64_t>(1, overlapCount / threadCount);
@@ -337,6 +357,25 @@ void Assembler::importAlignmentCandidatesFromMemory(
                     !reads->getFlags(readId0).isPalindromic &&
                     !reads->getFlags(readId1).isPalindromic;
                 if(!valid) continue;
+
+                // Minimum overlap length: both spans must reach kMinOverlapLen.
+                if(kMinOverlapLen > 0) {
+                    const uint32_t qSpan = (o.q_end > o.q_start) ? (o.q_end - o.q_start) : 0;
+                    const uint32_t tSpan = (o.t_end > o.t_start) ? (o.t_end - o.t_start) : 0;
+                    if(qSpan < kMinOverlapLen || tSpan < kMinOverlapLen) continue;
+                }
+
+                // Dovetail gate: require end-proximity on BOTH reads. Fail open
+                // when a raw length is unknown (0).
+                if(kDovetailHang > 0) {
+                    const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(readId0));
+                    const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(readId1));
+                    if(qLen > 0 && tLen > 0) {
+                        const bool qNear = nearEnd(o.q_start, o.q_end, qLen, kDovetailHang);
+                        const bool tNear = nearEnd(o.t_start, o.t_end, tLen, kDovetailHang);
+                        if(!(qNear && tNear)) continue;
+                    }
+                }
                 PafEntry entry = makePafEntry(
                     readId0, readId1,
                     o.q_start, o.q_end,
@@ -396,14 +435,14 @@ void Assembler::importAlignmentCandidatesFromMemory(
         cout << timestamp << "Imported hifiasm CIGARs for " << cigarOverlaps
              << " overlaps (" << cigarLen << " tokens)." << endl;
     } else {
-        // Interval-only import (myloasm marker overlap path): no base CIGAR is
-        // supplied. Store each surviving overlap's interval with ZERO CIGAR
+        // Interval-only import: hifiasm's base CIGAR is discarded (cigar ==
+        // nullptr). Store each surviving overlap's interval with ZERO CIGAR
         // tokens so computeBaseAlignmentsAndStore can find the pair, reframe the
         // interval (normalizeHifiasmCigar works with empty tokens), derive the
         // marker chain from it (deriveChainFromInterval), and build the CIGAR
         // per-segment with A*PA2 (constructQuickRawSparse). Without this record
         // the pair has no interval, deriveChainFromInterval is never called, and
-        // the empty-ordinals guard downstream would drop every myloasm overlap.
+        // the empty-ordinals guard downstream would drop every overlap.
         uint64_t intervalOverlaps = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), 0);
         for(const PafEntry& e : entries) {

@@ -409,21 +409,6 @@ void AssemblerOptions::addConfigurableOptions()
         "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
         "simd-minimizers instead.")
 
-        ("Kmers.useMyloasmMarkers",
-        value<bool>(&kmersOptions.useMyloasmMarkers)->
-        default_value(true),
-        "If true (default), use myloasm's open syncmers + SNPmers as the marker position "
-        "source (bundled myloasm SNPmer engine). SNPmers are detected from the "
-        "global k-mer spectrum across all reads. Only the positions come from "
-        "myloasm; dinara encodes its own canonical KmerId at a fixed k=20 "
-        "(myloasm's marker k=21 clipped, keeping the SNPmer middle base) at each "
-        "position, independent of Kmers.k, so the downstream index is unchanged. "
-        "Makes anchors and phasing run on syncmer+SNPmer positions. Overlaps use "
-        "the hybrid path: hifiasm (k=51 HPC) supplies candidate pairs and "
-        "intervals, and myloasm's syncmers + SNPmers are chained (myloasm DP) "
-        "inside each interval. Takes precedence over Kmers.useHifiasmMinimizers "
-        "and Kmers.useSimdMinimizers.")
-
         ("Kmers.hifiasmMarkerSampleDist",
         value<int>(&kmersOptions.hifiasmMarkerSampleDist)->
         default_value(500),
@@ -542,6 +527,19 @@ void AssemblerOptions::addConfigurableOptions()
         ("OverlapCandidates.maxEndExtension",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
         "Deprecated alias for OverlapCandidates.maxEndFuzz.")
+
+        ("OverlapCandidates.hifiasmRawCandidates",
+        value<bool>(&overlapCandidatesOptions.hifiasmRawCandidates)->
+        default_value(false),
+        "If true, hifiasm emits the pre-alignment raw candidate set and skips "
+        "its base-level alignment pass (no CIGAR computed). dinara re-derives "
+        "each overlap's chain from its own markers inside the interval, so "
+        "hifiasm's CIGAR is unused. But the raw set is a superset of pairs "
+        "hifiasm's own alignment would reject; those extras share no marker in "
+        "the interval and are dropped downstream. The default (false) runs "
+        "hifiasm's full alignment pass so the candidate set is real overlaps "
+        "only (every candidate chains, forward/reverse at parity). CIGAR is "
+        "discarded on import and coordinates are raw read space either way.")
 
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
@@ -1493,7 +1491,6 @@ void KmersOptions::write(ostream& s) const
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
     s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
     s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
-    s << "useMyloasmMarkers = " << convertBoolToPythonString(useMyloasmMarkers) << "\n";
     s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
 }
@@ -1525,6 +1522,8 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
     s << "maxChainingFreq = " << maxChainingFreq << "\n";
+    s << "hifiasmRawCandidates = " <<
+        convertBoolToPythonString(hifiasmRawCandidates) << "\n";
 }
 
 

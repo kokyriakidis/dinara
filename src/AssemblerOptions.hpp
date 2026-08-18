@@ -184,21 +184,6 @@ public:
     // benchmark hifiasm's seed selection against simd-minimizers.
     bool useHifiasmMinimizers;
 
-    // Use myloasm's open syncmers + SNPmers as the marker POSITION source
-    // (bundled myloasm SNPmer engine, via myloasm_index_reads in the hifiasm
-    // submodule). SNPmers are detected from the global k-mer spectrum across all
-    // reads, so this is a single whole-run call (not per-read). Only the marker
-    // POSITIONS are taken from myloasm; dinara still encodes its own canonical
-    // KmerId (length Kmers.k) at each position exactly as on the other marker
-    // paths, so markers/markerKmerIds and every downstream consumer are
-    // unchanged in shape. This makes dinara's anchors and phasing run on
-    // syncmer+SNPmer positions while hifiasm still provides overlap pairs and
-    // intervals (k=51 HPC, a separate path). The marker encode k is FIXED at 20
-    // (myloasm's marker k=21 clipped, keeping the SNPmer's middle base), set
-    // internally and independent of Kmers.k. Takes precedence over
-    // useHifiasmMinimizers / useSimdMinimizers when set.
-    bool useMyloasmMarkers;
-
     // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer
     // filters so markers match the seeds hifiasm uses for overlap detection:
     // a high-occurrence k-mer filter (built over the input reads, no-HPC) plus
@@ -256,6 +241,21 @@ public:
     uint32_t minOverlapLength = 0; // If >0, minimum raw marker chain span (bases) for a candidate to be kept (min of query/target spans).
     uint32_t maxEndFuzz = 0;       // If >0, discard candidates needing more extension (bases) to reach read ends.
     uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during chaining (markers still kept for journeys).
+
+    // When true, hifiasm overlap detection emits the pre-alignment RAW
+    // candidate set and SKIPS its base-level alignment pass entirely (no CIGAR
+    // is computed). dinara discards hifiasm's CIGAR anyway and re-derives each
+    // overlap's chain from its own markers inside the interval
+    // (deriveChainFromInterval, hifiasm chaining DP), so computing the CIGAR is
+    // wasted work. However, the raw set is a SUPERSET (~8k extra pairs on the
+    // GIAB chr1 test) of pairs hifiasm's own base alignment would reject; those
+    // extras share no marker inside the interval and are dropped downstream as
+    // wasted work. The default (false) runs hifiasm's full alignment pass so the
+    // candidate set is the real overlaps only: every candidate chains, with
+    // forward/reverse strands kept at parity. Set true to skip base alignment
+    // and accept the superset. Candidate coordinates stay in raw read space
+    // either way; the CIGAR is discarded on import regardless.
+    bool hifiasmRawCandidates = false;
 
     // When > 0, only chain pairs where at least one read has
     // readId < referenceReadCount. Skips read-vs-read pairs.
