@@ -2123,6 +2123,11 @@ void dinara::main::assemble(
         fakechain_bridge_opt_t fcOpt;
         fakechain_bridge_opt_init(&fcOpt);
         fcOpt.ovlp.threads = int(threadCount);
+        // Require both chain spans to reach this many RAW read bases before a
+        // candidate becomes a dinara overlap. Enforced in the bridge on the
+        // fakechain result (raw coordinates), so short overlaps never enter the
+        // importer.
+        fcOpt.min_overlap_len = 1000;
 
         fakechain_overlap_t* fcOv = nullptr;
         uint64_t nFcOv = 0;
@@ -2149,6 +2154,39 @@ void dinara::main::assemble(
                 "detection failed (code " + to_string(rc) + ").");
         }
 
+        // Dovetail gate (ported from myloasm's dovetail_possibility). A chained
+        // overlap is only useful for assembly if it could be a dovetail or a
+        // containment: the chain must reach within kDovetailHang RAW bases of an
+        // END of EACH read. myloasm tests every anchor for end-proximity on both
+        // reads; because the chain endpoints (f.q_start/q_end, f.t_start/t_end)
+        // are the extreme anchor positions, that per-anchor test reduces exactly
+        // to "either end of the chain is near either end of the read", evaluated
+        // per read. Overlaps that sit interior to both reads (internal matches,
+        // usually repeats) are dropped here so they never become candidates.
+        // 0 disables the gate; myloasm's native value is OVERLAP_HANG_LENGTH=350.
+        constexpr uint32_t kDovetailHang = 350;
+
+        // Resolve each hifiasm read id -> raw (non-HPC) read length once, via the
+        // hifiasm name table -> dinara ReadId (same resolution the importer uses).
+        // Raw length matches the fakechain positions' coordinate frame.
+        const Reads& fcReads = assembler.getReads();
+        vector<uint32_t> hifiRawLen(nReads, 0);
+        for(uint64_t i = 0; i < nReads; i++) {
+            const uint64_t b = nameOff[i];
+            const uint64_t e = nameOff[i + 1];
+            const ReadId rid =
+                fcReads.getReadId(span<const char>(names + b, size_t(e - b)));
+            if(rid != invalidReadId)
+                hifiRawLen[i] = uint32_t(fcReads.getReadRawSequenceLength(rid));
+        }
+
+        // True if [start,end) reaches within `hang` bases of either end of a
+        // read of length `len` (i.e. the chain could extend off that end).
+        auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
+                          uint32_t hang) -> bool {
+            return start < hang || (len > 0 && end + hang > len);
+        };
+
         // Translate fakechain overlaps to interval-only hifiasm_overlap_t.
         // block_len drives the importer's floor filter (>= 200) and its
         // keep-longest dedup; use the larger of the query/target chain spans as
@@ -2158,10 +2196,28 @@ void dinara::main::assemble(
         // with A*PA2.
         vector<hifiasm_overlap_t> ov;
         ov.reserve(nFcOv);
+        uint64_t droppedNonDovetail = 0;
         for(uint64_t i = 0; i < nFcOv; i++) {
             const fakechain_overlap_t& f = fcOv[i];
             const uint32_t qSpan = (f.q_end > f.q_start) ? (f.q_end - f.q_start) : 0;
             const uint32_t tSpan = (f.t_end > f.t_start) ? (f.t_end - f.t_start) : 0;
+
+            // Dovetail gate: require end-proximity on BOTH reads. Skip when a
+            // read length is unknown (0) so a name-resolution miss never
+            // silently drops a real overlap.
+            if(kDovetailHang > 0 &&
+               f.q_id < nReads && f.t_id < nReads &&
+               hifiRawLen[f.q_id] > 0 && hifiRawLen[f.t_id] > 0) {
+                const bool qNear =
+                    nearEnd(f.q_start, f.q_end, hifiRawLen[f.q_id], kDovetailHang);
+                const bool tNear =
+                    nearEnd(f.t_start, f.t_end, hifiRawLen[f.t_id], kDovetailHang);
+                if(!(qNear && tNear)) {
+                    ++droppedNonDovetail;
+                    continue;
+                }
+            }
+
             hifiasm_overlap_t o = {};
             o.q_id = f.q_id;
             o.t_id = f.t_id;
@@ -2180,10 +2236,12 @@ void dinara::main::assemble(
 
         performanceLog << timestamp << "hybrid path produced " << nFcOv
             << " overlaps over " << nReads << " reads (hifiasm candidates + "
-            << "myloasm chaining)." << endl;
+            << "myloasm chaining); dovetail gate dropped " << droppedNonDovetail
+            << " non-dovetail/internal overlaps, " << ov.size() << " kept." << endl;
         cout << timestamp << "hybrid path produced " << nFcOv
             << " overlaps over " << nReads << " reads (hifiasm candidates + "
-            << "myloasm chaining)." << endl;
+            << "myloasm chaining); dovetail gate dropped " << droppedNonDovetail
+            << " non-dovetail/internal overlaps, " << ov.size() << " kept." << endl;
 
         assembler.importAlignmentCandidatesFromMemory(
             ov.data(), ov.size(), names, nameOff, nReads,
