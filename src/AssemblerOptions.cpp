@@ -511,17 +511,17 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("OverlapCandidates.minOverlapLength",
         value<uint32_t>(&overlapCandidatesOptions.minOverlapLength)->
-        default_value(0),
-        "If non-zero, minimum overlap span in bases for a candidate to be kept. "
+        default_value(1000),
+        "Minimum overlap span in bases for a candidate to be kept. "
         "Implemented as min(qSpan, tSpan) >= threshold, where spans are the "
-        "pre-extension marker-derived (or PAF-derived) intervals.")
+        "pre-extension marker-derived (or PAF-derived) intervals. 0 disables.")
 
         ("OverlapCandidates.maxEndFuzz",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz)->
-        default_value(0),
-        "If non-zero, discard a candidate if extending it to read ends "
-        "would require more than this many bases on either the left or right side. "
-        "This is a heuristic to reject spurious internal overlaps.")
+        default_value(350),
+        "Dovetail hang in bases: keep a candidate only when its overlap reaches "
+        "within this many bases of an END of BOTH reads, dropping matches "
+        "interior to either read. 0 disables.")
 
         // Backward compatible alias (deprecated).
         ("OverlapCandidates.maxEndExtension",

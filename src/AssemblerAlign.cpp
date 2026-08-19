@@ -291,7 +291,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
     uint64_t cigarLen,
     const uint64_t* chain,
     uint64_t chainLen,
-    uint64_t threadCount)
+    uint64_t threadCount,
+    uint32_t minOverlapLength,
+    uint32_t maxEndFuzz)
 {
     cout << timestamp << "Importing " << overlapCount
          << " hifiasm overlaps from memory..." << endl;
@@ -318,16 +320,19 @@ void Assembler::importAlignmentCandidatesFromMemory(
     // coordinates (q_start/q_end, t_start/t_end) are RAW forward-strand read
     // coordinates (the PAF path reports them alongside the raw read length), so
     // these are base-count tests:
-    //   - kMinOverlapLen: keep only when BOTH the query and target spans reach
-    //     this many bases.
-    //   - kDovetailHang: keep only when the aligned interval reaches within this
-    //     many bases of an END of EACH read (dovetail test with hang=350),
-    //     dropping internal /
-    //     repeat matches interior to both reads.
+    //   - kMinOverlapLen (OverlapCandidates.minOverlapLength): keep only when
+    //     BOTH the query and target spans reach this many bases.
+    //   - kDovetailHang (OverlapCandidates.maxEndFuzz): keep only when the
+    //     aligned interval reaches within this many bases of an END of EACH
+    //     read (dovetail test), dropping internal / repeat matches interior to
+    //     both reads.
     // 0 disables a gate. The dovetail test fails OPEN when a read length is
     // unknown, so a name-resolution miss never silently drops a real overlap.
-    constexpr uint32_t kMinOverlapLen = 1000;
-    constexpr uint32_t kDovetailHang  = 350;
+    const uint32_t kMinOverlapLen = minOverlapLength;
+    const uint32_t kDovetailHang  = maxEndFuzz;
+    cout << timestamp << "Candidate filters: minOverlapLength="
+         << kMinOverlapLen << " (min of query/target span), maxEndFuzz="
+         << kDovetailHang << " (dovetail hang); 0 disables." << endl;
     auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
                       uint32_t hang) -> bool {
         return start < hang || (len > 0 && end + hang > len);

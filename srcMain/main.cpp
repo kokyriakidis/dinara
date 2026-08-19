@@ -1911,10 +1911,32 @@ void dinara::main::assemble(
         // Whether the overlap-path filter was actually applied to the markers.
         hifiasmMarkerFilterApplied = (hifiasmMarkerFilter != nullptr);
 
-        // Compute histogram using the pre-calculated KmerIds. Still needed even
-        // when the hf filter is active: it fills coverageHet/coverageHom, which
-        // phasing and the chaining-frequency cutoff below depend on.
-        assembler.countKmersFromMarkerKmerIds(threadCount);
+        // Coverage distribution (coverageLow/Het/Hom) feeds phasing, EC, and the
+        // chaining-frequency cutoff. hifiasm already computed the marker k-mer
+        // count histogram while building the overlap-path filter (ha_ft_gen), so
+        // when that filter is active we take hifiasm's authoritative peaks
+        // directly instead of running a second dinara-side histogram pass over
+        // every marker. This also skips building the KmerCounter frequency LUT,
+        // which on this path is only consumed by applyKmerCountFilter (skipped
+        // below) and the align6/AlignmentGraph paths (not used with the native
+        // hifiasm chain).
+        if(hifiasmMarkerFilterApplied) {
+            const int homCov = hifiasm_filter_hom_cov(hifiasmMarkerFilter);
+            const int hetCov = hifiasm_filter_het_cov(hifiasmMarkerFilter);
+            const int lowCov = hifiasm_filter_low_cov(hifiasmMarkerFilter);
+            auto& dist = assembler.assemblerInfo->kmerDistributionInfo;
+            dist.coverageHom = (homCov > 0) ? uint64_t(homCov) : 0;
+            dist.coverageHet = (hetCov > 0) ? uint64_t(hetCov) : dist.coverageHom;
+            dist.coverageLow = (lowCov > 0) ? uint64_t(lowCov) : 2;
+            cout << "Marker k-mer coverage from hifiasm peaks:"
+                    " low "  << dist.coverageLow <<
+                    ", het " << dist.coverageHet <<
+                    ", hom " << dist.coverageHom << endl;
+        } else {
+            // Legacy / no-filter path: dinara must count marker k-mers itself to
+            // build the frequency LUT that applyKmerCountFilter consumes.
+            assembler.countKmersFromMarkerKmerIds(threadCount);
+        }
         
         // Retrieve peak and set thresholds.
         // Hifiasm hard-filters k-mers above max_kmer_cnt (default 2000) during
@@ -1928,12 +1950,16 @@ void dinara::main::assemble(
         // via maxChainingFreq in the inverted index.
         const uint64_t maxFreq = std::numeric_limits<uint64_t>::max();
         const bool removePalindromicKmers = true;
-        uint64_t distinctKmerCount = 0;
-        for(uint64_t bucketId=0; bucketId<assembler.kmerCounter->kmerIdFrequencies.size(); bucketId++) {
-            distinctKmerCount += assembler.kmerCounter->kmerIdFrequencies[bucketId].size();
+        // kmerCounter is only built on the legacy/no-filter path (above); on the
+        // hifiasm-filter path it is intentionally absent since its frequency LUT
+        // is unused. Only report the distinct-k-mer count when it exists.
+        if(assembler.kmerCounter) {
+            uint64_t distinctKmerCount = 0;
+            for(uint64_t bucketId=0; bucketId<assembler.kmerCounter->kmerIdFrequencies.size(); bucketId++) {
+                distinctKmerCount += assembler.kmerCounter->kmerIdFrequencies[bucketId].size();
+            }
+            cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
         }
-
-        cout << "Analyzing " << distinctKmerCount << " distinct minimizer k-mers." << endl;
         cout << "Filtering minimizers: het coverage=" << coverageHet
              << ", hom coverage=" << coverageHom << "." << endl;
         cout << "Keeping k-mers with frequency >= " << minFreq;
@@ -2145,7 +2171,9 @@ void dinara::main::assemble(
     assembler.importAlignmentCandidatesFromMemory(
         ov, nOv, names, nameOff, nReads,
         /*cigar*/ nullptr, /*cigarLen*/ 0,
-        /*chain*/ chain, /*chainLen*/ chainLen, threadCount);
+        /*chain*/ chain, /*chainLen*/ chainLen, threadCount,
+        assemblerOptions.overlapCandidatesOptions.minOverlapLength,
+        assemblerOptions.overlapCandidatesOptions.maxEndFuzz);
     hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
     free(chain);  // native chain arena (plain uint64_t array; owned by caller)
     chain = nullptr;
