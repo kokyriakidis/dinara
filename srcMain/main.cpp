@@ -1851,12 +1851,12 @@ void dinara::main::assemble(
     // for the same reason.
     //
     // Coordinates: this uses the TIGHT CIGAR span (ad.qs/qe/ts/te). Internal
-    // matches are only detectable on tight coordinates -- the "Extended"
-    // variant first snaps the smaller overhang to 0 on each side
-    // (extendOverlapToReadBoundaries), forcing ext5 = ext3 = 0, so its
-    // ma_hit2arc can never return MA_HT_INT and it deletes nothing. With
-    // dinara's minCoverage=0, hifiasm's ma_hit_flt likewise classifies on the
-    // real overlap span against raw read lengths, matching the tight span here.
+    // matches are only detectable on tight coordinates -- extending them to the
+    // read tips (extendOverlapToReadBoundaries) snaps the smaller overhang to 0
+    // on each side, forcing ext5 = ext3 = 0, so ma_hit2arc could never return
+    // MA_HT_INT. With dinara's minCoverage=0, hifiasm's ma_hit_flt likewise
+    // classifies on the real overlap span against raw read lengths, matching the
+    // tight span here.
     assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);

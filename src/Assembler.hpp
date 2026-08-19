@@ -890,14 +890,11 @@ public:
     /// Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps.
     void deleteContainmentOverlaps(uint64_t threadCount);
     /// Delete internal overlaps (ma_hit2arc MA_HT_INT/MA_HT_SHORT_OVLP: excessive overhangs or too short).
-    /// Runs early (e.g. after deleteContainmentOverlaps) to remove spurious internal matches.
-    /// Uses stored CIGAR boundary coordinates directly.
+    /// Runs before flagContainedReads to remove spurious internal matches while
+    /// keeping containments. Uses the TIGHT CIGAR span (ad.qs/qe/ts/te), which is
+    /// required: extending coordinates to the read tips would zero out both
+    /// overhangs and make MA_HT_INT undetectable.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
-    /// Same as deleteInternalOverlaps but extends CIGAR boundary coordinates
-    /// toward read tips before classification (matching hifiasm's
-    /// append_inexact_overlap_region_alloc). Less aggressive than the
-    /// non-extended version.
-    void deleteInternalOverlapsExtended(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
     void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeReadsFlaggedContained(uint64_t threadCount);
@@ -942,9 +939,8 @@ private:
     void filterHangingOverlapsThreadFunction(size_t threadId);
     // Delete containment overlaps - thread function
     void deleteContainmentOverlapsThreadFunction(size_t threadId);
-    // Delete internal overlaps - thread functions
+    // Delete internal overlaps - thread function
     void deleteInternalOverlapsThreadFunction(size_t threadId);
-    void deleteInternalOverlapsExtendedThreadFunction(size_t threadId);
     uint64_t hangingFilterMaxHang = 1000;
     double hangingFilterMaxHangRate = 0.8;
     uint64_t hangingFilterMinOverlap = 0;

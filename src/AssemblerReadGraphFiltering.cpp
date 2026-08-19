@@ -870,15 +870,14 @@ validReadIntervals are [0, readLen) for all reads.  This makes ma_hit_cut a
 no-op (no coordinate clipping) and ma_hit_flt uses raw read lengths.  We
 therefore use raw read lengths directly, skipping the clipping step.
 
-NOTE: ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment span, not extended --
-this function (deleteInternalOverlapsThreadFunction, below) feeds them to
-ma_hit2arc as-is, which is NOT hifiasm parity: ma_hit2arc needs hifiasm's
-ma_hit_t convention (diagonally extrapolated to read boundaries). Use
-ad.extendedQs/extendedQe/extendedTs/extendedTe instead (see
-AlignmentData::extendedQs doc comment) if/when this function is wired back in --
-it is currently not called anywhere in the live pipeline
-(deleteInternalOverlapsExtendedThreadFunction, further below, already does this
-correctly).
+COORDINATES: this uses ad.qs/qe/ts/te, the TIGHT, real CIGAR-alignment span.
+That is deliberate and required. Internal matches are only detectable on the
+tight span: extending the coordinates toward the read tips first (as
+extendOverlapToReadBoundaries does) snaps the smaller overhang on each side to
+0, forcing ext5 = ext3 = 0, so ma_hit2arc could then never return MA_HT_INT.
+With dinara's minCoverage=0, ma_hit_cut is a no-op and ma_hit_flt classifies on
+the real overlap span against raw read lengths, matching the tight span used
+here. This is the variant wired into the live pipeline (main.cpp).
 
 Parameters (hifiasm defaults):
   maxHang          = 1000  (asm_opt.max_hang_Len)
@@ -942,11 +941,8 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
             const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
             const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
 
-            // NOTE: ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment span,
-            // not extended -- see the header comment above. This does not
-            // match hifiasm's ma_hit_t convention; prefer
-            // deleteInternalOverlapsExtendedThreadFunction (below), which
-            // uses ad.extendedQs/extendedQe/extendedTs/extendedTe.
+            // Tight CIGAR span -- see the header comment above for why the
+            // extended coordinates would defeat internal-match detection.
             const uint32_t queryStart  = ad.qs;
             const uint32_t queryEnd    = ad.qe;
             const uint32_t targetStart = ad.ts;
@@ -973,87 +969,6 @@ void Assembler::deleteInternalOverlapsThreadFunction(size_t threadId)
             const int classification = ma_hit2arc(
                 (int32_t)queryStart,  (int32_t)queryEnd,  (int32_t)queryLen,
                 (int32_t)targetStart, (int32_t)targetEnd, (int32_t)targetLen,
-                !ad.isSameStrand,
-                (int32_t)maxHang,
-                maxHangRate,
-                (int32_t)minOvlp);
-
-            if (classification == MA_HT_INT || classification == MA_HT_SHORT_OVLP) {
-                ad.addDeleteReasonsBoth(AlignmentData::DeleteReasonHanging);
-            }
-        }
-    }
-}
-
-void Assembler::deleteInternalOverlapsExtended(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount)
-{
-    cout << timestamp << "Deleting internal overlaps with extended coordinates (maxHang=" << maxHang
-         << ", maxHangRate=" << maxHangRate << ", minOverlapLength=" << minOverlapLength << ")." << endl;
-
-    if (threadCount == 0) {
-        threadCount = std::thread::hardware_concurrency();
-    }
-
-    hangingFilterMaxHang = maxHang;
-    hangingFilterMaxHangRate = maxHangRate;
-    hangingFilterMinOverlap = minOverlapLength;
-
-    uint64_t deletedBefore = 0;
-    for (const auto& ad : alignmentData) {
-        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
-            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
-            ++deletedBefore;
-        }
-    }
-
-    setupLoadBalancing(alignmentData.size(), 10000);
-    runThreads(&Assembler::deleteInternalOverlapsExtendedThreadFunction, threadCount);
-
-    uint64_t deletedAfter = 0;
-    for (const auto& ad : alignmentData) {
-        if ((ad.deleteReasons0 & AlignmentData::DeleteReasonHanging) ||
-            (ad.deleteReasons1 & AlignmentData::DeleteReasonHanging)) {
-            ++deletedAfter;
-        }
-    }
-
-    cout << timestamp << "Internal overlaps (extended): " << (deletedAfter - deletedBefore) << " deleted ("
-         << deletedAfter << " total)." << endl;
-}
-
-void Assembler::deleteInternalOverlapsExtendedThreadFunction(size_t threadId)
-{
-    static_cast<void>(threadId);
-    uint64_t begin, end;
-    const uint64_t maxHang = this->hangingFilterMaxHang;
-    const double maxHangRate = this->hangingFilterMaxHangRate;
-    const uint64_t minOvlp = this->hangingFilterMinOverlap;
-
-    while (getNextBatch(begin, end)) {
-        for (uint64_t i = begin; i != end; i++) {
-            AlignmentData& ad = alignmentData[i];
-
-            if (!ad.keptByBothSides()) continue;
-
-            const ReadId queryId  = ad.readIds[0];
-            const ReadId targetId = ad.readIds[1];
-            const uint32_t queryLen  = uint32_t(reads->getReadRawSequenceLength(queryId));
-            const uint32_t targetLen = uint32_t(reads->getReadRawSequenceLength(targetId));
-
-            // Use the stored EXTENDED coordinates (hifiasm ma_hit_t convention;
-            // see AlignmentData::extendedQs doc comment) directly -- no need to
-            // re-derive the extension here, computeBaseAlignmentsAndStoreThreadFunction
-            // already did it.
-            const uint32_t qs = ad.extendedQs;
-            const uint32_t qe = ad.extendedQe;
-            const uint32_t ts = ad.extendedTs;
-            const uint32_t te = ad.extendedTe;
-
-            if (qe <= qs || te <= ts) continue;
-
-            const int classification = ma_hit2arc(
-                (int32_t)qs,  (int32_t)qe,  (int32_t)queryLen,
-                (int32_t)ts,  (int32_t)te,  (int32_t)targetLen,
                 !ad.isSameStrand,
                 (int32_t)maxHang,
                 maxHangRate,
