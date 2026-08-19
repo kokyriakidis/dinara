@@ -17,9 +17,6 @@
 #include "span.hpp"
 #include "timestamp.hpp"
 
-// hifiasm colinear-chaining DP (thin per-pair wrapper).
-#include "hifiasm_chain.h"
-
 // Standard libraries.
 #include "chrono.hpp"
 #include <cmath>
@@ -33,126 +30,6 @@
 
 using namespace dinara;
 using namespace std;
-
-void Assembler::deriveChainFromInterval(
-    const array<OrientedReadId, 2>& orientedReadIds,
-    uint32_t read0Begin, uint32_t read0End,
-    uint32_t read1Begin, uint32_t read1End,
-    vector< array<uint32_t, 2> >& ordinals) const
-{
-    ordinals.clear();
-
-    // Markers and their KmerIds share the same oriented indexing (index ==
-    // ordinal) and are position-sorted ascending in each oriented frame.
-    const auto markers0    = (*markers)[orientedReadIds[0].getValue()];
-    const auto markers1    = (*markers)[orientedReadIds[1].getValue()];
-    const auto kmerIds0    = (*markerKmerIds)[orientedReadIds[0].getValue()];
-    const auto kmerIds1    = (*markerKmerIds)[orientedReadIds[1].getValue()];
-
-    // Collect (KmerId, ordinal, position) for markers whose position lies in the
-    // overlap box on each side. Positions are sorted, so we can stop once past
-    // the end. Position is the marker (minimizer) START on the oriented read --
-    // exactly the seed coordinate the chaining DP works in, since dinara's
-    // markers ARE hifiasm's non-HPC 51/51 minimizers.
-    struct BoxMarker { KmerId kmer; uint32_t ordinal; uint32_t position; };
-    vector<BoxMarker> box0, box1;
-    auto collect = [](
-        const span<const CompressedMarker>& m,
-        const span<const KmerId>& kids,
-        uint32_t begin, uint32_t end,
-        vector<BoxMarker>& out)
-    {
-        const uint32_t n = uint32_t(m.size());
-        for(uint32_t ord = 0; ord < n; ++ord) {
-            const uint32_t pos = m[ord].position;
-            if(pos < begin) continue;
-            if(pos >= end) break;              // sorted: no later marker qualifies
-            out.push_back({kids[ord], ord, pos});
-        }
-    };
-    collect(markers0, kmerIds0, read0Begin, read0End, box0);
-    collect(markers1, kmerIds1, read1Begin, read1End, box1);
-
-    if(box0.empty() || box1.empty()) {
-        return;
-    }
-
-    // Match markers by shared KmerId into seed anchors, then chain them with
-    // hifiasm's colinear DP (hifiasm_chain_pair). Unlike the previous
-    // unique-KmerId-only heuristic, ambiguous (repeat) KmerIds are fed as m:n
-    // anchors and the DP -- with hifiasm's tuned band/gap penalties -- selects
-    // the colinear subset. Each anchor carries q_pos/t_pos (marker starts) and,
-    // in its opaque id, the packed (ord0, ord1) so kept anchors map straight
-    // back to marker ordinals.
-    auto byKmer = [](const BoxMarker& a, const BoxMarker& b) {
-        return a.kmer < b.kmer;
-    };
-    sort(box0.begin(), box0.end(), byKmer);
-    sort(box1.begin(), box1.end(), byKmer);
-
-    vector<hifiasm_chain_anchor_t> anchorSeeds;
-    {
-        size_t i = 0, j = 0;
-        const size_t n0 = box0.size(), n1 = box1.size();
-        while(i < n0 && j < n1) {
-            if(box0[i].kmer < box1[j].kmer) {
-                ++i;
-            } else if(box1[j].kmer < box0[i].kmer) {
-                ++j;
-            } else {
-                // Equal KmerId: emit the m:n cross product of the two runs.
-                const KmerId key = box0[i].kmer;
-                size_t iEnd = i, jEnd = j;
-                while(iEnd < n0 && box0[iEnd].kmer == key) ++iEnd;
-                while(jEnd < n1 && box1[jEnd].kmer == key) ++jEnd;
-                for(size_t a = i; a < iEnd; ++a) {
-                    for(size_t b = j; b < jEnd; ++b) {
-                        hifiasm_chain_anchor_t s;
-                        s.q_pos = box0[a].position;
-                        s.t_pos = box1[b].position;
-                        s.id = (uint64_t(box0[a].ordinal) << 32) |
-                               uint64_t(box1[b].ordinal);
-                        anchorSeeds.push_back(s);
-                    }
-                }
-                i = iEnd;
-                j = jEnd;
-            }
-        }
-    }
-
-    if(anchorSeeds.empty()) {
-        return;
-    }
-
-    // Read lengths for the DP band/gap penalties (orientation-invariant).
-    const uint32_t qLen = uint32_t(
-        reads->getReadRawSequenceLength(orientedReadIds[0].getReadId()));
-    const uint32_t tLen = uint32_t(
-        reads->getReadRawSequenceLength(orientedReadIds[1].getReadId()));
-
-    hifiasm_chain_anchor_t* kept = nullptr;
-    uint64_t nKept = 0;
-    int32_t score = 0;
-    const int rc = hifiasm_chain_pair(
-        anchorSeeds.data(), anchorSeeds.size(), qLen, tLen,
-        /*opt=*/nullptr, &kept, &nKept, &score);
-    if(rc != 0 || nKept == 0 || kept == nullptr) {
-        hifiasm_chain_free(kept);
-        return;
-    }
-
-    // Unpack kept anchors (ordered by ascending query position) into marker
-    // ordinals. The DP guarantees strictly increasing q_pos and t_pos, so the
-    // ordinals are already a valid strictly-increasing chain in both reads.
-    ordinals.reserve(size_t(nKept));
-    for(uint64_t a = 0; a < nKept; ++a) {
-        const uint32_t ord0 = uint32_t(kept[a].id >> 32);
-        const uint32_t ord1 = uint32_t(kept[a].id & 0xffffffffu);
-        ordinals.push_back({ord0, ord1});
-    }
-    hifiasm_chain_free(kept);
-}
 
 void Assembler::mapNativeChainToOrdinals(
     const array<OrientedReadId, 2>& orientedReadIds,
@@ -458,13 +335,10 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 tProjStart = steady_clock::now();
             }
 
-            // Reuse hifiasm's base alignment: reframe hifiasm's CIGAR into
-            // dinara's read0/read1 canonical frame and walk it clipped to the
-            // marker interval. Falls back to A*PA2 (Method QuickRawSparse) only
-            // if the imported CIGAR is missing/unusable for this pair.
-            bool usedHifiasmCigar = false;
-            // The chain is derived from the overlap box (deriveChainFromInterval),
-            // so the ctor gets an empty local Alignment that we fill below; under
+            // Interval-only import: hifiasm supplies each candidate pair and its
+            // native dense chain (its own colinear-DP anchors); dinara maps those
+            // anchors straight to marker ordinals and builds the per-segment CIGAR
+            // itself. The ctor gets an empty local Alignment filled below; under
             // Method::None the ctor does not read it.
             Alignment directAlignment;
             ProjectedAlignment projectedAlignment(
@@ -482,74 +356,17 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
 
             {
                 // Candidate readIds are canonical (readIds[0] < readIds[1]); the
-                // pair key and strand match the imported-CIGAR store keys.
+                // pair key and strand match the imported store keys.
                 const uint64_t pairKey =
                     (uint64_t(candidate.readIds[0]) << 32) | uint64_t(candidate.readIds[1]);
                 const HifiasmImportedCigarStore::Record* rec =
                     hifiasmImportedCigarStore.find(pairKey, candidate.isSameStrand);
-                if(rec != nullptr && rec->cigarTokenCount > 0) {
-                    // Reframe the native hifiasm CIGAR into read0/read1 canonical
-                    // frame. read lengths are needed for the reverse-strand /
-                    // id-swap cases.
-                    const uint32_t qLen =
-                        uint32_t(reads->getRead(ReadId(rec->readIdQ)).baseCount);
-                    const uint32_t tLen =
-                        uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
-                    const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
-                        hifiasmImportedCigarStore.tokensOf(*rec),
-                        rec->readIdQ, rec->readIdT,
-                        rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
-                        qLen, tLen, rec->isSameStrand);
-
-                    // Clip window is the CIGAR's own read0 span (forward coords).
-                    // The marker-ordinal chain is derived separately from the
-                    // hifiasm overlap interval (deriveChainFromInterval), not from
-                    // this walk; the walk only produces statistics and the CIGAR.
-                    usedHifiasmCigar = projectedAlignment.constructFromHifiasmCigar(
-                        span<const CigarToken>(norm.tokens.data(), norm.tokens.size()),
-                        norm.read0Start, norm.read1Start,
-                        norm.read0Start, norm.read0End);
-
-                    // Derive the marker-ordinal chain from the overlap box hifiasm
-                    // validated. Both intervals are in the oriented frames of
-                    // orientedReadIds: read0 forward [read0Start,read0End); read1
-                    // in alignment orientation [read1Start,read1End) (norm already
-                    // reframed for reverse overlaps). No chaining DP -- the box is
-                    // colinear.
-                    if(usedHifiasmCigar) {
-                        const span<const uint64_t> nativeChain =
-                            hifiasmImportedCigarStore.chainOf(*rec);
-                        if(!nativeChain.empty()) {
-                            mapNativeChainToOrdinals(
-                                orientedReadIds,
-                                rec->readIdQ, rec->readIdT, rec->isSameStrand,
-                                nativeChain, directAlignment.ordinals);
-                        }
-                        if(directAlignment.ordinals.empty()) {
-                            deriveChainFromInterval(
-                                orientedReadIds,
-                                norm.read0Start, norm.read0End,
-                                norm.read1Start, norm.read1End,
-                                directAlignment.ordinals);
-                        }
-                    }
-                } else if(rec != nullptr) {
-                    // Interval-only record: hifiasm supplied the candidate pair
-                    // and its interval but no base CIGAR (interval-only import).
-                    // Reframe the interval into the read0/read1 canonical frame
-                    // exactly as above (normalizeHifiasmCigar produces empty
-                    // tokens here) and derive the marker chain from it.
-                    // constructQuickRawSparse below then builds the per-segment
-                    // CIGAR from that chain with A*PA2.
-                    const uint32_t qLen =
-                        uint32_t(reads->getRead(ReadId(rec->readIdQ)).baseCount);
-                    const uint32_t tLen =
-                        uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
-                    // Prefer hifiasm's native dense chain (its own colinear-DP
-                    // anchors) when present: map anchor positions directly to
-                    // marker ordinals (no re-chaining). Fall back to deriving the
-                    // chain from the interval only when no native chain was
-                    // imported for this pair.
+                if(rec != nullptr) {
+                    // Map hifiasm's native dense chain anchors directly to marker
+                    // ordinals (no re-chaining). Overlap detection ran no-HPC at
+                    // the marker k, so each anchor lands on a marker 1:1. Pairs
+                    // with no mappable anchor are dropped by the empty-ordinals
+                    // guard below.
                     const span<const uint64_t> nativeChain =
                         hifiasmImportedCigarStore.chainOf(*rec);
                     if(!nativeChain.empty()) {
@@ -558,33 +375,17 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                             rec->readIdQ, rec->readIdT, rec->isSameStrand,
                             nativeChain, directAlignment.ordinals);
                     }
-                    if(directAlignment.ordinals.empty()) {
-                        const NormalizedHifiasmCigar norm = normalizeHifiasmCigar(
-                            hifiasmImportedCigarStore.tokensOf(*rec),
-                            rec->readIdQ, rec->readIdT,
-                            rec->qStart, rec->qEnd, rec->tStart, rec->tEnd,
-                            qLen, tLen, rec->isSameStrand);
-                        deriveChainFromInterval(
-                            orientedReadIds,
-                            norm.read0Start, norm.read0End,
-                            norm.read1Start, norm.read1End,
-                            directAlignment.ordinals);
-                    }
                 }
-                if(!usedHifiasmCigar) {
-                    if(computeCigar) {
-                        // Build the base alignment from the derived marker chain
-                        // (interval-only path). constructQuickRawSparse walks
-                        // directAlignment.ordinals; on the interval-only path
-                        // this is the chain from deriveChainFromInterval above.
-                        projectedAlignment.constructQuickRawSparse();
-                    } else {
-                        // Base alignment disabled (Align.computeBaseAlignmentCigar
-                        // false): keep only the marker-ordinal chain and its
-                        // span; no A*PA2, no CIGAR. Downstream graph construction
-                        // uses the ordinal chain, not the base CIGAR.
-                        projectedAlignment.constructChainOnly();
-                    }
+                if(computeCigar) {
+                    // Build the base alignment from the mapped marker chain.
+                    // constructQuickRawSparse walks directAlignment.ordinals.
+                    projectedAlignment.constructQuickRawSparse();
+                } else {
+                    // Base alignment disabled (Align.computeBaseAlignmentCigar
+                    // false): keep only the marker-ordinal chain and its span; no
+                    // A*PA2, no CIGAR. Downstream graph construction uses the
+                    // ordinal chain, not the base CIGAR.
+                    projectedAlignment.constructChainOnly();
                 }
             }
             if(collectProjectedTiming) {

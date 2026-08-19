@@ -451,12 +451,11 @@ void Assembler::importAlignmentCandidatesFromMemory(
     } else {
         // Interval-only import: hifiasm's base CIGAR is discarded (cigar ==
         // nullptr). Store each surviving overlap's interval with ZERO CIGAR
-        // tokens so computeBaseAlignmentsAndStore can find the pair, reframe the
-        // interval (normalizeHifiasmCigar works with empty tokens), derive the
-        // marker chain from it (deriveChainFromInterval), and build the CIGAR
-        // per-segment with A*PA2 (constructQuickRawSparse). Without this record
-        // the pair has no interval, deriveChainFromInterval is never called, and
-        // the empty-ordinals guard downstream would drop every overlap.
+        // tokens plus its native dense chain, so computeBaseAlignmentsAndStore
+        // can find the pair, map the chain anchors to marker ordinals
+        // (mapNativeChainToOrdinals), and build the CIGAR per-segment with A*PA2
+        // (constructQuickRawSparse). Without this record the pair has no chain
+        // and the empty-ordinals guard downstream would drop every overlap.
         uint64_t intervalOverlaps = 0;
         uint64_t chainOverlaps = 0, chainAnchorsTotal = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), 0);
@@ -473,8 +472,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 o.q_start, o.q_end, o.t_start, o.t_end);
             ++intervalOverlaps;
             // Attach hifiasm's native dense chain for this pair (query-forward /
-            // target-alignment frame). Consumed in place of
-            // deriveChainFromInterval.
+            // target-alignment frame). Consumed by mapNativeChainToOrdinals.
             if(chain != nullptr && o.chain_len > 0 &&
                o.chain_offset + o.chain_len <= chainLen) {
                 hifiasmImportedCigarStore.addChain(

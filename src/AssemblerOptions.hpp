@@ -160,52 +160,17 @@ public:
     string file;
     string globalFrequencyOverrideDirectory;
 
-    // Select the SIMD minimizer marker path (as opposed to the legacy k-mer
-    // marker method). Within that path the position source is chosen by
-    // useHifiasmMinimizers. Despite the historical name, this never ran closed
-    // syncmers: the live implementation is minimizer-based.
-    bool useSimdMinimizers;
-
-    // Deprecated alias for useSimdMinimizers. Kept so existing command lines and
-    // configs that pass Kmers.useSimdClosedSyncmers keep working; resolved into
-    // useSimdMinimizers by resolveDeprecatedAliases(). Do not read directly.
-    bool useSimdClosedSyncmersDeprecated;
-
-    // Deprecated and unused. Was intended as the sub-k-mer size for closed
-    // syncmer selection, but the closed-syncmer path was never wired up (the
-    // live SIMD path is minimizer-based). Retained only so old command lines do
-    // not error; it has no effect.
-    int syncmerS;
-
-    // Use hifiasm's sketcher (no-HPC) as the minimizer position source instead
-    // of the simd-minimizers library. Only affects the SIMD minimizer path
-    // (useSimdMinimizers); positions are still resolved to real canonical
-    // KmerIds by dinara, so the downstream index is unchanged. Exists to
-    // benchmark hifiasm's seed selection against simd-minimizers.
-    bool useHifiasmMinimizers;
-
-    // When using hifiasm minimizers, apply hifiasm's overlap-path minimizer
-    // filters so markers match the seeds hifiasm uses for overlap detection:
-    // a high-occurrence k-mer filter (built over the input reads, no-HPC) plus
-    // distance subsampling. This is the sample distance (in bases) for the
-    // subsampling stage; hifiasm's overlap default is 500. Set to 0 to disable
-    // subsampling (the frequency filter still applies). Only consulted when
-    // useHifiasmMinimizers is true.
-    //
-    // When the filter is active the redundant downstream marker frequency prune
-    // (applyKmerCountFilter) is skipped, so the marker set is exactly what the
-    // hf + sample_dist sketch produces (true parity with the overlap path).
+    // hifiasm's overlap-path minimizer filter (high-occurrence k-mer filter +
+    // distance subsampling) selects the markers so they match the seeds hifiasm
+    // uses for overlap detection. This is the sample distance (in bases) for the
+    // subsampling stage; hifiasm's overlap default is 500. Must be greater than
+    // the minimizer window for subsampling to take effect.
     int hifiasmMarkerSampleDist;
 
     // Minimum fraction of read length that must be covered by the marker span
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.
     double minMarkerSpanFraction;
-
-    // Fold the deprecated useSimdClosedSyncmers alias into useSimdMinimizers.
-    // Call once after options are parsed. If the deprecated flag was set true,
-    // it turns on useSimdMinimizers (a warning is printed by the caller).
-    void resolveDeprecatedAliases();
 
     void write(ostream&) const;
 };
@@ -241,21 +206,6 @@ public:
     uint32_t minOverlapLength = 1000; // Minimum overlap span (bases) for a candidate to be kept (min of query/target spans); 0 disables.
     uint32_t maxEndFuzz = 350;         // Dovetail hang (bases): overlap must reach within this of an end on BOTH reads; 0 disables.
     uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during chaining (markers still kept for journeys).
-
-    // When true, hifiasm overlap detection emits the pre-alignment RAW
-    // candidate set and SKIPS its base-level alignment pass entirely (no CIGAR
-    // is computed). dinara discards hifiasm's CIGAR anyway and re-derives each
-    // overlap's chain from its own markers inside the interval
-    // (deriveChainFromInterval, hifiasm chaining DP), so computing the CIGAR is
-    // wasted work. However, the raw set is a SUPERSET (~8k extra pairs on the
-    // GIAB chr1 test) of pairs hifiasm's own base alignment would reject; those
-    // extras share no marker inside the interval and are dropped downstream as
-    // wasted work. The default (false) runs hifiasm's full alignment pass so the
-    // candidate set is the real overlaps only: every candidate chains, with
-    // forward/reverse strands kept at parity. Set true to skip base alignment
-    // and accept the superset. Candidate coordinates stay in raw read space
-    // either way; the CIGAR is discarded on import regardless.
-    bool hifiasmRawCandidates = false;
 
     // When > 0, only chain pairs where at least one read has
     // readId < referenceReadCount. Skips read-vs-read pairs.

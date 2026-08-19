@@ -4,8 +4,6 @@ DINARA_PHASING_DEBUG_READ=695 \
 --Reads.minReadLength 1000 \
 --threads 20 \
 --Kmers.k 50 \
---Kmers.useSimdClosedSyncmers true \
---Kmers.syncmerS 11 \
 --Assembly.mode3.minAnchorCoverage 4 \
 --Assembly.mode3.maxAnchorCoverage 400 \
 --Align.minAlignedMarkerCount 2 \
@@ -26,9 +24,7 @@ DINARA_PHASING_DEBUG_READ=695 \
 --Reads.minReadLength 1000 \
 --threads 20 --Kmers.k 50 \
 --Kmers.minimizerW 50 \
---Kmers.useSimdClosedSyncmers true \
 --Kmers.minMarkerSpanFraction 0.0 \
---Kmers.syncmerS 2 \
 --Assembly.mode3.maxAnchorCoverage 400 \
 --OverlapCandidates.method InvertedIndex \
 --OverlapCandidates.driftRateTolerance 0.05 \
@@ -96,9 +92,7 @@ minimap2 \
 --Reads.minReadLength 1000 \
 --threads 20 --Kmers.k 50 \
 --Kmers.minimizerW 50 \
---Kmers.useSimdClosedSyncmers true \
 --Kmers.minMarkerSpanFraction 0.0 \
---Kmers.syncmerS 2 \
 --Assembly.mode3.maxAnchorCoverage 200 \
 --OverlapCandidates.method InvertedIndex \
 --OverlapCandidates.driftRateTolerance 0.05 \
@@ -129,9 +123,7 @@ minimap2 \
 --threads 20 \
 --Kmers.k 50 \
 --Kmers.minimizerW 50 \
---Kmers.useSimdClosedSyncmers true \
 --Kmers.minMarkerSpanFraction 0.0 \
---Kmers.syncmerS 2 \
 --Assembly.mode3.maxAnchorCoverage 200 \
 --OverlapCandidates.method InvertedIndex \
 --OverlapCandidates.driftRateTolerance 0.05 \

@@ -123,9 +123,6 @@ AssemblerOptions::AssemblerOptions(int argumentCount, const char** arguments) :
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
 
-    // Fold deprecated option aliases into their replacements.
-    kmersOptions.resolveDeprecatedAliases();
-
     // Unpack the consensuscaller and replace relative path with the absolute
     // one if necessary.
     assemblyOptions.parseConsensusCallerString();
@@ -157,9 +154,6 @@ AssemblerOptions::AssemblerOptions(const string& fileName)
 
     // Parse ReadOptions.desiredCoverageString into its numeric value.
     readsOptions.parseDesiredCoverageString();
-
-    // Fold deprecated option aliases into their replacements.
-    kmersOptions.resolveDeprecatedAliases();
 
     // Unpack the consensuscaller and replace relative path with the absolute
     // one if necessary.
@@ -376,49 +370,14 @@ void AssemblerOptions::addConfigurableOptions()
         "The directory containing the hash table with marker k-mer global frequencies. "
         "Only used for Dinara development.")
 
-        ("Kmers.useSimdMinimizers",
-        value<bool>(&kmersOptions.useSimdMinimizers)->
-        default_value(false),
-        "If set to true, use the SIMD minimizer marker path instead of the "
-        "default k-mer based method. Within this path the minimizer position "
-        "source is chosen by Kmers.useHifiasmMinimizers.")
-
-        // Deprecated alias for Kmers.useSimdMinimizers. Despite the name, the
-        // closed-syncmer selection was never implemented; the live path is
-        // minimizer-based. Retained so existing command lines keep working;
-        // resolveDeprecatedAliases() folds it into useSimdMinimizers.
-        ("Kmers.useSimdClosedSyncmers",
-        value<bool>(&kmersOptions.useSimdClosedSyncmersDeprecated)->
-        default_value(false),
-        "Deprecated alias for Kmers.useSimdMinimizers (the closed-syncmer path "
-        "was never implemented; the live path is minimizer-based).")
-
-        // Deprecated and unused: no code path consumes syncmerS.
-        ("Kmers.syncmerS",
-        value<int>(&kmersOptions.syncmerS)->
-        default_value(11),
-        "Deprecated and unused. Retained only so old command lines do not error; "
-        "it has no effect.")
-
-        ("Kmers.useHifiasmMinimizers",
-        value<bool>(&kmersOptions.useHifiasmMinimizers)->
-        default_value(true),
-        "If true (default), use hifiasm's sketcher (no-HPC) as the minimizer position source "
-        "instead of the simd-minimizers library. Only affects the SIMD minimizer path "
-        "(Kmers.useSimdMinimizers). Positions are still resolved to canonical "
-        "KmerIds by dinara, so the inverted index is unchanged. Set to false to use "
-        "simd-minimizers instead.")
-
         ("Kmers.hifiasmMarkerSampleDist",
         value<int>(&kmersOptions.hifiasmMarkerSampleDist)->
         default_value(500),
-        "When Kmers.useHifiasmMinimizers is true, apply hifiasm's overlap-path "
-        "minimizer filters (high-occurrence k-mer filter built over the reads, "
-        "plus distance subsampling) so markers match hifiasm's overlap seeds. "
-        "This is the subsampling distance in bases; hifiasm's overlap default is "
-        "500. Set to 0 to disable subsampling (the frequency filter still "
-        "applies). When active, the redundant downstream marker frequency filter "
-        "is skipped for true parity with the overlap path.")
+        "hifiasm's overlap-path minimizer filter (high-occurrence k-mer filter "
+        "built over the reads, plus distance subsampling) selects the markers so "
+        "they match hifiasm's overlap seeds. This is the subsampling distance in "
+        "bases; hifiasm's overlap default is 500. Must be greater than the "
+        "minimizer window for subsampling to take effect.")
 
         ("Kmers.minMarkerSpanFraction",
         value<double>(&kmersOptions.minMarkerSpanFraction)->
@@ -527,19 +486,6 @@ void AssemblerOptions::addConfigurableOptions()
         ("OverlapCandidates.maxEndExtension",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
         "Deprecated alias for OverlapCandidates.maxEndFuzz.")
-
-        ("OverlapCandidates.hifiasmRawCandidates",
-        value<bool>(&overlapCandidatesOptions.hifiasmRawCandidates)->
-        default_value(false),
-        "If true, hifiasm emits the pre-alignment raw candidate set and skips "
-        "its base-level alignment pass (no CIGAR computed). dinara re-derives "
-        "each overlap's chain from its own markers inside the interval, so "
-        "hifiasm's CIGAR is unused. But the raw set is a superset of pairs "
-        "hifiasm's own alignment would reject; those extras share no marker in "
-        "the interval and are dropped downstream. The default (false) runs "
-        "hifiasm's full alignment pass so the candidate set is real overlaps "
-        "only (every candidate chains, forward/reverse at parity). CIGAR is "
-        "discarded on import and coordinates are raw read space either way.")
 
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->
@@ -1476,20 +1422,6 @@ void ReadsOptions::write(ostream& s) const
 
 
 
-void KmersOptions::resolveDeprecatedAliases()
-{
-    // Kmers.useSimdClosedSyncmers is a deprecated alias for Kmers.useSimdMinimizers.
-    if(useSimdClosedSyncmersDeprecated) {
-        useSimdMinimizers = true;
-        cout << "Warning: Kmers.useSimdClosedSyncmers is deprecated and has been "
-                "renamed to Kmers.useSimdMinimizers (the closed-syncmer path was "
-                "never implemented; the live path is minimizer-based). Please "
-                "update your command line/config." << endl;
-    }
-}
-
-
-
 void KmersOptions::write(ostream& s) const
 {
     s << "[Kmers]\n";
@@ -1500,8 +1432,6 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
-    s << "useSimdMinimizers = " << convertBoolToPythonString(useSimdMinimizers) << "\n";
-    s << "useHifiasmMinimizers = " << convertBoolToPythonString(useHifiasmMinimizers) << "\n";
     s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
 }
@@ -1533,8 +1463,6 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
     s << "maxChainingFreq = " << maxChainingFreq << "\n";
-    s << "hifiasmRawCandidates = " <<
-        convertBoolToPythonString(hifiasmRawCandidates) << "\n";
 }
 
 

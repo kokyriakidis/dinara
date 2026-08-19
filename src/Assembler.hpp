@@ -357,27 +357,8 @@ public:
         uint64_t threadCount
     );
 
-    // Derive a marker-ordinal chain for one overlap from hifiasm's validated
-    // overlap box, using hifiasm's colinear-chaining DP (hifiasm_chain_pair).
-    // Shared markers (equal KmerId) that fall in read0's [read0Begin,read0End)
-    // and read1's [read1Begin,read1End) -- both in the oriented frames of
-    // orientedReadIds (strand baked in) -- are matched m:n into seed anchors at
-    // their marker START positions. Because dinara's markers ARE hifiasm's
-    // non-HPC 51/51 minimizers, those positions are the DP's native seed
-    // coordinates. The DP (hifiasm's tuned HiFi band/gap penalties) selects the
-    // colinear subset, resolving repeat KmerIds instead of discarding them.
-    // Kept anchors carry packed (ord0, ord1) ids, so the result maps straight to
-    // marker ordinals, strictly increasing in both reads. Emits into `ordinals`
-    // (cleared first).
-    void deriveChainFromInterval(
-        const array<OrientedReadId, 2>& orientedReadIds,
-        uint32_t read0Begin, uint32_t read0End,
-        uint32_t read1Begin, uint32_t read1End,
-        vector< array<uint32_t, 2> >& ordinals) const;
-
     // Map hifiasm's native dense chain anchors to marker ordinals for one
-    // overlap, replacing deriveChainFromInterval on the native-chain path. Each
-    // anchor is packed (q_start<<32)|t_start in hifiasm's query-forward /
+    // overlap. Each anchor is packed (q_start<<32)|t_start in hifiasm's query-forward /
     // target-alignment frame; readIdQ/readIdT identify hifiasm's query/target
     // dinara ReadIds (used to detect the read0/read1 swap and reverse strand).
     // Because overlap detection runs no-HPC at selectK==encodeK, every marker
