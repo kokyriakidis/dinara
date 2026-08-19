@@ -370,15 +370,6 @@ void AssemblerOptions::addConfigurableOptions()
         "The directory containing the hash table with marker k-mer global frequencies. "
         "Only used for Dinara development.")
 
-        ("Kmers.hifiasmMarkerSampleDist",
-        value<int>(&kmersOptions.hifiasmMarkerSampleDist)->
-        default_value(500),
-        "hifiasm's overlap-path minimizer filter (high-occurrence k-mer filter "
-        "built over the reads, plus distance subsampling) selects the markers so "
-        "they match hifiasm's overlap seeds. This is the subsampling distance in "
-        "bases; hifiasm's overlap default is 500. Must be greater than the "
-        "minimizer window for subsampling to take effect.")
-
         ("Kmers.minMarkerSpanFraction",
         value<double>(&kmersOptions.minMarkerSpanFraction)->
         default_value(0.5),
@@ -1432,7 +1423,6 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
-    s << "hifiasmMarkerSampleDist = " << hifiasmMarkerSampleDist << "\n";
     s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
 }
 

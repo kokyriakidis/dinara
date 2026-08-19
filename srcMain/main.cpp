@@ -1438,106 +1438,24 @@ void dinara::main::setupRunDirectory(
 namespace {
 
 // ===========================================================================
-// DESIGN NOTE: why markers are no-HPC while overlaps are HPC (do NOT "unify").
-//
-// This split is intentional. It looks like an inconsistency at first glance
-// ("why don't markers use the exact k-mers hifiasm overlapped with?"), so this
-// note exists to prevent it being "fixed" later into a regression.
-//
-// hifiasm finds OVERLAPS in homopolymer-compressed (HPC) space: runs like
-// AAAAA are collapsed to A before seeding. That is what makes overlap detection
-// robust to homopolymer-length errors, the dominant HiFi/ONT error mode - two
-// reads that differ only in a run length still share the collapsed seed.
+// DESIGN NOTE: markers AND overlaps both run no-HPC at the same marker k.
 //
 // dinara MARKERS are exact-match anchors in RAW space: two reads "share a
-// marker" only when the raw k-mer is byte-identical. So markers must be sketched
-// no-HPC. If we instead took the HPC minimizer POSITIONS and read raw k-mers
-// there, reads differing by a single homopolymer length would get different raw
-// k-mers (frame-shifted after the run) and FAIL to match - precisely on the
-// read pairs hifiasm paired. That would seed dinara's anchoring with markers
-// engineered NOT to match across the errors the assembler must see through.
+// marker" only when the raw k-mer is byte-identical, so markers are sketched
+// no-HPC. Overlap detection is run in the SAME space (hifiOpt.no_hpc = 1,
+// k = w = Kmers.k) so hifiasm's native chain anchors land 1:1 on dinara marker
+// positions and no re-chaining is needed. The overlap-path minimizer filter is
+// likewise built no-HPC at the marker k and reused by the overlapper, so the
+// frequency counts correspond exactly to the minimizers being filtered.
 //
-// What we CAN and DO share is the selection methodology, not the k-mer space:
-//   - same k (HIFIASM_OVLP_K), same window, same distance subsampling
-//     (HIFIASM_OVLP_SAMPLE_DIST / REWIN), same high-occurrence cutoff policy;
-//   - the raw minimizer START position as the shared coordinate (select at
-//     k=51, encode dinara's k=50 there; the 50-mer is the 51-mer's prefix).
+// Selecting at the marker k (not a longer hifiasm 51-mer) makes each marker the
+// FULL canonical minimizer, which is required for strand symmetry: RC(marker)
+// is then exactly the same k-mer on the other strand, so reverse-strand
+// overlaps share KmerIds.
 //
-// Consequence to keep in mind: the marker high-occurrence filter is built
-// no-HPC, so it is a DIFFERENT frequency table than the HPC overlap filter and
-// removes a different specific set of k-mers. This is correct - markers need a
-// no-HPC table - but it means "markers pass the same filter as overlaps" is
-// true in METHOD, not in the literal identity of removed k-mers.
-//
-// Only revisit this split if dinara markers themselves move into HPC space (a
-// large change touching read representation, coordinates, and alignment).
+// Only revisit this if dinara markers move into HPC space (a large change
+// touching read representation, coordinates, and alignment).
 // ===========================================================================
-//
-// ---------------------------------------------------------------------------
-// Marker-selection configuration (single source of truth).
-//
-// dinara's hifiasm-minimizer marker path has two distinct k-mer roles that
-// used to be conflated, plus two filtering stages that were each silently
-// conditional. This struct centralizes all of it and validates the invariants
-// once, up front, so the downstream code can rely on them:
-//
-//   selectK / selectW   : the k/w hifiasm uses to CHOOSE minimizer positions.
-//                         Pinned to hifiasm's tuned overlap-path values
-//                         (HIFIASM_OVLP_K/W = 51) so marker seeds match the
-//                         seeds hifiasm uses for overlaps.
-//   encodeK             : the k-mer length dinara actually stores/indexes at
-//                         each chosen position (kmersOptions.k, e.g. 50). A
-//                         51-mer at offset p has dinara's 50-mer as its prefix,
-//                         so the position is shared and no realignment is
-//                         needed. Requires encodeK <= selectK (checked).
-//   sampleDist          : distance subsampling. hifiasm applies it ONLY when
-//                         sampleDist > selectW; below that it silently no-ops.
-//                         We require sampleDist > selectW on the filtered path.
-//   filterRequired      : on the hifiasm path the high-occurrence filter is the
-//                         whole point; running unfiltered is a large, silent
-//                         quality regression, so we refuse to proceed without a
-//                         filter rather than fall back quietly.
-//
-// resolve() throws runtime_error with an explicit message on any violated
-// invariant, turning previously-silent misconfigurations into hard failures.
-// ---------------------------------------------------------------------------
-struct MarkerSelectionConfig {
-    int  selectK         = HIFIASM_OVLP_K;
-    int  selectW         = HIFIASM_OVLP_W;
-    int  encodeK         = 0;     // dinara marker k (kmersOptions.k)
-    int  sampleDist      = HIFIASM_OVLP_SAMPLE_DIST;
-
-    static MarkerSelectionConfig resolve(const KmersOptions& k)
-    {
-        MarkerSelectionConfig c;
-        c.encodeK    = k.k;
-        c.sampleDist = k.hifiasmMarkerSampleDist;
-        // Position selection is pinned to dinara's encoding k (selectK ==
-        // encodeK), so each marker is the FULL canonical minimizer. This matters
-        // for strand symmetry: with selectK == encodeK, RC(marker) is exactly the
-        // same k-mer on the other strand, so reverse-strand overlaps share
-        // KmerIds. hifiasm's native chain anchors then land 1:1 on dinara
-        // markers.
-        c.selectK    = c.encodeK;
-        c.selectW    = c.encodeK;
-
-        if(c.encodeK <= 0) {
-            throw runtime_error("Marker k (Kmers.k) must be positive.");
-        }
-        // Subsampling is applied by hifiasm's sketch ONLY when
-        // sampleDist > selectW. Below that it is a silent no-op, which would give
-        // a much denser marker set than the overlap path. Refuse it.
-        if(c.sampleDist <= c.selectW) {
-            throw runtime_error(
-                "Kmers.hifiasmMarkerSampleDist (" +
-                std::to_string(c.sampleDist) + ") must be > the hifiasm "
-                "minimizer window (" + std::to_string(c.selectW) + ") for "
-                "distance subsampling to take effect; otherwise markers are "
-                "not subsampled to match the overlap path.");
-        }
-        return c;
-    }
-};
 
 // Shared-read-store bridge to hifiasm.
 //
@@ -1725,180 +1643,96 @@ void dinara::main::assemble(
     HifiasmReadStore hifiasmStore(assembler.getReads());
     performanceLog << timestamp << "hifiasm read store loaded." << endl;
 
-    // The overlap-path minimizer filter is built during marker selection (inside
-    // the block below) but must OUTLIVE it: overlap detection reuses the very
-    // same filter so the overlapper does not rebuild its own high-occurrence
-    // table (one fewer yak count pass) and seeds against the identical set the
-    // markers were selected from. Hoisted here so it survives to the overlap
-    // block; destroyed once overlaps are generated. overlapSeedK/W carry the
-    // no-HPC selection k/w the filter was built at, so the overlapper sketches
-    // in the SAME space (its native chain anchors then land on dinara markers).
-    hifiasm_filter_t* overlapReuseFilter = nullptr;
-    int overlapSeedK = 0;
-    int overlapSeedW = 0;
-
-    // Markers are derived from hifiasm's native overlap chains
-    // (createMarkersFromNativeChain) after detection, so marker creation is
-    // DEFERRED. markerEncodeK records the k for KmerId encoding (== selectK ==
-    // encodeK on the no-HPC hifiasm path).
-    int markerEncodeK = 0;
-
-    {
-        // Resolve and validate the marker-selection configuration once, up
-        // front. This centralizes the two k-mer roles (select vs encode) and
-        // the distance-subsampling parameter, and turns previously-silent
-        // misconfigurations (encode k > select k, sampleDist <= window) into
-        // explicit failures. See MarkerSelectionConfig.
-        const MarkerSelectionConfig markerCfg =
-            MarkerSelectionConfig::resolve(assemblerOptions.kmersOptions);
-
-        // Build hifiasm's overlap-path minimizer filter (no-HPC high-occurrence
-        // k-mer filter). Built once and shared read-only across all marker
-        // threads; the handle is a standalone hash of k-mer values (no read
-        // store), so it is safe to share and outlives this call until destroyed
-        // below. The filter is keyed by (k, w): the filtered sketch looks up
-        // each minimizer's hash in it, so it MUST be built at the SELECTION k/w
-        // (markerCfg.selectK/W), not dinara's encoding k.
-        hifiasm_filter_opt_t filterOpt = {};
-        filterOpt.threads = int(threadCount);
-        filterOpt.k_mer_length = markerCfg.selectK; // match the selection sketch
-        filterOpt.mz_win = markerCfg.selectW;       // w
-        filterOpt.is_hpc = 0;        // dinara markers are no-HPC
-        filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
-
-        performanceLog << timestamp
-            << "Building hifiasm overlap-path minimizer filter (no-HPC, "
-            << "k=" << markerCfg.selectK << ", w=" << markerCfg.selectW
-            << ") from in-memory read store." << endl;
-        hifiasm_filter_t* hifiasmMarkerFilter =
-            hifiasm_build_filter_from_store(&filterOpt);
-        if(hifiasmMarkerFilter == nullptr) {
-            throw runtime_error(
-                "Failed to build hifiasm minimizer filter for markers.");
-        }
-        performanceLog << timestamp
-            << "hifiasm minimizer filter built." << endl;
-
-        performanceLog << timestamp
-            << "Marker selection: source=hifiasm-minimizers"
-            << ", selectK=" << markerCfg.selectK
-            << ", selectW=" << markerCfg.selectW
-            << ", encodeK=" << markerCfg.encodeK
-            << ", sampleDist=" << markerCfg.sampleDist
-            << "." << endl;
-
-        // Markers are derived from hifiasm's native overlap chains AFTER
-        // detection (createMarkersFromNativeChain), so no marker sketch runs
-        // here; marker creation is deferred. The chain anchors are the only
-        // marker positions that can become anchors; sketching a full marker set
-        // would just add marker-graph singletons.
-        markerEncodeK = markerCfg.encodeK;
-        cout << "Deferring marker creation to hifiasm native chain "
-                "(single-sketch path)." << endl;
-
-        // Coverage distribution (coverageLow/Het/Hom) feeds phasing, EC, and the
-        // chaining-frequency cutoff. hifiasm already computed the marker k-mer
-        // count histogram while building the overlap-path filter (ha_ft_gen), so
-        // we take hifiasm's authoritative peaks directly instead of running a
-        // second dinara-side histogram pass over every marker.
-        {
-            const int homCov = hifiasm_filter_hom_cov(hifiasmMarkerFilter);
-            const int hetCov = hifiasm_filter_het_cov(hifiasmMarkerFilter);
-            const int lowCov = hifiasm_filter_low_cov(hifiasmMarkerFilter);
-            auto& dist = assembler.assemblerInfo->kmerDistributionInfo;
-            dist.coverageHom = (homCov > 0) ? uint64_t(homCov) : 0;
-            dist.coverageHet = (hetCov > 0) ? uint64_t(hetCov) : dist.coverageHom;
-            dist.coverageLow = (lowCov > 0) ? uint64_t(lowCov) : 2;
-            cout << "Marker k-mer coverage from hifiasm peaks:"
-                    " low "  << dist.coverageLow <<
-                    ", het " << dist.coverageHet <<
-                    ", hom " << dist.coverageHom << endl;
-        }
-        
-        // Retrieve peak and set thresholds.
-        // Hifiasm hard-filters k-mers above max_kmer_cnt (default 2000) during
-        // sketching. K-mers between highFreqThreshold (coverageHet * 1.667)
-        // and this cutoff are kept but downsampled per-streak during chaining.
-        const uint64_t coverageHet = assembler.assemblerInfo->kmerDistributionInfo.coverageHet;
-        const uint64_t coverageHom = assembler.assemblerInfo->kmerDistributionInfo.coverageHom;
-        // The hifiasm overlap-path filter (high-occurrence k-mer filter +
-        // distance subsampling) already selected the markers, exactly as hifiasm
-        // selects overlap seeds; no separate dinara marker frequency prune runs
-        // on this path (it would prune a second, different way and break parity).
-        cout << "Filtering minimizers: het coverage=" << coverageHet
-             << ", hom coverage=" << coverageHom << "." << endl;
-        // Effective chaining cutoff: min(coverageHom * 5, maxChainingFreq).
-        // Matches hifiasm's min(hom_cov * 5, max_kmer_cnt) logic.
-        const uint64_t effectiveChainingFreq = min(coverageHom * 5,
-            uint64_t(assemblerOptions.overlapCandidatesOptions.maxChainingFreq));
-        cout << "Chaining limited to frequency <= " << effectiveChainingFreq << "." << endl;
-
-        // Hand the marker filter to overlap detection instead of freeing it
-        // here: the overlapper reuses this exact no-HPC filter (built at
-        // selectK/selectW) so it skips its own filter-build pass and seeds in
-        // the same space as the markers. Ownership transfers to
-        // overlapReuseFilter; it is destroyed after overlaps are generated.
-        // selectK==selectW==encodeK on this path (no-HPC marker space), which is
-        // also the k/w the overlapper must sketch at for its native chain
-        // anchors to coincide with dinara's markers.
-        overlapReuseFilter = hifiasmMarkerFilter;
-        overlapSeedK = markerCfg.selectK;
-        overlapSeedW = markerCfg.selectW;
-        hifiasmMarkerFilter = nullptr;
-
-        // Initialize KmerChecker for HttpServer diagnostics (optional).
-        cout << "Initializing KmerChecker for diagnostics." << endl;
-        assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
+    // Markers and overlaps share one no-HPC minimizer space at the marker k
+    // (Kmers.k), so hifiasm's native chain anchors land 1:1 on dinara markers.
+    const int markerK = int(assemblerOptions.kmersOptions.k);
+    if(markerK <= 0) {
+        throw runtime_error("Marker k (Kmers.k) must be positive.");
     }
 
-    // Markers are created after overlap detection from hifiasm's native chains
-    // (createMarkersFromNativeChain), so they do not exist yet here. The
-    // span-coverage read filter and marker persistence both run after marker
-    // creation below. Chain-derived markers cluster in aligned interiors and omit
-    // a read's extreme minimizers, so span coverage is not meaningful and that
-    // filter is intentionally not applied on this path.
+    // Build hifiasm's overlap-path minimizer filter (no-HPC high-occurrence
+    // k-mer filter) over the loaded store. Overlap detection REUSES this exact
+    // filter (see hifiOpt.filter below) so it skips its own filter-build pass
+    // (one fewer yak count pass) and seeds against the identical k-mer set. The
+    // filter is keyed by (k, w, HPC), so it MUST be built at the same marker k /
+    // no-HPC the overlapper sketches at. Ownership is held here until overlaps
+    // are generated, then destroyed.
+    hifiasm_filter_opt_t filterOpt = {};
+    filterOpt.threads = int(threadCount);
+    filterOpt.k_mer_length = markerK;
+    filterOpt.mz_win = markerK;
+    filterOpt.is_hpc = 0;        // dinara markers are no-HPC
+    filterOpt.min_read_len = -1; // keep all reads (match dinara's set)
 
+    performanceLog << timestamp
+        << "Building hifiasm overlap-path minimizer filter (no-HPC, k=w="
+        << markerK << ") from in-memory read store." << endl;
+    hifiasm_filter_t* overlapReuseFilter =
+        hifiasm_build_filter_from_store(&filterOpt);
+    if(overlapReuseFilter == nullptr) {
+        throw runtime_error(
+            "Failed to build hifiasm minimizer filter for markers.");
+    }
+    performanceLog << timestamp << "hifiasm minimizer filter built." << endl;
 
+    // Markers are derived from hifiasm's native overlap chains AFTER detection
+    // (createMarkersFromNativeChain), so no marker sketch runs here and marker
+    // creation is deferred. The chain anchors are the only marker positions that
+    // can become anchors; sketching a full marker set would just add
+    // marker-graph singletons. Chain-derived markers cluster in aligned
+    // interiors and omit a read's extreme minimizers, so the span-coverage read
+    // filter is not meaningful and is not applied on this path.
+    cout << "Deferring marker creation to hifiasm native chain." << endl;
 
-    // ========================================================================
-    // HIFIASM MAX_N_CHAIN CALCULATION (Per-Read Overlap Limiting)
-    // ========================================================================
-    // Reference: Hifiasm CommandLines.cpp:413, anchor.cpp:191-220
-    //
-    // Compute max_n_chain = max(MIN_N_CHAIN, hom_cov * high_factor)
-    //
-    // Purpose: Limit total number of overlaps kept per read across ALL partners
-    // - Applied AFTER chaining all read pairs (not during DP chaining)
-    // - Prevents memory explosion from reads with many partners
-    // - Keeps top N overlaps by score, grouped by overlap type
-    //
-    // Hifiasm defaults:
-    //   high_factor = 5.0 (CommandLines.cpp:271)
-    //   MIN_N_CHAIN = 100 (CommandLines.h:28)
-    //
+    // Coverage distribution (coverageLow/Het/Hom) feeds phasing, EC, and the
+    // chaining-frequency cutoff. hifiasm already computed the marker k-mer count
+    // histogram while building the filter (ha_ft_gen), so we take its
+    // authoritative peaks directly instead of a second dinara-side histogram
+    // pass over every marker.
+    {
+        const int homCov = hifiasm_filter_hom_cov(overlapReuseFilter);
+        const int hetCov = hifiasm_filter_het_cov(overlapReuseFilter);
+        const int lowCov = hifiasm_filter_low_cov(overlapReuseFilter);
+        auto& dist = assembler.assemblerInfo->kmerDistributionInfo;
+        dist.coverageHom = (homCov > 0) ? uint64_t(homCov) : 0;
+        dist.coverageHet = (hetCov > 0) ? uint64_t(hetCov) : dist.coverageHom;
+        dist.coverageLow = (lowCov > 0) ? uint64_t(lowCov) : 2;
+        cout << "Marker k-mer coverage from hifiasm peaks:"
+                " low "  << dist.coverageLow <<
+                ", het " << dist.coverageHet <<
+                ", hom " << dist.coverageHom << endl;
+        // Effective chaining cutoff: min(coverageHom * 5, maxChainingFreq),
+        // matching hifiasm's min(hom_cov * 5, max_kmer_cnt) logic.
+        const uint64_t effectiveChainingFreq = min(dist.coverageHom * 5,
+            uint64_t(assemblerOptions.overlapCandidatesOptions.maxChainingFreq));
+        cout << "Chaining limited to frequency <= "
+             << effectiveChainingFreq << "." << endl;
+    }
+
+    // Initialize KmerChecker for HttpServer diagnostics (optional).
+    cout << "Initializing KmerChecker for diagnostics." << endl;
+    assembler.createKmerChecker(assemblerOptions.kmersOptions, threadCount);
+
     // Generate read overlaps with the bundled hifiasm library from the loaded
     // in-memory read store (no file re-reads) and import them. hifiasm exports,
     // per overlap, the candidate pair, its aligned interval, AND its native
     // dense chain (its own colinear-DP anchors); dinara maps those anchors
     // straight to marker ordinals rather than re-chaining. Overlaps come back in
     // memory keyed by read name.
+    //
+    // Overlap detection runs in dinara's marker space: no-HPC at the marker k,
+    // reusing the prebuilt filter. This unifies the overlapper with marker
+    // selection so (a) the reused filter's k-mer counts correspond to the
+    // minimizers being filtered and (b) hifiasm's native chain anchors land 1:1
+    // on dinara marker positions.
     hifiasm_ovlp_opt_t hifiOpt = {};
-    hifiOpt.threads = int(threadCount);
-
-    // Run overlap detection in dinara's marker space: NO homopolymer compression
-    // and the SAME k/w the markers were selected at (no-HPC selectK/selectW),
-    // reusing the prebuilt marker filter. This unifies the overlapper with the
-    // marker selection so (a) the reused filter's k-mer counts correspond to the
-    // minimizers being filtered and (b) hifiasm's native chain anchors land
-    // exactly on dinara marker positions.
-    DINARA_ASSERT(overlapReuseFilter != nullptr);
+    hifiOpt.threads      = int(threadCount);
     hifiOpt.no_hpc       = 1;
-    hifiOpt.k_mer_length = overlapSeedK;
-    hifiOpt.mz_win       = overlapSeedW;
+    hifiOpt.k_mer_length = markerK;
+    hifiOpt.mz_win       = markerK;
     hifiOpt.filter       = overlapReuseFilter;
     performanceLog << timestamp
-        << "Overlap detection: no-HPC, k=" << overlapSeedK
-        << ", w=" << overlapSeedW
+        << "Overlap detection: no-HPC, k=w=" << markerK
         << ", reusing prebuilt marker filter." << endl;
 
     hifiasm_overlap_t* ov = nullptr;
@@ -1948,7 +1782,7 @@ void dinara::main::assemble(
     // computeBaseAlignmentsAndStore (which maps chain anchors to marker ordinals).
     // createMarkersFromNativeChain builds BOTH markers and markerKmerIds (strand
     // 0 and the RC-mirrored strand 1), so computeMarkerKmerIds is not needed.
-    assembler.assemblerInfo->k = markerEncodeK;
+    assembler.assemblerInfo->k = markerK;
     assembler.createMarkersFromNativeChain(
         ov, nOv, names, nameOff, nReads,
         chain, chainLen, threadCount);
@@ -1958,9 +1792,8 @@ void dinara::main::assemble(
     free(chain);  // native chain arena (plain uint64_t array; owned by caller)
     chain = nullptr;
 
-    // The overlap-path filter (reused from marker selection) is no longer needed
-    // once overlaps are generated. Destroyed here rather than in the marker
-    // block so it survived to be reused by overlap detection above.
+    // The overlap-path filter (built above and reused for overlap detection) is
+    // no longer needed once overlaps are generated.
     hifiasm_filter_destroy(overlapReuseFilter);
     overlapReuseFilter = nullptr;
 

@@ -160,13 +160,6 @@ public:
     string file;
     string globalFrequencyOverrideDirectory;
 
-    // hifiasm's overlap-path minimizer filter (high-occurrence k-mer filter +
-    // distance subsampling) selects the markers so they match the seeds hifiasm
-    // uses for overlap detection. This is the sample distance (in bases) for the
-    // subsampling stage; hifiasm's overlap default is 500. Must be greater than
-    // the minimizer window for subsampling to take effect.
-    int hifiasmMarkerSampleDist;
-
     // Minimum fraction of read length that must be covered by the marker span
     // (lastMarkerPos + k - firstMarkerPos). Reads below this are discarded.
     // 0 disables the filter.
