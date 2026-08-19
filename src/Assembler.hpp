@@ -883,7 +883,6 @@ public:
 	    void keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount);
 public:
     // Hifiasm-style filtering methods (called from main.cpp)
-    void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);
     void filterHangingOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     /// Delete overlaps where one read is contained in the other (ma_hit2arc containment).
@@ -896,27 +895,14 @@ public:
     /// overhangs and make MA_HT_INT undetectable.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
-    void removeContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void removeReadsFlaggedContained(uint64_t threadCount);
     void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
-
-    // Rescue overlaps where one side says trans but the partner says cis.
-    // Adapted from hifiasm's try_rescue_overlaps. If ≥ minPileup disagreement
-    // overlaps pile up spatially on a read, that read's trans calls are flipped
-    // to cis. Call after phaseOverlapsKmeans, before createReadGraphFromPhasingCisOverlaps.
-    // skipDeleted: when true, skip overlaps with any deleteReason set by earlier
-    // pipeline stages (chimeric, contained, weak, etc.). Maps to hifiasm's
-    // is_del parameter, which is true for ONT and false for HiFi.
-    void rescueTransOverlaps(uint64_t minPileup = 4, bool skipDeleted = false);
 
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
 
 private:
-    // Filter local segments (coverage based) - thread function
-    void filterLocalSegmentsThreadFunction(size_t threadId);
-    
     // Structure for local segment filtering results
     struct ReadSegmentStatus {
         uint32_t start = 0;
@@ -1167,7 +1153,6 @@ private:
 
     // Chimeric Read Detection
 public:
-    void detectChimericReads(uint64_t threadCount);
     void rescueChimericReads(uint64_t threadCount);
     
     // Rescue phased overlaps (try_rescue_overlaps equivalent)
@@ -1178,7 +1163,6 @@ public:
     uint64_t countActiveAlignments() const;
 
 private:
-    void detectChimericReadsThreadFunction(size_t threadId);
     void rescueChimericReadsThreadFunction(size_t threadId);
     void rescuePhasedOverlapsThreadFunction(size_t threadId);
     uint64_t rescuePhasedThreshold = 4; // Default threshold from Hifiasm
@@ -1586,11 +1570,6 @@ private:
     // Unlabeled overlaps (state 0) are kept.
     void createReadGraphFromPhasingCisOverlaps();
     void createReadGraphFromPhasingCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
-
-    // asg_arc_del_trans port: remove transitive edges from the read graph.
-    // An edge v→x is transitive if there exists v→w→x with
-    // len(v→w) + len(w→x) <= len(v→x) + fuzz.
-    uint64_t transitiveReductionOnReadGraph(int32_t fuzz = 5000);
 
     // Like createReadGraphFromEcParityCisOverlaps, but only keep cis overlaps that
     // cover at least one informative site (as recorded by AlignmentData::coversHetSite()

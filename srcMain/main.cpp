@@ -1824,25 +1824,7 @@ void dinara::main::assemble(
 
     // assembler.performHifiasmECParity(threadCount);
 
-    // ---- Post-phasing overlap cleaning (hifiasm order: Overlaps.cpp:39390-39726) ----
-
-    // NOTE: filterLocalSegments(minCoverage=0) is intentionally NOT called here.
-    // It only populates validReadIntervals, and no stage in the live pipeline
-    // reads it: deleteInternalOverlaps and flagContainedReads use raw read
-    // lengths directly, and createReadGraphFromPhasingCisOverlaps filters on
-    // ad.keptByBothSides()/hifiasmEcMatchState. Re-enable it (as the ma_hit_sub
-    // init point) if any validReadIntervals reader is turned back on:
-    // detectChimericReads, removeContainedReads, coverage trimming
-    // (applyCoverageCuts / filterHangingOverlaps), or
-    // createReadGraphFromFilteredAlignments.
-
-    // // Flag chimeric reads — reads whose overlaps don't form a consistent
-    // // linear arrangement. A chimeric read has left-side and right-side
-    // // overlaps that come from different genomic locations (artifact of
-    // // library prep joining unrelated fragments). All overlaps of flagged
-    // // reads are deleted. The chimeric flag is also checked by
-    // // createMarkerGraphVertices, which skips chimeric reads.
-    // assembler.detectChimericReads(threadCount);
+    // ---- Post-phasing overlap cleaning ----
 
     // Delete internal (non-dovetail) overlaps: matches that dangle off both
     // reads instead of reaching a read end -- repeat-induced or spurious
@@ -1851,8 +1833,7 @@ void dinara::main::assemble(
     // This drops ONLY internal / short overlaps. Containments (MA_HT_QCONT /
     // MA_HT_TCONT) are intentionally KEPT: contained reads are only *flagged*
     // later (flagContainedReads), never removed here, because dropping their
-    // overlaps would fragment the graph. removeContainedReads stays disabled
-    // for the same reason.
+    // overlaps would fragment the graph.
     //
     // Coordinates: this uses the TIGHT CIGAR span (ad.qs/qe/ts/te). Internal
     // matches are only detectable on tight coordinates -- extending them to the
@@ -1863,10 +1844,6 @@ void dinara::main::assemble(
     // tight span here.
     assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
-    // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
-
-    // assembler.rescueTransOverlaps(/* minPileup */ 4, /* skipDeleted */ true);
-
     // Build the read graph used for marker graph vertex construction.
     // Includes only alignments that:
     // - Are not deleted (no deleteReasons on either side — filters out
@@ -1875,11 +1852,6 @@ void dinara::main::assemble(
     // Cis (state 1) and unlabeled (state 0) alignments are kept.
     // The read graph edges drive the disjoint set merges in createMarkerGraphVertices.
     assembler.createReadGraphFromPhasingCisOverlaps();
-
-    // // 8. Transitive reduction: remove redundant edges where v→x can be
-    // //    reached through v→w→x within fuzz tolerance.
-    // //    Port of asg_arc_del_trans.
-    // assembler.transitiveReductionOnReadGraph(/* fuzz */ 5000);
 
     // Set min and max marker graph vertex coverage thresholds.
     // const uint64_t minAnchorCoverage = std::max((uint64_t)3, (uint64_t)(0.15 * double(coverageHet) / 2));
