@@ -446,13 +446,6 @@ public:
     // Must be called after createMarkerGraphVertices and computeCandidateTable.
     void filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount);
 
-    // Diagnostic (does not remove anything yet): detect the same class of
-    // transitive-collapse false merges as filterMarkerGraphVerticesByChainConsistency
-    // above, but via cross-read order agreement on consecutive journey vertices
-    // instead of alignment-ordinal-range reconstruction. Must be called after
-    // createMarkerGraphVertices.
-    void filterMarkerGraphVerticesByJourneyOrderConsistency(uint64_t threadCount);
-
     // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
     // overlap start/end events on each oriented read (using read-graph overlaps).
     // This produces fewer anchors than using all marker graph vertices, while preserving

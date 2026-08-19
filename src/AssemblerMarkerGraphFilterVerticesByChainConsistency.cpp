@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <fstream>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace dinara;
@@ -51,6 +52,13 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
 
             // Thread-local reusable buffers.
             vector<pair<OrientedReadId, uint32_t>> readOrdinals;
+            // Maps a vertex member's OrientedReadId to the sorted list of its
+            // indices in readOrdinals. Lets the alignment partner be located
+            // without rescanning the whole vertex. A read can legitimately
+            // appear more than once in a vertex (a repeat merged onto itself by
+            // the transitive collapse -- exactly what this filter targets), so
+            // indices are kept as a list, not a single slot. Rebuilt per vertex.
+            unordered_map<uint64_t, vector<uint32_t>> readIndicesInVertex;
 
             for(MarkerGraph::VertexId vertexId = begin; vertexId < end; ++vertexId) {
                 const span<const MarkerId> markerIds = markerGraph.getVertexMarkerIds(vertexId);
@@ -59,15 +67,25 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                     continue;
                 }
 
-                // Get (orientedReadId, ordinal) for each marker in this vertex.
+                // Get (orientedReadId, ordinal) for each marker in this vertex,
+                // and index it by OrientedReadId for fast partner lookup below.
+                // Indices are appended in increasing order, so each list stays
+                // sorted.
                 readOrdinals.resize(n);
+                readIndicesInVertex.clear();
+                readIndicesInVertex.reserve(n * 2);
                 for(uint64_t i = 0; i < n; ++i) {
                     readOrdinals[i] = dinara::findMarkerId(markerIds[i], *markers);
+                    readIndicesInVertex[readOrdinals[i].first.getValue()].push_back(uint32_t(i));
                 }
 
-                // Check all unique pairs (i, j) with i < j.
-                // For each i, scan its candidate table once and check
-                // all j's that appear in it.
+                // Check each unordered pair (i, j), i < j, that has a stored
+                // alignment, at most once. For each i, scan its stored alignments
+                // and jump straight to the partner's indices in this vertex via
+                // readIndicesInVertex, taking the first index > i. This mirrors
+                // the original "first j > i match" semantics exactly (including
+                // the duplicate-read case) while avoiding the per-alignment
+                // linear rescan of the vertex.
                 bool foundInconsistent = false;
 
                 for(uint64_t i = 0; i < n && !foundInconsistent; ++i) {
@@ -83,7 +101,7 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                     const auto alignmentIndices = alignmentTable[readIdI.getValue()];
 
                     // For each stored alignment of readIdI, check if the other
-                    // read is one of the reads j > i in this vertex.
+                    // read is a member j > i of this vertex.
                     for(const uint32_t alignmentIndex : alignmentIndices) {
                         if(foundInconsistent) break;
 
@@ -96,58 +114,64 @@ void Assembler::filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount
                             (readIdI.getReadId() == ad.readIds[0]) ?
                                 canonicalRead1 : canonicalRead0;
 
-                        // Find otherReadId among reads j > i in this vertex.
-                        for(uint64_t j = i + 1; j < n; ++j) {
-                            if(readOrdinals[j].first != otherReadId) {
-                                continue;
-                            }
+                        // Locate the partner's indices in this vertex and take
+                        // the first one > i (the sorted list makes this the
+                        // original's "first j > i" without a full rescan).
+                        const auto it = readIndicesInVertex.find(otherReadId.getValue());
+                        if(it == readIndicesInVertex.end()) {
+                            continue;
+                        }
+                        const vector<uint32_t>& partnerIndices = it->second;
+                        const auto jt = std::upper_bound(
+                            partnerIndices.begin(), partnerIndices.end(), uint32_t(i));
+                        if(jt == partnerIndices.end()) {
+                            continue;
+                        }
+                        const uint64_t j = *jt;
 
-                            // Found a pair (i, j) with an alignment. Check consistency.
-                            const uint32_t ordinalJ = readOrdinals[j].second;
+                        // Found a pair (i, j) with an alignment. Check consistency.
+                        const uint32_t ordinalJ = readOrdinals[j].second;
 
-                            if(ad.info.markerCount == 0) {
-                                foundInconsistent = true;
-                                break;
-                            }
+                        if(ad.info.markerCount == 0) {
+                            foundInconsistent = true;
+                            break;
+                        }
 
-                            // Determine which alignment slot (0 or 1) corresponds to readIdI and readIdJ.
-                            int slotI, slotJ;
-                            if(readIdI.getReadId() == ad.readIds[0]) {
-                                slotI = 0;
-                                slotJ = 1;
-                            } else {
-                                slotI = 1;
-                                slotJ = 0;
-                            }
+                        // Determine which alignment slot (0 or 1) corresponds to readIdI and readIdJ.
+                        int slotI, slotJ;
+                        if(readIdI.getReadId() == ad.readIds[0]) {
+                            slotI = 0;
+                            slotJ = 1;
+                        } else {
+                            slotI = 1;
+                            slotJ = 0;
+                        }
 
-                            // Convert vertex ordinals to canonical ordinal space if needed.
-                            const OrientedReadId canonI = (slotI == 0) ? canonicalRead0 : canonicalRead1;
-                            const OrientedReadId canonJ = (slotJ == 0) ? canonicalRead0 : canonicalRead1;
+                        // Convert vertex ordinals to canonical ordinal space if needed.
+                        const OrientedReadId canonI = (slotI == 0) ? canonicalRead0 : canonicalRead1;
+                        const OrientedReadId canonJ = (slotJ == 0) ? canonicalRead0 : canonicalRead1;
 
-                            uint32_t canonOrdinalI = ordinalI;
-                            if(readIdI != canonI) {
-                                // readIdI is on the opposite strand from canonical.
-                                const uint32_t mc = uint32_t(markers->size(readIdI.getValue()));
-                                canonOrdinalI = mc - 1 - ordinalI;
-                            }
+                        uint32_t canonOrdinalI = ordinalI;
+                        if(readIdI != canonI) {
+                            // readIdI is on the opposite strand from canonical.
+                            const uint32_t mc = uint32_t(markers->size(readIdI.getValue()));
+                            canonOrdinalI = mc - 1 - ordinalI;
+                        }
 
-                            uint32_t canonOrdinalJ = ordinalJ;
-                            if(readOrdinals[j].first != canonJ) {
-                                const uint32_t mc = uint32_t(markers->size(readOrdinals[j].first.getValue()));
-                                canonOrdinalJ = mc - 1 - ordinalJ;
-                            }
+                        uint32_t canonOrdinalJ = ordinalJ;
+                        if(readOrdinals[j].first != canonJ) {
+                            const uint32_t mc = uint32_t(markers->size(readOrdinals[j].first.getValue()));
+                            canonOrdinalJ = mc - 1 - ordinalJ;
+                        }
 
-                            const uint32_t chainStartI = ad.info.data[slotI].firstOrdinal;
-                            const uint32_t chainEndI   = ad.info.data[slotI].lastOrdinal;
-                            const uint32_t chainStartJ = ad.info.data[slotJ].firstOrdinal;
-                            const uint32_t chainEndJ   = ad.info.data[slotJ].lastOrdinal;
+                        const uint32_t chainStartI = ad.info.data[slotI].firstOrdinal;
+                        const uint32_t chainEndI   = ad.info.data[slotI].lastOrdinal;
+                        const uint32_t chainStartJ = ad.info.data[slotJ].firstOrdinal;
+                        const uint32_t chainEndJ   = ad.info.data[slotJ].lastOrdinal;
 
-                            if(canonOrdinalI < chainStartI || canonOrdinalI > chainEndI ||
-                               canonOrdinalJ < chainStartJ || canonOrdinalJ > chainEndJ) {
-                                foundInconsistent = true;
-                            }
-
-                            break; // Only one j can match this otherReadId.
+                        if(canonOrdinalI < chainStartI || canonOrdinalI > chainEndI ||
+                           canonOrdinalJ < chainStartJ || canonOrdinalJ > chainEndJ) {
+                            foundInconsistent = true;
                         }
                     }
                 }
