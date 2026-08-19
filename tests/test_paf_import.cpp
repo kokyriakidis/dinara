@@ -122,15 +122,17 @@ TEST_CASE("dedupPafEntriesKeepBestScore: highest score wins over longer span", "
     REQUIRE(entries[0].iv.blockLen == 300);
 }
 
-TEST_CASE("dedupPafEntriesKeepBestScore: ties on score fall back to longer span", "[paf]") {
+TEST_CASE("dedupPafEntriesKeepBestScore: ties on score fall back to shorter span", "[paf]") {
+    // hifiasm's per-target collapse (anchor.cpp:756) keeps the SMALLER overlapLen
+    // on a shared_seed tie, so the shorter span must survive.
     vector<PafEntry> entries = {
-        makePafEntry(1, 2, 0, 300, 0, 300, 300, 60, true),
         makePafEntry(1, 2, 0, 700, 0, 700, 700, 60, true),   // same score, longer span
+        makePafEntry(1, 2, 0, 300, 0, 300, 300, 60, true),   // same score, shorter span (kept)
     };
     dedupPafEntriesKeepBestScore(entries);
     REQUIRE(entries.size() == 1);
     REQUIRE(entries[0].iv.sharedSeedScore == 60);
-    REQUIRE(entries[0].iv.blockLen == 700);
+    REQUIRE(entries[0].iv.blockLen == 300);
 }
 
 TEST_CASE("dedupPafEntriesKeepBestScore: result is order-independent", "[paf]") {

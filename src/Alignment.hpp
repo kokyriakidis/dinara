@@ -242,12 +242,6 @@ public:
     // single-affine overlap scoring model. Populated when ProjectedAlignment is computed.
     int64_t dpScore = invalid<int64_t>;
 
-    // Hifiasm minimizer-chain DP score (`overlap_region.shared_seed`) for this overlap.
-    // This is populated when the overlap originated from the inverted-index chaining path.
-    // It remains invalid when a given alignment-generation path did not compute a hifiasm-style
-    // chaining score.
-    int32_t sharedSeedScore = invalid<int32_t>;
-
     // Evidence ID (APES/TASSD index)
     size_t alignmentId = invalid<size_t>;
 
@@ -290,14 +284,13 @@ public:
     //   alignment DP score computed from a base CIGAR.
     // - When shared_seed ties, hifiasm prefers the *smaller* overlapLen.
     //
-    // Return hifiasm's stored minimizer-chain DP (`shared_seed`) when available.
-    // Otherwise fall back to a deterministic proxy that correlates with chain strength:
-    // the number of aligned markers in the marker alignment.
+    // hifiasm's shared_seed is not carried on AlignmentInfo (import-time dedup in
+    // PafImport already selects overlaps by shared_seed; see
+    // dedupPafEntriesKeepBestScore). Where later stages need a per-alignment
+    // chain-strength ranking they use the number of aligned markers, which
+    // correlates with chain strength, as a deterministic proxy.
     int64_t hifiasmSharedSeedScoreProxy() const
     {
-        if(sharedSeedScore != invalid<int32_t>) {
-            return int64_t(sharedSeedScore);
-        }
         return int64_t(markerCount);
     }
 

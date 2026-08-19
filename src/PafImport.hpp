@@ -86,15 +86,19 @@ inline PafEntry makePafEntry(
 // descending): for each (key, strand) the entry with the highest
 // sharedSeedScore sorts first, so dedup keeps the same overlap hifiasm would.
 //   key ascending, then strand (same before diff), then sharedSeedScore
-//   DESCENDING, then blockLen DESCENDING as a tie-break (longer span first),
+//   DESCENDING, then blockLen ASCENDING as a tie-break (SHORTER span first),
 //   then remaining fields to break ties reproducibly.
+//
+// The blockLen tie-break direction matches hifiasm's per-target collapse
+// (anchor.cpp:755-756): on a shared_seed tie it keeps the candidate with the
+// smaller overlapLen (`shared_seed == shared_seed && overlapLen <= overlapLen`).
 inline bool pafEntryLess(const PafEntry& a, const PafEntry& b)
 {
     if(a.key != b.key) return a.key < b.key;
     // same-strand (true) sorts before reverse (false).
     if(a.iv.isSameStrand != b.iv.isSameStrand) return int(a.iv.isSameStrand) > int(b.iv.isSameStrand);
     if(a.iv.sharedSeedScore != b.iv.sharedSeedScore) return a.iv.sharedSeedScore > b.iv.sharedSeedScore;
-    if(a.iv.blockLen != b.iv.blockLen) return a.iv.blockLen > b.iv.blockLen;
+    if(a.iv.blockLen != b.iv.blockLen) return a.iv.blockLen < b.iv.blockLen;
     if(a.iv.qStart != b.iv.qStart) return a.iv.qStart < b.iv.qStart;
     if(a.iv.qEnd != b.iv.qEnd) return a.iv.qEnd < b.iv.qEnd;
     if(a.iv.tStart != b.iv.tStart) return a.iv.tStart < b.iv.tStart;
@@ -104,11 +108,11 @@ inline bool pafEntryLess(const PafEntry& a, const PafEntry& b)
 
 // Sort `entries` in place and collapse duplicates by (key, strand), keeping the
 // entry with the highest sharedSeedScore (hifiasm's chain DP score, tie-broken
-// by longest span) for each (key, strand). This matches hifiasm's own overlap
-// selection (oreg_ss_lt: shared_seed descending). A read pair that overlaps in
-// both orientations therefore keeps up to two entries (one +, one -). After this
-// call `entries` is in ascending key order, same-strand before reverse within a
-// key (deterministic).
+// by SHORTER span) for each (key, strand). This matches hifiasm's own overlap
+// selection (oreg_ss_lt: shared_seed descending; smaller overlapLen wins on a
+// tie). A read pair that overlaps in both orientations therefore keeps up to two
+// entries (one +, one -). After this call `entries` is in ascending key order,
+// same-strand before reverse within a key (deterministic).
 inline void dedupPafEntriesKeepBestScore(std::vector<PafEntry>& entries)
 {
     std::sort(entries.begin(), entries.end(), pafEntryLess);
