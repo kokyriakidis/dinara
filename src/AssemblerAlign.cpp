@@ -245,9 +245,6 @@ void Assembler::alignOverlappingOrientedReads(
 
 
 
-// Minimum PAF alignment block length (column 11) for an overlap to be kept.
-static constexpr uint64_t pafMinAlignmentBlockLength = 200;
-
 // Deduplicate the collected overlap entries (one entry per (read pair, strand),
 // keeping the overlap with the highest hifiasm chain DP score) and publish them
 // into alignmentCandidates.candidates. Returns the number of duplicate entries
@@ -323,7 +320,10 @@ void Assembler::importAlignmentCandidatesFromMemory(
     // coordinates (the PAF path reports them alongside the raw read length), so
     // these are base-count tests:
     //   - kMinOverlapLen (OverlapCandidates.minOverlapLength): keep only when
-    //     BOTH the query and target spans reach this many bases.
+    //     the overlap span between the first and last shared minimizer reaches
+    //     this many bases. This is block_len (o.x_pos_e - o.x_pos_s + 1), the
+    //     chain's query-side span; it is the single overlap-length floor (the
+    //     former hardcoded 200 bp block-length floor is folded into this).
     //   - kDovetailHang (OverlapCandidates.maxEndFuzz): keep only when the
     //     aligned interval reaches within this many bases of an END of EACH
     //     read (dovetail test), dropping internal / repeat matches interior to
@@ -333,7 +333,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const uint32_t kMinOverlapLen = minOverlapLength;
     const uint32_t kDovetailHang  = maxEndFuzz;
     cout << timestamp << "Candidate filters: minOverlapLength="
-         << kMinOverlapLen << " (min of query/target span), maxEndFuzz="
+         << kMinOverlapLen << " (span between first and last shared minimizer), maxEndFuzz="
          << kDovetailHang << " (dovetail hang); 0 disables." << endl;
     auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
                       uint32_t hang) -> bool {
@@ -341,7 +341,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     };
 
     // Build PafEntry records in parallel, mirroring the per-record filtering of
-    // the PAF importer (block length floor, distinct, non-palindromic).
+    // the PAF importer (overlap-length floor, distinct, non-palindromic).
     const uint64_t batch = std::max<uint64_t>(1, overlapCount / threadCount);
     vector<vector<PafEntry>> threadEntries(threadCount);
     vector<uint64_t> threadKept(threadCount, 0);
@@ -355,7 +355,6 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 i < overlapCount && (ti == threadCount - 1 || i < (ti + 1) * batch);
                 i++) {
                 const hifiasm_overlap_t& o = overlaps[i];
-                if(o.block_len < pafMinAlignmentBlockLength) continue;
                 if(o.q_id >= readCountFromHifiasm || o.t_id >= readCountFromHifiasm) continue;
                 const ReadId readId0 = hifiToDinara[o.q_id];
                 const ReadId readId1 = hifiToDinara[o.t_id];
@@ -367,12 +366,10 @@ void Assembler::importAlignmentCandidatesFromMemory(
                     !reads->getFlags(readId1).isPalindromic;
                 if(!valid) continue;
 
-                // Minimum overlap length: both spans must reach kMinOverlapLen.
-                if(kMinOverlapLen > 0) {
-                    const uint32_t qSpan = (o.q_end > o.q_start) ? (o.q_end - o.q_start) : 0;
-                    const uint32_t tSpan = (o.t_end > o.t_start) ? (o.t_end - o.t_start) : 0;
-                    if(qSpan < kMinOverlapLen || tSpan < kMinOverlapLen) continue;
-                }
+                // Minimum overlap length: the span between the first and last
+                // shared minimizer (block_len = o.x_pos_e - o.x_pos_s + 1) must
+                // reach kMinOverlapLen. Single length floor; 0 disables.
+                if(kMinOverlapLen > 0 && o.block_len < kMinOverlapLen) continue;
 
                 // Dovetail gate: require end-proximity on BOTH reads. Fail open
                 // when a raw length is unknown (0).
