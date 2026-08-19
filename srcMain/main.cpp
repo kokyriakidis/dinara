@@ -1980,7 +1980,7 @@ void dinara::main::assemble(
     //
     // Flip this to switch methods; the unused path is not built.
     // ========================================================================
-    #define USE_JOURNEY_ANCHOR_GRAPH 0
+    #define USE_JOURNEY_ANCHOR_GRAPH 1
 
     // Shared across both methods. In the journey path these stay empty: an empty
     // `anchorWindows` makes the assembly-graph stage fall back to length-only
