@@ -1826,11 +1826,15 @@ void dinara::main::assemble(
 
     // ---- Post-phasing overlap cleaning (hifiasm order: Overlaps.cpp:39390-39726) ----
 
-    // Initialize per-read valid intervals. With minCoverage=0 this sets
-    // every read's interval to [0, readLen). Must run before the next two
-    // steps which read validReadIntervals to compute hangs and classify
-    // overlaps.
-    assembler.filterLocalSegments(/* minCoverage */ 0, threadCount);
+    // NOTE: filterLocalSegments(minCoverage=0) is intentionally NOT called here.
+    // It only populates validReadIntervals, and no stage in the live pipeline
+    // reads it: deleteInternalOverlaps and flagContainedReads use raw read
+    // lengths directly, and createReadGraphFromPhasingCisOverlaps filters on
+    // ad.keptByBothSides()/hifiasmEcMatchState. Re-enable it (as the ma_hit_sub
+    // init point) if any validReadIntervals reader is turned back on:
+    // detectChimericReads, removeContainedReads, coverage trimming
+    // (applyCoverageCuts / filterHangingOverlaps), or
+    // createReadGraphFromFilteredAlignments.
 
     // // Flag chimeric reads — reads whose overlaps don't form a consistent
     // // linear arrangement. A chimeric read has left-side and right-side
