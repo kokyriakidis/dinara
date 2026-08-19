@@ -466,17 +466,19 @@ void AssemblerOptions::addConfigurableOptions()
         "Implemented as block_len >= threshold, where block_len is the span "
         "between the first and last shared minimizer of the chain. 0 disables.")
 
+        // Deprecated and IGNORED. The crude absolute end-proximity dovetail
+        // gate this controlled has been replaced by deleteInternalOverlaps
+        // (hifiasm ma_hit2arc on the tight CIGAR span). Accepted so existing
+        // command lines still parse; the value has no effect.
         ("OverlapCandidates.maxEndFuzz",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz)->
-        default_value(350),
-        "Dovetail hang in bases: keep a candidate only when its overlap reaches "
-        "within this many bases of an END of BOTH reads, dropping matches "
-        "interior to either read. 0 disables.")
+        default_value(0),
+        "Deprecated and ignored: dovetail/internal filtering is now done by "
+        "deleteInternalOverlaps (ma_hit2arc). Accepted for compatibility.")
 
-        // Backward compatible alias (deprecated).
         ("OverlapCandidates.maxEndExtension",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz),
-        "Deprecated alias for OverlapCandidates.maxEndFuzz.")
+        "Deprecated and ignored alias for OverlapCandidates.maxEndFuzz.")
 
         ("Align.alignMethod",
         value<int>(&alignOptions.alignMethod)->

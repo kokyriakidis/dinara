@@ -291,8 +291,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const uint64_t* chain,
     uint64_t chainLen,
     uint64_t threadCount,
-    uint32_t minOverlapLength,
-    uint32_t maxEndFuzz)
+    uint32_t minOverlapLength)
 {
     cout << timestamp << "Importing " << overlapCount
          << " hifiasm overlaps from memory..." << endl;
@@ -324,21 +323,18 @@ void Assembler::importAlignmentCandidatesFromMemory(
     //     this many bases. This is block_len (o.x_pos_e - o.x_pos_s + 1), the
     //     chain's query-side span; it is the single overlap-length floor (the
     //     former hardcoded 200 bp block-length floor is folded into this).
-    //   - kDovetailHang (OverlapCandidates.maxEndFuzz): keep only when the
-    //     aligned interval reaches within this many bases of an END of EACH
-    //     read (dovetail test), dropping internal / repeat matches interior to
-    //     both reads.
-    // 0 disables a gate. The dovetail test fails OPEN when a read length is
-    // unknown, so a name-resolution miss never silently drops a real overlap.
+    // 0 disables the gate.
+    //
+    // Dovetail / internal-match classification is NOT done here. It is handled
+    // downstream by deleteInternalOverlaps (a faithful hifiasm ma_hit2arc on the
+    // tight CIGAR span), which drops MA_HT_INT / MA_HT_SHORT_OVLP while keeping
+    // containments. Doing it at import on raw pre-alignment coordinates was a
+    // crude approximation and has been removed.
     const uint32_t kMinOverlapLen = minOverlapLength;
-    const uint32_t kDovetailHang  = maxEndFuzz;
     cout << timestamp << "Candidate filters: minOverlapLength="
-         << kMinOverlapLen << " (span between first and last shared minimizer), maxEndFuzz="
-         << kDovetailHang << " (dovetail hang); 0 disables." << endl;
-    auto nearEnd = [](uint32_t start, uint32_t end, uint32_t len,
-                      uint32_t hang) -> bool {
-        return start < hang || (len > 0 && end + hang > len);
-    };
+         << kMinOverlapLen << " (span between first and last shared minimizer); "
+         << "0 disables. Dovetail/internal filtering deferred to "
+         << "deleteInternalOverlaps (ma_hit2arc)." << endl;
 
     // Build PafEntry records in parallel, mirroring the per-record filtering of
     // the PAF importer (overlap-length floor, distinct, non-palindromic).
@@ -371,17 +367,6 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 // reach kMinOverlapLen. Single length floor; 0 disables.
                 if(kMinOverlapLen > 0 && o.block_len < kMinOverlapLen) continue;
 
-                // Dovetail gate: require end-proximity on BOTH reads. Fail open
-                // when a raw length is unknown (0).
-                if(kDovetailHang > 0) {
-                    const uint32_t qLen = uint32_t(reads->getReadRawSequenceLength(readId0));
-                    const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(readId1));
-                    if(qLen > 0 && tLen > 0) {
-                        const bool qNear = nearEnd(o.q_start, o.q_end, qLen, kDovetailHang);
-                        const bool tNear = nearEnd(o.t_start, o.t_end, tLen, kDovetailHang);
-                        if(!(qNear && tNear)) continue;
-                    }
-                }
                 PafEntry entry = makePafEntry(
                     readId0, readId1,
                     o.q_start, o.q_end,

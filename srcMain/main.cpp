@@ -1773,8 +1773,7 @@ void dinara::main::assemble(
         ov, nOv, names, nameOff, nReads,
         /*cigar*/ nullptr, /*cigarLen*/ 0,
         /*chain*/ chain, /*chainLen*/ chainLen, threadCount,
-        assemblerOptions.overlapCandidatesOptions.minOverlapLength,
-        assemblerOptions.overlapCandidatesOptions.maxEndFuzz);
+        assemblerOptions.overlapCandidatesOptions.minOverlapLength);
 
     // Deferred marker creation: build the marker set from hifiasm's native chain
     // anchors (the shared k-mer positions), then persist. Must happen while
@@ -1841,25 +1840,24 @@ void dinara::main::assemble(
     // // createMarkerGraphVertices, which skips chimeric reads.
     // assembler.detectChimericReads(threadCount);
 
-    // Delete internal overlaps — overlaps where both reads extend
-    // significantly beyond the aligned region on the same side.
+    // Delete internal (non-dovetail) overlaps: matches that dangle off both
+    // reads instead of reaching a read end -- repeat-induced or spurious
+    // overlaps that hifiasm's ma_hit2arc classifies as MA_HT_INT / MA_HT_SHORT.
     //
-    // NOTE (corrected): ad.qs/qe/ts/te are the TIGHT, real CIGAR-alignment
-    // span (computeBaseAlignmentsAndStoreThreadFunction), not extended to
-    // read tips. AlignmentData::extendedQs/extendedQe/extendedTs/extendedTe
-    // are the hifiasm ma_hit_t-convention coordinates (diagonally
-    // extrapolated to read boundaries via extendOverlapToReadBoundaries,
-    // overlapClassification.hpp) that ma_hit2arc actually needs.
+    // This drops ONLY internal / short overlaps. Containments (MA_HT_QCONT /
+    // MA_HT_TCONT) are intentionally KEPT: contained reads are only *flagged*
+    // later (flagContainedReads), never removed here, because dropping their
+    // overlaps would fragment the graph. removeContainedReads stays disabled
+    // for the same reason.
     //
-    // Two variants:
-    //   deleteInternalOverlaps:         feeds the TIGHT ad.qs/qe/ts/te
-    //                                   straight to ma_hit2arc -- NOT hifiasm
-    //                                   parity despite the name/old comment here.
-    //   deleteInternalOverlapsExtended: correctly uses
-    //                                   ad.extendedQs/extendedQe/extendedTs/extendedTe.
-    //                                   This is the hifiasm-parity one.
-    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
-    // assembler.deleteInternalOverlapsExtended(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // Coordinates: this uses the TIGHT CIGAR span (ad.qs/qe/ts/te). Internal
+    // matches are only detectable on tight coordinates -- the "Extended"
+    // variant first snaps the smaller overhang to 0 on each side
+    // (extendOverlapToReadBoundaries), forcing ext5 = ext3 = 0, so its
+    // ma_hit2arc can never return MA_HT_INT and it deletes nothing. With
+    // dinara's minCoverage=0, hifiasm's ma_hit_flt likewise classifies on the
+    // real overlap span against raw read lengths, matching the tight span here.
+    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // assembler.removeContainedReads(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 

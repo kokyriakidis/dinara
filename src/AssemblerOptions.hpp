@@ -197,7 +197,7 @@ public:
     double driftRateTolerance;  // Drift rate tolerance for chaining. Hifiasm: 0.05 for ONT, 0.02 for HiFi.
     int minChainMarkerCount = 2;    // Minimum marker count required for a chained overlap candidate. Hifiasm: min_lc_cnt = 2 (inter.cpp:496).
     uint32_t minOverlapLength = 1000; // Minimum overlap span (bases) for a candidate to be kept (min of query/target spans); 0 disables.
-    uint32_t maxEndFuzz = 350;         // Dovetail hang (bases): overlap must reach within this of an end on BOTH reads; 0 disables.
+    uint32_t maxEndFuzz = 0;           // Deprecated and IGNORED: dovetail/internal filtering moved to deleteInternalOverlaps (ma_hit2arc). Kept so old command lines still parse.
     uint32_t maxChainingFreq = 1000;  // Skip kmers with frequency above this during chaining (markers still kept for journeys).
 
     // When > 0, only chain pairs where at least one read has

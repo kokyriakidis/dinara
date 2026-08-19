@@ -1040,13 +1040,12 @@ public:
         const uint64_t* chain,
         uint64_t chainLen,
         uint64_t threadCount = 0,
-        // Candidate filters (OverlapCandidates.*). minOverlapLength: keep an
-        // overlap only when both the query and target spans reach this many
-        // bases (min(qSpan, tSpan) >= threshold). maxEndFuzz: dovetail hang;
-        // keep only when the overlap reaches within this many bases of an end
-        // of BOTH reads. 0 disables the corresponding gate.
-        uint32_t minOverlapLength = 1000,
-        uint32_t maxEndFuzz = 350);
+        // Candidate filter (OverlapCandidates.minOverlapLength): keep an overlap
+        // only when block_len (the span between the first and last shared
+        // minimizer) reaches this many bases. 0 disables. Dovetail / internal-
+        // match classification is handled downstream by deleteInternalOverlaps
+        // (ma_hit2arc), not here.
+        uint32_t minOverlapLength = 1000);
 
 private:
     // Dedup + publish tail for the in-memory hifiasm overlap importer.
