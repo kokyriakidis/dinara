@@ -249,16 +249,18 @@ void Assembler::alignOverlappingOrientedReads(
 static constexpr uint64_t pafMinAlignmentBlockLength = 200;
 
 // Deduplicate the collected overlap entries (one entry per (read pair, strand),
-// keeping the longest overlap) and publish them into
-// alignmentCandidates.candidates. Returns the number of duplicate entries that
-// were merged away. The caller must have created alignmentCandidates.candidates.
+// keeping the overlap with the highest hifiasm chain DP score) and publish them
+// into alignmentCandidates.candidates. Returns the number of duplicate entries
+// that were merged away. The caller must have created
+// alignmentCandidates.candidates.
 uint64_t Assembler::publishPafEntries(vector<PafEntry>& entries)
 {
     const size_t rawCount = entries.size();
 
-    // One entry per (read pair, strand), keeping the longest overlap. A pair
-    // overlapping in both orientations keeps up to two entries.
-    dedupPafEntriesKeepLongest(entries);
+    // One entry per (read pair, strand), keeping the overlap with the highest
+    // sharedSeedScore (hifiasm's oreg_ss_lt selection). A pair overlapping in
+    // both orientations keeps up to two entries.
+    dedupPafEntriesKeepBestScore(entries);
     const uint64_t duplicateCount = uint64_t(rawCount - entries.size());
 
     // Publish (deterministic: entries are in ascending key order, same-strand
@@ -387,7 +389,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
                     readId0, readId1,
                     o.q_start, o.q_end,
                     o.t_start, o.t_end,
-                    o.block_len, o.is_same_strand != 0);
+                    o.block_len, o.shared_seed, o.is_same_strand != 0);
                 // Remember which overlap this entry came from so the CIGAR of
                 // the entry that survives dedup can be recovered below.
                 entry.sourceIndex = i;
@@ -417,7 +419,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const uint64_t duplicateCount = publishPafEntries(entries);
 
     // publishPafEntries deduped `entries` in place, so it now holds exactly the
-    // overlaps that became candidates (one per key+strand, the longest). Copy
+    // overlaps that became candidates (one per key+strand, highest chain DP
+    // score). Copy
     // each survivor's hifiasm CIGAR into the imported-CIGAR store, keyed by
     // canonical read pair, so computeBaseAlignmentsAndStore can reuse hifiasm's
     // base alignment instead of recomputing it. Stored in the native

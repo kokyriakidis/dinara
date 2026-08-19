@@ -882,16 +882,6 @@ public:
 	    // among overlaps that are cis on both reads and not already deleted.
 	    void keepOnlyBestAlignmentPerReadPairByDpScore(uint64_t threadCount);
 public:
-    // For each read pair with multiple chains to the same target on the same
-    // strand, keep the single best chain (highest hifiasm shared_seed) and
-    // delete the rest. Mirrors hifiasm's live special_lchain selection.
-    // Same-strand and reverse-strand overlaps are deduped independently,
-    // matching hifiasm's separate paf[] / reverse_paf[] storage.
-    void removeMultiChainAlignments(uint64_t threadCount);
-private:
-    void removeMultiChainAlignmentsThreadFunction(size_t threadId);
-    std::atomic<uint64_t> removedMultiChainCount;
-public:
     // Hifiasm-style filtering methods (called from main.cpp)
     void filterLocalSegments(uint64_t minCoverage, uint64_t threadCount);
     void applyCoverageCuts(uint64_t minOverlapLength, uint64_t threadCount);

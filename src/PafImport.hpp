@@ -29,7 +29,11 @@ struct PafCandidateInterval {
     uint32_t qEnd = 0;
     uint32_t tStart = 0;
     uint32_t tEnd = 0;
-    uint32_t blockLen = 0;   // PAF alignment block length (used as chain score).
+    uint32_t blockLen = 0;   // PAF alignment block length (overlap span).
+    uint32_t sharedSeedScore = 0; // hifiasm's minimizer-chain DP score for this
+                                  // overlap (overlap_region.shared_seed). This is
+                                  // the key hifiasm selects on (oreg_ss_lt:
+                                  // shared_seed descending); dinara dedups by it.
     bool isSameStrand = true;
 };
 
@@ -49,16 +53,17 @@ struct PafEntry {
 // Canonicalize a resolved overlap into a PafEntry. readId0/readId1 are the
 // resolved query/target ids (already known distinct). The interval is stored so
 // q* always refers to min(id) and t* to max(id), matching the forward-coordinate
-// convention. blockLen and strand are copied through.
+// convention. blockLen, sharedSeedScore and strand are copied through.
 inline PafEntry makePafEntry(
     ReadId readId0, ReadId readId1,
     uint32_t qStart, uint32_t qEnd,
     uint32_t tStart, uint32_t tEnd,
-    uint32_t blockLen, bool isSameStrand)
+    uint32_t blockLen, uint32_t sharedSeedScore, bool isSameStrand)
 {
     PafEntry entry;
     entry.iv.isSameStrand = isSameStrand;
     entry.iv.blockLen = blockLen;
+    entry.iv.sharedSeedScore = sharedSeedScore;
     if(readId0 < readId1) {
         entry.iv.qStart = qStart;
         entry.iv.qEnd   = qEnd;
@@ -76,15 +81,19 @@ inline PafEntry makePafEntry(
 }
 
 
-// Strict ordering used to make deduplication deterministic:
-//   key ascending, then strand (same before diff), then blockLen DESCENDING (so
-//   the longest overlap sorts first for each (key, strand)), then remaining
-//   fields to break ties reproducibly.
+// Strict ordering used to make deduplication deterministic. This mirrors
+// hifiasm's overlap selection (oreg_ss_lt in anchor.cpp: shared_seed
+// descending): for each (key, strand) the entry with the highest
+// sharedSeedScore sorts first, so dedup keeps the same overlap hifiasm would.
+//   key ascending, then strand (same before diff), then sharedSeedScore
+//   DESCENDING, then blockLen DESCENDING as a tie-break (longer span first),
+//   then remaining fields to break ties reproducibly.
 inline bool pafEntryLess(const PafEntry& a, const PafEntry& b)
 {
     if(a.key != b.key) return a.key < b.key;
     // same-strand (true) sorts before reverse (false).
     if(a.iv.isSameStrand != b.iv.isSameStrand) return int(a.iv.isSameStrand) > int(b.iv.isSameStrand);
+    if(a.iv.sharedSeedScore != b.iv.sharedSeedScore) return a.iv.sharedSeedScore > b.iv.sharedSeedScore;
     if(a.iv.blockLen != b.iv.blockLen) return a.iv.blockLen > b.iv.blockLen;
     if(a.iv.qStart != b.iv.qStart) return a.iv.qStart < b.iv.qStart;
     if(a.iv.qEnd != b.iv.qEnd) return a.iv.qEnd < b.iv.qEnd;
@@ -94,11 +103,13 @@ inline bool pafEntryLess(const PafEntry& a, const PafEntry& b)
 
 
 // Sort `entries` in place and collapse duplicates by (key, strand), keeping the
-// entry with the largest blockLen (the longest overlap) for each (key, strand).
-// A read pair that overlaps in both orientations therefore keeps up to two
-// entries (one +, one -). After this call `entries` is in ascending key order,
-// same-strand before reverse within a key (deterministic).
-inline void dedupPafEntriesKeepLongest(std::vector<PafEntry>& entries)
+// entry with the highest sharedSeedScore (hifiasm's chain DP score, tie-broken
+// by longest span) for each (key, strand). This matches hifiasm's own overlap
+// selection (oreg_ss_lt: shared_seed descending). A read pair that overlaps in
+// both orientations therefore keeps up to two entries (one +, one -). After this
+// call `entries` is in ascending key order, same-strand before reverse within a
+// key (deterministic).
+inline void dedupPafEntriesKeepBestScore(std::vector<PafEntry>& entries)
 {
     std::sort(entries.begin(), entries.end(), pafEntryLess);
     size_t w = 0;
@@ -107,7 +118,7 @@ inline void dedupPafEntriesKeepLongest(std::vector<PafEntry>& entries)
             (entries[r].key != entries[w - 1].key) ||
             (entries[r].iv.isSameStrand != entries[w - 1].iv.isSameStrand);
         if(distinct) {
-            entries[w++] = entries[r];   // First per (key, strand) = longest.
+            entries[w++] = entries[r];   // First per (key, strand) = best score.
         }
     }
     entries.resize(w);

@@ -204,34 +204,36 @@ TEST_CASE("normalizeHifiasmCigar: query>target, reverse strand (reverse+transpos
 // candidate must equal the key used at store time.
 //
 // importAlignmentCandidatesFromMemory tags each PafEntry with sourceIndex (the
-// overlap it came from), runs dedupPafEntriesKeepLongest, then builds the CIGAR
-// store from the survivors. computeBaseAlignmentsAndStore rebuilds the lookup
-// key as (candidate.readIds[0]<<32)|readIds[1] where candidate comes from
+// overlap it came from), runs dedupPafEntriesKeepBestScore, then builds the
+// CIGAR store from the survivors. computeBaseAlignmentsAndStore rebuilds the
+// lookup key as (candidate.readIds[0]<<32)|readIds[1] where candidate comes from
 // OrientedReadPair(key>>32, key&mask, isSameStrand). These tests pin both the
-// "longest wins, sourceIndex rides along" and the "key round-trips" invariants.
+// "best score wins, sourceIndex rides along" and the "key round-trips"
+// invariants.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("import association: dedup keeps the longest overlap's sourceIndex",
+TEST_CASE("import association: dedup keeps the best-scoring overlap's sourceIndex",
           "[hifiasm][cigar][import][association]") {
     using namespace dinara;
-    // Three overlaps on the same pair+strand with increasing block length; the
-    // longest (sourceIndex 2) must be the survivor whose CIGAR we would store.
+    // Three overlaps on the same pair+strand with increasing chain score; the
+    // highest-scoring (sourceIndex 2) must be the survivor whose CIGAR we store.
     std::vector<PafEntry> entries;
     for(uint32_t i = 0; i < 3; ++i) {
         PafEntry e = makePafEntry(/*readId0*/5, /*readId1*/9,
                                   /*q*/0, /*qEnd*/10 + i, /*t*/0, /*tEnd*/10 + i,
-                                  /*blockLen*/10 + i, /*isSameStrand*/true);
+                                  /*blockLen*/10 + i, /*sharedSeedScore*/10 + i,
+                                  /*isSameStrand*/true);
         e.sourceIndex = i;
         entries.push_back(e);
     }
     // A different-strand overlap on the same pair survives independently.
     {
-        PafEntry e = makePafEntry(5, 9, 0, 7, 0, 7, 7, /*isSameStrand*/false);
+        PafEntry e = makePafEntry(5, 9, 0, 7, 0, 7, 7, 7, /*isSameStrand*/false);
         e.sourceIndex = 99;
         entries.push_back(e);
     }
 
-    dedupPafEntriesKeepLongest(entries);
+    dedupPafEntriesKeepBestScore(entries);
 
     // One survivor per (key,strand).
     const uint64_t key = (uint64_t(5) << 32) | uint64_t(9);
@@ -244,7 +246,8 @@ TEST_CASE("import association: dedup keeps the longest overlap's sourceIndex",
     }
     REQUIRE(same != nullptr);
     REQUIRE(diff != nullptr);
-    REQUIRE(same->sourceIndex == 2);   // longest same-strand overlap
+    REQUIRE(same->sourceIndex == 2);   // highest-scoring same-strand overlap
+    REQUIRE(same->iv.sharedSeedScore == 12);
     REQUIRE(same->iv.blockLen == 12);
     REQUIRE(diff->sourceIndex == 99);  // the lone reverse overlap
 }
@@ -259,7 +262,7 @@ TEST_CASE("import association: makePafEntry key survives the candidate round-tri
     const Case cases[] = { {5, 9, true}, {9, 5, true}, {5, 9, false}, {9, 5, false} };
 
     for(const auto& c : cases) {
-        PafEntry e = makePafEntry(c.a, c.b, /*q*/1, 11, /*t*/2, 12, 10, c.sameStrand);
+        PafEntry e = makePafEntry(c.a, c.b, /*q*/1, 11, /*t*/2, 12, 10, 10, c.sameStrand);
 
         const uint32_t lo = std::min(c.a, c.b);
         const uint32_t hi = std::max(c.a, c.b);

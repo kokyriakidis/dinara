@@ -4,8 +4,9 @@
  *
  * These tests exercise the pure, allocation-free building blocks used by
  * Assembler::importAlignmentCandidatesFromMemory:
- *   - makePafEntry / pafEntryLess / dedupPafEntriesKeepLongest: canonical keying
- *     and longest-overlap-wins deduplication, independent of input order.
+ *   - makePafEntry / pafEntryLess / dedupPafEntriesKeepBestScore: canonical
+ *     keying and highest-chain-score-wins deduplication (matching hifiasm's
+ *     oreg_ss_lt selection), independent of input order.
  *
  * They also pin the semantics of the in-memory hifiasm overlap path (canonical
  * keying, both-orientation retention, block-length floor, self-overlap filter).
@@ -32,6 +33,7 @@ struct MemOverlap {
     uint32_t q_start, q_end;
     uint32_t t_start, t_end;
     uint32_t n_match, block_len;
+    uint32_t shared_seed;
     bool     is_same_strand;
 };
 
@@ -50,9 +52,9 @@ vector<PafEntry> importMem(
         entries.push_back(makePafEntry(
             ReadId(o.q_id), ReadId(o.t_id),
             o.q_start, o.q_end, o.t_start, o.t_end,
-            o.block_len, o.is_same_strand));
+            o.block_len, o.shared_seed, o.is_same_strand));
     }
-    dedupPafEntriesKeepLongest(entries);
+    dedupPafEntriesKeepBestScore(entries);
     return entries;
 }
 
@@ -65,7 +67,7 @@ TEST_CASE("makePafEntry: canonicalizes read pair and swaps intervals", "[paf]") 
         /*readId0=*/5, /*readId1=*/2,
         /*qStart=*/100, /*qEnd=*/900,   // these are read 5's coords
         /*tStart=*/50,  /*tEnd=*/850,   // these are read 2's coords
-        /*blockLen=*/700, /*isSameStrand=*/true);
+        /*blockLen=*/700, /*sharedSeedScore=*/700, /*isSameStrand=*/true);
     REQUIRE(e.key == ((uint64_t(2) << 32) | 5));
     // After swap: q* refers to read 2 (=old target), t* to read 5 (=old query).
     REQUIRE(e.iv.qStart == 50);
@@ -77,9 +79,9 @@ TEST_CASE("makePafEntry: canonicalizes read pair and swaps intervals", "[paf]") 
 
 TEST_CASE("makePafEntry: reciprocal A->B and B->A produce identical entry", "[paf]") {
     // A=5, B=2. Record A->B: q=A coords, t=B coords.
-    PafEntry ab = makePafEntry(5, 2, 100, 900, 50, 850, 700, true);
+    PafEntry ab = makePafEntry(5, 2, 100, 900, 50, 850, 700, 700, true);
     // Record B->A: q=B coords, t=A coords.
-    PafEntry ba = makePafEntry(2, 5, 50, 850, 100, 900, 700, true);
+    PafEntry ba = makePafEntry(2, 5, 50, 850, 100, 900, 700, 700, true);
     REQUIRE(ab.key == ba.key);
     REQUIRE(ab.iv.qStart == ba.iv.qStart);
     REQUIRE(ab.iv.qEnd == ba.iv.qEnd);
@@ -87,32 +89,59 @@ TEST_CASE("makePafEntry: reciprocal A->B and B->A produce identical entry", "[pa
     REQUIRE(ab.iv.tEnd == ba.iv.tEnd);
 }
 
-TEST_CASE("dedupPafEntriesKeepLongest: keeps the longest block per pair", "[paf]") {
+TEST_CASE("dedupPafEntriesKeepBestScore: keeps the highest chain score per pair", "[paf]") {
+    // makePafEntry args: readId0, readId1, qs, qe, ts, te, blockLen,
+    // sharedSeedScore, isSameStrand. Selection is by sharedSeedScore, NOT span.
     vector<PafEntry> entries = {
-        makePafEntry(1, 2, 0, 300, 0, 300, 300, true),
-        makePafEntry(1, 2, 0, 700, 0, 700, 700, true),   // longest for (1,2)
-        makePafEntry(1, 2, 0, 150, 0, 150, 150, true),
-        makePafEntry(3, 4, 0, 500, 0, 500, 500, false),
+        makePafEntry(1, 2, 0, 300, 0, 300, 300, 40, true),
+        makePafEntry(1, 2, 0, 700, 0, 700, 700, 90, true),   // best score for (1,2)
+        makePafEntry(1, 2, 0, 150, 0, 150, 150, 10, true),
+        makePafEntry(3, 4, 0, 500, 0, 500, 500, 55, false),
     };
-    dedupPafEntriesKeepLongest(entries);
+    dedupPafEntriesKeepBestScore(entries);
     REQUIRE(entries.size() == 2);
     // Sorted by key ascending: (1,2) then (3,4).
     REQUIRE(entries[0].key == ((uint64_t(1) << 32) | 2));
+    REQUIRE(entries[0].iv.sharedSeedScore == 90);
     REQUIRE(entries[0].iv.blockLen == 700);
     REQUIRE(entries[0].iv.qEnd == 700);
     REQUIRE(entries[1].key == ((uint64_t(3) << 32) | 4));
-    REQUIRE(entries[1].iv.blockLen == 500);
+    REQUIRE(entries[1].iv.sharedSeedScore == 55);
 }
 
-TEST_CASE("dedupPafEntriesKeepLongest: result is order-independent", "[paf]") {
+TEST_CASE("dedupPafEntriesKeepBestScore: highest score wins over longer span", "[paf]") {
+    // The longer overlap (span 700) has the LOWER chain score; hifiasm selects
+    // by shared_seed, so the shorter, higher-scoring overlap must survive.
+    vector<PafEntry> entries = {
+        makePafEntry(1, 2, 0, 700, 0, 700, 700, 30, true),   // long span, low score
+        makePafEntry(1, 2, 0, 300, 0, 300, 300, 95, true),   // short span, high score
+    };
+    dedupPafEntriesKeepBestScore(entries);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].iv.sharedSeedScore == 95);
+    REQUIRE(entries[0].iv.blockLen == 300);
+}
+
+TEST_CASE("dedupPafEntriesKeepBestScore: ties on score fall back to longer span", "[paf]") {
+    vector<PafEntry> entries = {
+        makePafEntry(1, 2, 0, 300, 0, 300, 300, 60, true),
+        makePafEntry(1, 2, 0, 700, 0, 700, 700, 60, true),   // same score, longer span
+    };
+    dedupPafEntriesKeepBestScore(entries);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].iv.sharedSeedScore == 60);
+    REQUIRE(entries[0].iv.blockLen == 700);
+}
+
+TEST_CASE("dedupPafEntriesKeepBestScore: result is order-independent", "[paf]") {
     auto build = [](bool reversed) {
         vector<PafEntry> v = {
-            makePafEntry(1, 2, 0, 300, 0, 300, 300, true),
-            makePafEntry(1, 2, 0, 700, 0, 700, 700, true),
-            makePafEntry(2, 5, 0, 400, 0, 400, 400, false),
+            makePafEntry(1, 2, 0, 300, 0, 300, 300, 40, true),
+            makePafEntry(1, 2, 0, 700, 0, 700, 700, 90, true),
+            makePafEntry(2, 5, 0, 400, 0, 400, 400, 55, false),
         };
         if (reversed) std::reverse(v.begin(), v.end());
-        dedupPafEntriesKeepLongest(v);
+        dedupPafEntriesKeepBestScore(v);
         return v;
     };
     const auto a = build(false);
@@ -120,6 +149,7 @@ TEST_CASE("dedupPafEntriesKeepLongest: result is order-independent", "[paf]") {
     REQUIRE(a.size() == b.size());
     for (size_t i = 0; i < a.size(); ++i) {
         REQUIRE(a[i].key == b[i].key);
+        REQUIRE(a[i].iv.sharedSeedScore == b[i].iv.sharedSeedScore);
         REQUIRE(a[i].iv.blockLen == b[i].iv.blockLen);
         REQUIRE(a[i].iv.qStart == b[i].iv.qStart);
         REQUIRE(a[i].iv.qEnd == b[i].iv.qEnd);
@@ -140,7 +170,7 @@ TEST_CASE("mem import: canonicalizes to min-id query coordinates", "[paf][mem]")
     // In-memory route (record's own orientation): q_id=0 [100,900),
     // t_id=1 [50,850), same strand.
     vector<MemOverlap> mem = {
-        {0, 1, 100, 900, 50, 850, 700, 800, true},
+        {0, 1, 100, 900, 50, 850, 700, 800, 800, true},
     };
     vector<PafEntry> fromMem = importMem(mem);
 
@@ -155,7 +185,7 @@ TEST_CASE("mem import: canonicalizes to min-id query coordinates", "[paf][mem]")
 
     // Same overlap with q/t swapped must canonicalize identically.
     vector<MemOverlap> swapped = {
-        {1, 0, 50, 850, 100, 900, 700, 800, true},
+        {1, 0, 50, 850, 100, 900, 700, 800, 800, true},
     };
     vector<PafEntry> fromSwapped = importMem(swapped);
     REQUIRE(fromSwapped.size() == 1);
@@ -170,8 +200,8 @@ TEST_CASE("mem import: both orientations of a pair are kept", "[paf][mem]") {
     // Reads 0 and 1 overlap both same-strand and reverse-complement (e.g. an
     // inverted repeat). Both must survive as distinct entries.
     vector<MemOverlap> mem = {
-        {0, 1, 100, 900, 50, 850, 700, 800, true},   // +
-        {0, 1, 100, 900, 50, 850, 700, 800, false},  // -
+        {0, 1, 100, 900, 50, 850, 700, 800, 800, true},   // +
+        {0, 1, 100, 900, 50, 850, 700, 800, 800, false},  // -
     };
     vector<PafEntry> got = importMem(mem);
     REQUIRE(got.size() == 2);
@@ -181,14 +211,17 @@ TEST_CASE("mem import: both orientations of a pair are kept", "[paf][mem]") {
     REQUIRE(got[1].iv.isSameStrand == false);
 }
 
-TEST_CASE("mem import: longest overlap wins per (pair, strand)", "[paf][mem]") {
+TEST_CASE("mem import: highest chain score wins per (pair, strand)", "[paf][mem]") {
+    // MemOverlap fields: q_id,t_id, q_start,q_end, t_start,t_end, n_match,
+    // block_len, shared_seed, is_same_strand. Selection is by shared_seed.
     vector<MemOverlap> mem = {
-        {0, 1, 100, 500, 50, 450, 380, 400, true},   // shorter +
-        {0, 1, 100, 900, 50, 850, 700, 800, true},   // longer  + (kept)
-        {2, 3, 0, 400, 0, 400, 380, 150, true},      // dropped: block_len < 200
+        {0, 1, 100, 500, 50, 450, 380, 400, 420, true},   // lower score +
+        {0, 1, 100, 900, 50, 850, 700, 800, 900, true},   // higher score + (kept)
+        {2, 3, 0, 400, 0, 400, 380, 150, 150, true},      // dropped: block_len < 200
     };
     vector<PafEntry> got = importMem(mem);
     REQUIRE(got.size() == 1);
+    REQUIRE(got[0].iv.sharedSeedScore == 900);
     REQUIRE(got[0].iv.blockLen == 800);
     REQUIRE(got[0].iv.qStart == 100);
     REQUIRE(got[0].iv.qEnd   == 900);
@@ -196,9 +229,9 @@ TEST_CASE("mem import: longest overlap wins per (pair, strand)", "[paf][mem]") {
 
 TEST_CASE("mem import: block_len floor and self-overlaps filtered", "[paf][mem]") {
     vector<MemOverlap> mem = {
-        {0, 0, 0, 400, 0, 400, 380, 800, true},      // self overlap: dropped
-        {0, 1, 0, 400, 0, 400, 380, 199, true},      // below floor: dropped
-        {0, 1, 0, 400, 0, 400, 380, 200, true},      // exactly floor: kept
+        {0, 0, 0, 400, 0, 400, 380, 800, 800, true},      // self overlap: dropped
+        {0, 1, 0, 400, 0, 400, 380, 199, 199, true},      // below floor: dropped
+        {0, 1, 0, 400, 0, 400, 380, 200, 200, true},      // exactly floor: kept
     };
     vector<PafEntry> got = importMem(mem);
     REQUIRE(got.size() == 1);
