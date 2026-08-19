@@ -43,11 +43,13 @@ struct MemOverlap {
 // (the real importer resolves them by name first, which is orthogonal to the
 // dedup/keying property under test).
 vector<PafEntry> importMem(
-    const vector<MemOverlap>& ovs, uint64_t minBlock = 200)
+    const vector<MemOverlap>& ovs, uint64_t minOverlapLength = 1000)
 {
     vector<PafEntry> entries;
     for (const MemOverlap& o : ovs) {
-        if (o.block_len < minBlock) continue;
+        // Single overlap-length gate: block_len (span between the first and last
+        // shared minimizer) must reach minOverlapLength. Mirrors production.
+        if (o.block_len < minOverlapLength) continue;
         if (o.q_id == o.t_id) continue;
         entries.push_back(makePafEntry(
             ReadId(o.q_id), ReadId(o.t_id),
@@ -174,7 +176,8 @@ TEST_CASE("mem import: canonicalizes to min-id query coordinates", "[paf][mem]")
     vector<MemOverlap> mem = {
         {0, 1, 100, 900, 50, 850, 700, 800, 800, true},
     };
-    vector<PafEntry> fromMem = importMem(mem);
+    // Length floor disabled: this test is about coordinate canonicalization.
+    vector<PafEntry> fromMem = importMem(mem, /*minOverlapLength=*/0);
 
     REQUIRE(fromMem.size() == 1);
     // The canonical interval is q=min(id) coords.
@@ -189,7 +192,7 @@ TEST_CASE("mem import: canonicalizes to min-id query coordinates", "[paf][mem]")
     vector<MemOverlap> swapped = {
         {1, 0, 50, 850, 100, 900, 700, 800, 800, true},
     };
-    vector<PafEntry> fromSwapped = importMem(swapped);
+    vector<PafEntry> fromSwapped = importMem(swapped, /*minOverlapLength=*/0);
     REQUIRE(fromSwapped.size() == 1);
     REQUIRE(fromSwapped[0].key == fromMem[0].key);
     REQUIRE(fromSwapped[0].iv.qStart == fromMem[0].iv.qStart);
@@ -205,7 +208,8 @@ TEST_CASE("mem import: both orientations of a pair are kept", "[paf][mem]") {
         {0, 1, 100, 900, 50, 850, 700, 800, 800, true},   // +
         {0, 1, 100, 900, 50, 850, 700, 800, 800, false},  // -
     };
-    vector<PafEntry> got = importMem(mem);
+    // Length floor disabled: this test is about keeping both orientations.
+    vector<PafEntry> got = importMem(mem, /*minOverlapLength=*/0);
     REQUIRE(got.size() == 2);
     // Deterministic order: same-strand before reverse within a key.
     REQUIRE(got[0].key == got[1].key);
@@ -216,26 +220,44 @@ TEST_CASE("mem import: both orientations of a pair are kept", "[paf][mem]") {
 TEST_CASE("mem import: highest chain score wins per (pair, strand)", "[paf][mem]") {
     // MemOverlap fields: q_id,t_id, q_start,q_end, t_start,t_end, n_match,
     // block_len, shared_seed, is_same_strand. Selection is by shared_seed.
+    // Length floor disabled so only the score-selection behavior is exercised.
     vector<MemOverlap> mem = {
         {0, 1, 100, 500, 50, 450, 380, 400, 420, true},   // lower score +
         {0, 1, 100, 900, 50, 850, 700, 800, 900, true},   // higher score + (kept)
-        {2, 3, 0, 400, 0, 400, 380, 150, 150, true},      // dropped: block_len < 200
+        {2, 3, 0, 400, 0, 400, 380, 150, 150, true},      // distinct pair, kept
     };
-    vector<PafEntry> got = importMem(mem);
-    REQUIRE(got.size() == 1);
+    vector<PafEntry> got = importMem(mem, /*minOverlapLength=*/0);
+    REQUIRE(got.size() == 2);
+    // Entries are sorted by key ascending: (0,1) first, then (2,3).
     REQUIRE(got[0].iv.sharedSeedScore == 900);
     REQUIRE(got[0].iv.blockLen == 800);
     REQUIRE(got[0].iv.qStart == 100);
     REQUIRE(got[0].iv.qEnd   == 900);
+    REQUIRE(got[1].key == ((uint64_t(2) << 32) | 3));
 }
 
-TEST_CASE("mem import: block_len floor and self-overlaps filtered", "[paf][mem]") {
+TEST_CASE("mem import: minOverlapLength floor and self-overlaps filtered", "[paf][mem]") {
+    // The single overlap-length gate is block_len >= minOverlapLength. Using the
+    // production default (1000), an overlap whose block_len is one below is
+    // dropped and one exactly at the threshold is kept.
     vector<MemOverlap> mem = {
-        {0, 0, 0, 400, 0, 400, 380, 800, 800, true},      // self overlap: dropped
-        {0, 1, 0, 400, 0, 400, 380, 199, 199, true},      // below floor: dropped
-        {0, 1, 0, 400, 0, 400, 380, 200, 200, true},      // exactly floor: kept
+        {0, 0, 0, 2000, 0, 2000, 380, 1500, 1500, true},  // self overlap: dropped
+        {0, 1, 0, 2000, 0, 2000, 380, 999,  999,  true},  // below floor: dropped
+        {0, 1, 0, 2000, 0, 2000, 380, 1000, 1000, true},  // exactly floor: kept
     };
-    vector<PafEntry> got = importMem(mem);
+    vector<PafEntry> got = importMem(mem);  // default minOverlapLength = 1000
     REQUIRE(got.size() == 1);
-    REQUIRE(got[0].iv.blockLen == 200);
+    REQUIRE(got[0].iv.blockLen == 1000);
+}
+
+TEST_CASE("mem import: minOverlapLength=0 disables the length floor", "[paf][mem]") {
+    // With the gate disabled, even a tiny overlap survives (self-overlaps are
+    // still dropped independently of the length gate).
+    vector<MemOverlap> mem = {
+        {0, 0, 0, 400, 0, 400, 380, 50, 50, true},   // self overlap: dropped
+        {0, 1, 0, 400, 0, 400, 380, 50, 50, true},   // tiny, but kept (floor off)
+    };
+    vector<PafEntry> got = importMem(mem, /*minOverlapLength=*/0);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].iv.blockLen == 50);
 }

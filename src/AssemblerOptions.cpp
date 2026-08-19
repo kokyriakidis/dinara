@@ -463,8 +463,8 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint32_t>(&overlapCandidatesOptions.minOverlapLength)->
         default_value(1000),
         "Minimum overlap span in bases for a candidate to be kept. "
-        "Implemented as min(qSpan, tSpan) >= threshold, where spans are the "
-        "pre-extension marker-derived (or PAF-derived) intervals. 0 disables.")
+        "Implemented as block_len >= threshold, where block_len is the span "
+        "between the first and last shared minimizer of the chain. 0 disables.")
 
         ("OverlapCandidates.maxEndFuzz",
         value<uint32_t>(&overlapCandidatesOptions.maxEndFuzz)->
