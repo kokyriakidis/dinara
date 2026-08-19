@@ -9,6 +9,7 @@
 #include "MarkerFinder.hpp"
 #include "MarkerKmers.hpp"
 #include "performanceLog.hpp"
+#include "span.hpp"
 #include "timestamp.hpp"
 using namespace dinara;
 
@@ -25,6 +26,7 @@ using namespace dinara;
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
+#include <thread>
 #include <vector>
 
 
@@ -351,6 +353,145 @@ void Assembler::findMarkersSimdMinimizersPass2(size_t /* threadId */)
             std::vector<std::pair<uint32_t, KmerId>>().swap(staged);
         }
     }
+}
+
+
+// ============================================================================
+// CHAIN-DERIVED MARKERS (hifiasm path)
+// ============================================================================
+
+// Build the marker set directly from hifiasm's native overlap chains instead of
+// a separate minimizer sketch. Each chain anchor packs the START positions of
+// one shared k-mer: (q_start << 32) | t_start, where q_start is on the FORWARD
+// query read and t_start is on the target in ALIGNMENT orientation (so it is a
+// forward position for a same-strand overlap, and a reverse-complement position
+// for a reverse overlap). We convert every anchor to a FORWARD-strand position
+// on each of the two reads, collect the union per read, then store markers with
+// the same RC-symmetric two-strand layout as the sketch path.
+//
+// A marker not referenced by any chain anchor would be a marker-graph singleton
+// and dropped at minCoverage>=2, so restricting markers to chain positions does
+// not change the shasta2 anchor set; it only removes inert singletons.
+void Assembler::createMarkersFromNativeChain(
+    const void* overlapsV,
+    uint64_t overlapCount,
+    const char* names,
+    const uint64_t* nameOffsets,
+    uint64_t readCountFromHifiasm,
+    const uint64_t* chain,
+    uint64_t chainLen,
+    uint64_t threadCount)
+{
+    reads->checkReadsAreOpen();
+    const auto tBegin = std::chrono::steady_clock::now();
+    const hifiasm_overlap_t* overlaps =
+        static_cast<const hifiasm_overlap_t*>(overlapsV);
+
+    const uint32_t k = uint32_t(assemblerInfo->k);
+    const uint64_t readCount = reads->readCount();
+    if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
+    if(threadCount == 0) threadCount = 1;
+
+    markers->createNew(largeDataName("Markers"), largeDataPageSize);
+    markerKmerIds->createNew(largeDataName("MarkerKmerIds"), largeDataPageSize);
+
+    // Resolve hifiasm read index -> dinara ReadId once, by name (same scheme as
+    // importAlignmentCandidatesFromMemory).
+    vector<ReadId> hifiToDinara(readCountFromHifiasm, invalidReadId);
+    for(uint64_t i = 0; i < readCountFromHifiasm; i++) {
+        const uint64_t b = nameOffsets[i];
+        const uint64_t e = nameOffsets[i + 1];
+        hifiToDinara[i] = reads->getReadId(span<const char>(names + b, size_t(e - b)));
+    }
+
+    // Collect, per dinara ReadId, the forward-strand marker positions referenced
+    // by any chain anchor. Positions repeat heavily across overlaps; we append to
+    // a flat per-read vector and sort+unique once at the end (far cheaper than a
+    // per-read std::set given millions of anchors).
+    vector<vector<uint32_t>> readPositions(readCount);
+    for(uint64_t i = 0; i < overlapCount; i++) {
+        const hifiasm_overlap_t& o = overlaps[i];
+        if(o.chain_len == 0) continue;
+        if(o.q_id >= readCountFromHifiasm || o.t_id >= readCountFromHifiasm) continue;
+        const ReadId qReadId = hifiToDinara[o.q_id];
+        const ReadId tReadId = hifiToDinara[o.t_id];
+        if(qReadId == invalidReadId || tReadId == invalidReadId) continue;
+        const uint32_t qLen = uint32_t(reads->getRead(qReadId).baseCount);
+        const uint32_t tLen = uint32_t(reads->getRead(tReadId).baseCount);
+        const bool sameStrand = (o.is_same_strand != 0);
+
+        const uint64_t* a = chain + o.chain_offset;
+        for(uint32_t j = 0; j < o.chain_len; j++) {
+            const uint32_t qPos = uint32_t(a[j] >> 32);
+            const uint32_t tPos = uint32_t(a[j] & 0xffffffffu);
+            // Query position is already forward on the query read.
+            if(qPos + k <= qLen) readPositions[qReadId].push_back(qPos);
+            // Target position is in alignment orientation: forward when the
+            // overlap is same-strand, else on the reverse complement.
+            if(sameStrand) {
+                if(tPos + k <= tLen) readPositions[tReadId].push_back(tPos);
+            } else {
+                if(tPos + k <= tLen) {
+                    readPositions[tReadId].push_back(tLen - tPos - k);
+                }
+            }
+        }
+    }
+    (void)chainLen;
+
+    // Stage forward-strand (position, KmerId) per read, computing each KmerId
+    // from the read sequence at the picked position (identical to the sketch
+    // path, so KmerIds are byte-for-byte the same).
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.resize(readCount);
+    findMarkersSimdMinimizersData.k = int(k);
+
+    markers->beginPass1(2 * readCount);
+    markerKmerIds->beginPass1(2 * readCount);
+    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
+        vector<uint32_t>& positions = readPositions[readId];
+        if(!positions.empty()) {
+            // Dedup + sort ascending (markers are stored in position order).
+            std::sort(positions.begin(), positions.end());
+            positions.erase(std::unique(positions.begin(), positions.end()),
+                            positions.end());
+            const LongBaseSequenceView read = reads->getRead(readId);
+            std::vector<std::pair<uint32_t, KmerId>>& staged =
+                findMarkersSimdMinimizersData.stagedMarkers[readId];
+            staged.reserve(positions.size());
+            Kmer kmer;
+            for(const uint32_t position : positions) {
+                extractKmer(read, uint64_t(position), uint64_t(k), kmer);
+                staged.push_back({position, KmerId(kmer.id(uint64_t(k)))});
+            }
+        }
+        // Free this read's positions now that they are staged.
+        vector<uint32_t>().swap(positions);
+        const uint64_t count64 = findMarkersSimdMinimizersData.stagedMarkers[readId].size();
+        markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+        markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+        markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+        markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+    }
+
+    // Store markers on both strands (strand 1 mirrored) via the shared pass-2
+    // routine, then finalize.
+    markers->beginPass2();
+    markerKmerIds->beginPass2();
+    setupLoadBalancing(readCount, 100);
+    runThreads(&Assembler::findMarkersSimdMinimizersPass2, threadCount);
+    markers->endPass2(false);
+    markerKmerIds->endPass2(false);
+
+    findMarkersSimdMinimizersData.stagedMarkers.clear();
+    findMarkersSimdMinimizersData.stagedMarkers.shrink_to_fit();
+
+    const auto tEnd = std::chrono::steady_clock::now();
+    const double tTotal = 1.e-9 * double((std::chrono::duration_cast<std::chrono::nanoseconds>(tEnd - tBegin)).count());
+    performanceLog << timestamp << "Building markers from hifiasm native chain "
+        "completed in " << tTotal << " s." << endl;
+    cout << "Created " << markers->totalSize()
+         << " markers from hifiasm native chain positions." << endl;
 }
 
 

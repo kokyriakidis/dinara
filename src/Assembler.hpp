@@ -288,6 +288,24 @@ public:
         bool useHifiasm = true,
         const void* hifiasmFilter = nullptr, int hifiasmSampleDist = 0,
         int sketchK = 0, int sketchW = 0);
+    // Build the marker set directly from hifiasm's native overlap chains.
+    // Every chain anchor is the position of one shared k-mer on both reads, so
+    // the union of chain-anchor positions per read IS the set of markers that
+    // can ever become shasta2 anchors (a marker in no chain is a marker-graph
+    // singleton, dropped at minCoverage>=2). This replaces the separate
+    // minimizer sketch on the hifiasm path: markers, chains, and overlaps all
+    // come from the single hifiasm overlap-detection pass. overlaps/names/etc.
+    // are the same arrays passed to importAlignmentCandidatesFromMemory; the
+    // chain arena is out_chain from hifiasm_detect_overlaps_from_store.
+    void createMarkersFromNativeChain(
+        const void* overlaps,          // const hifiasm_overlap_t*
+        uint64_t overlapCount,
+        const char* names,
+        const uint64_t* nameOffsets,
+        uint64_t readCountFromHifiasm,
+        const uint64_t* chain,
+        uint64_t chainLen,
+        uint64_t threadCount);
     void accessMarkers();
     void writeMarkers(ReadId, Strand, const string& fileName);
 

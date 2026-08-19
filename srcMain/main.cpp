@@ -1812,6 +1812,15 @@ void dinara::main::assemble(
     int overlapSeedK = 0;
     int overlapSeedW = 0;
 
+    // On the hifiasm store path we derive markers directly from hifiasm's native
+    // overlap chains (createMarkersFromNativeChain) instead of a separate
+    // minimizer sketch, so marker creation is DEFERRED until after overlap
+    // detection. These flags carry that decision out of the marker-source block.
+    // deferMarkersToNativeChain gates the deferral; markerEncodeK records the k
+    // for KmerId encoding (== selectK == encodeK on the no-HPC hifiasm path).
+    bool deferMarkersToNativeChain = false;
+    int  markerEncodeK = 0;
+
     if(markerSource != MarkerSource::LegacyKmer) {
         // The hifiasm overlap-path filter handle (simd/hifiasm paths only) and
         // whether it was applied. Declared here so the shared post-processing
@@ -1898,15 +1907,28 @@ void dinara::main::assemble(
             << ", filter=" << (hifiasmMarkerFilter ? "on" : "off")
             << "." << endl;
 
-        assembler.findMarkersSimdMinimizers(
-            threadCount,
-            markerCfg.encodeK,  // marker-encoding k (dinara indexes this)
-            markerCfg.encodeK,  // marker-encoding w
-            markerCfg.useHifiasm,
-            hifiasmMarkerFilter,
-            markerCfg.sampleDist,
-            markerCfg.selectK,   // hifiasm position-selection k (tuned)
-            markerCfg.selectW);  // hifiasm position-selection w (tuned)
+        // On the hifiasm store path, markers are derived from hifiasm's native
+        // overlap chains AFTER detection (createMarkersFromNativeChain), so the
+        // separate sketch here is skipped and marker creation is deferred. The
+        // chain anchors are the only marker positions that can become anchors;
+        // sketching a full marker set would just add marker-graph singletons.
+        deferMarkersToNativeChain = markerCfg.useHifiasm && useHifiasmStore;
+        markerEncodeK = markerCfg.encodeK;
+
+        if(!deferMarkersToNativeChain) {
+            assembler.findMarkersSimdMinimizers(
+                threadCount,
+                markerCfg.encodeK,  // marker-encoding k (dinara indexes this)
+                markerCfg.encodeK,  // marker-encoding w
+                markerCfg.useHifiasm,
+                hifiasmMarkerFilter,
+                markerCfg.sampleDist,
+                markerCfg.selectK,   // hifiasm position-selection k (tuned)
+                markerCfg.selectW);  // hifiasm position-selection w (tuned)
+        } else {
+            cout << "Deferring marker creation to hifiasm native chain "
+                    "(single-sketch path)." << endl;
+        }
 
         // Whether the overlap-path filter was actually applied to the markers.
         hifiasmMarkerFilterApplied = (hifiasmMarkerFilter != nullptr);
@@ -2042,13 +2064,18 @@ void dinara::main::assemble(
     }
 
     // Filter reads whose marker span covers less than the threshold fraction
-    // of the read length. Reads with sparse markers contribute noise.
-    if(assemblerOptions.kmersOptions.minMarkerSpanFraction > 0.0) {
-        assembler.filterReadsByMarkerSpanCoverage(
-            assemblerOptions.kmersOptions.minMarkerSpanFraction, threadCount);
+    // of the read length, then persist markers. On the deferred (native-chain)
+    // path markers do not exist yet, so both steps run after marker creation
+    // below instead. Note: chain-derived markers cluster in aligned interiors
+    // and omit a read's extreme minimizers, so the span-coverage filter is not
+    // meaningful there and is intentionally not applied on that path.
+    if(!deferMarkersToNativeChain) {
+        if(assemblerOptions.kmersOptions.minMarkerSpanFraction > 0.0) {
+            assembler.filterReadsByMarkerSpanCoverage(
+                assemblerOptions.kmersOptions.minMarkerSpanFraction, threadCount);
+        }
+        assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
     }
-
-    assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
 
 
@@ -2174,6 +2201,23 @@ void dinara::main::assemble(
         /*chain*/ chain, /*chainLen*/ chainLen, threadCount,
         assemblerOptions.overlapCandidatesOptions.minOverlapLength,
         assemblerOptions.overlapCandidatesOptions.maxEndFuzz);
+
+    // Deferred marker creation: build the marker set from hifiasm's native chain
+    // anchors (the shared k-mer positions), then run the marker-dependent steps
+    // that were skipped above. Must happen while ov/names/nameOff/chain are still
+    // alive and before computeBaseAlignmentsAndStore (which maps chain anchors to
+    // marker ordinals).
+    if(deferMarkersToNativeChain) {
+        assembler.assemblerInfo->k = markerEncodeK;
+        // createMarkersFromNativeChain builds BOTH markers and markerKmerIds
+        // (strand 0 and the RC-mirrored strand 1), so computeMarkerKmerIds is
+        // not needed here.
+        assembler.createMarkersFromNativeChain(
+            ov, nOv, names, nameOff, nReads,
+            chain, chainLen, threadCount);
+        assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
+    }
+
     hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
     free(chain);  // native chain arena (plain uint64_t array; owned by caller)
     chain = nullptr;
