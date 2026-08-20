@@ -1183,6 +1183,14 @@ void AssemblerOptions::addConfigurableOptions()
         "for well-supported consecutive anchor pairs. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minCommonForHet",
+        value<uint64_t>(&assemblyOptions.mode3Options.minCommonForHet)->
+        default_value(12),
+        "Minimum anchor-pair coverage (common two-sided reads) for an "
+        "anchor-graph edge to be MSA'd during experimental per-edge het "
+        "detection (enabled with DINARA_HET_ON_GRAPH=1). "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.minWindowBaseSpan",
         value<uint64_t>(&assemblyOptions.mode3Options.minWindowBaseSpan)->
         default_value(1000),
@@ -1628,6 +1636,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minInterWindowEdgeCoverage = " << minInterWindowEdgeCoverage << "\n";
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
+    s << "mode3.minCommonForHet = " << minCommonForHet << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
     s << "mode3.hetMinVaf = " << hetMinVaf << "\n";
     s << "mode3.hetMinSupport = " << hetMinSupport << "\n";

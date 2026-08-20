@@ -2676,6 +2676,49 @@ void dinara::main::assemble(
             *shasta2Journeys,
             minEdgeCoverage,
             threadCount);
+
+        // Transcribe abPOA-detected bubbles (SNPs and >=15bp indels) on the
+        // journey anchor-graph edges into real het anchors + flank->arm->flank
+        // edges. The journey graph connects consecutive anchors with no het
+        // structure of its own; this adds it. Coverage floor is
+        // Assembly.mode3.minCommonForHet.
+        {
+            const uint64_t minCommonForHet =
+                assemblerOptions.assemblyOptions.mode3Options.minCommonForHet;
+            cout << timestamp << "transcribeHetBubbles: minCommonForHet="
+                 << minCommonForHet << "..." << endl;
+            const HetOnGraphResult res = transcribeHetBubbles(
+                *assembler.shasta2AnchorGraph, *shasta2Anchors,
+                minCommonForHet, threadCount);
+            cout << timestamp << "transcribeHetBubbles results:\n"
+                 << "  edges total:             " << res.edgesTotal << "\n"
+                 << "  edges considered:        " << res.edgesConsidered
+                 << " (coverage >= " << minCommonForHet << ")\n"
+                 << "  edges skipped coverage:  " << res.edgesSkippedCoverage << "\n"
+                 << "  edges skipped length:    " << res.edgesSkippedLen << "\n"
+                 << "  edges skipped identical: " << res.edgesSkippedIdentical << "\n"
+                 << "  edges MSA'd:             " << res.edgesMsad << "\n"
+                 << "  edges transcribed:       " << res.edgesPlanned << "\n"
+                 << "  deferred multi-site:     " << res.edgesDeferredMultiSite << "\n"
+                 << "  deferred end-bubble:     " << res.edgesDeferredEndBubble << "\n"
+                 << "  deferred complex:        " << res.edgesDeferredComplex << "\n"
+                 << "  bubbles transcribed:     " << res.bubblesTranscribed << "\n"
+                 << "  het anchors created:     " << res.hetAnchorsCreated << "\n"
+                 << "  arm edges added:         " << res.armEdgesAdded << "\n"
+                 << "  deletion edges added:    " << res.deletionEdgesAdded << "\n"
+                 << "  original edges disabled: " << res.originalEdgesDisabled << "\n"
+                 << "  elapsed:                 " << res.elapsedSeconds << " s"
+                 << endl;
+        }
+
+        // Tip cleanup after transcription: disabling the original mixed edges
+        // can leave one-sided anchors, and the new het arms are exactly what
+        // removeHetArmTips is designed to finish. Iterate until stable.
+        for(uint64_t tipPass = 0; ; ++tipPass) {
+            const uint64_t hetTips =
+                assembler.shasta2AnchorGraph->removeHetArmTips(*shasta2Anchors);
+            if(hetTips == 0) break;
+        }
 #else
         if(!windowTransitionsComputed) {
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,

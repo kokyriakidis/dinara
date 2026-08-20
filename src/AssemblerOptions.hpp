@@ -483,6 +483,11 @@ public:
     // backbone journeys for well-supported consecutive pairs.
     uint64_t maxSkipForBackbone;
 
+    // Minimum anchor-pair coverage (common two-sided reads) for an
+    // anchor-graph edge to be considered for per-edge MSA het detection
+    // (experimental, DINARA_HET_ON_GRAPH=1). Edges below this are skipped.
+    uint64_t minCommonForHet;
+
     // Minimum base span (first anchor to last anchor) for a read's
     // journey to be accepted as a window backbone.
     uint64_t minWindowBaseSpan;
