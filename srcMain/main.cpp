@@ -1842,7 +1842,7 @@ void dinara::main::assemble(
     // MA_HT_INT. With dinara's minCoverage=0, hifiasm's ma_hit_flt likewise
     // classifies on the real overlap span against raw read lengths, matching the
     // tight span here.
-    assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
+    // assembler.deleteInternalOverlaps(/* maxHang */ 1000, /* maxHangRate */ 0.8, /* minOverlapLength */ 50, threadCount);
 
     // Build the read graph used for marker graph vertex construction.
     // Includes only alignments that:
