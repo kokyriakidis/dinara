@@ -2649,14 +2649,25 @@ void dinara::main::assemble(
     {
 #if USE_JOURNEY_ANCHOR_GRAPH
         // Journey-based anchor graph: one edge per pair of anchors that are
-        // consecutive in some read's journey and reach the coverage threshold
-        // (classic mode3::AnchorGraph rule). No windows, no het bubbles, no
-        // inter-window / trim / het-tip passes. Reuse minInterWindowEdgeCoverage
-        // as the per-edge coverage threshold (it is the closest existing knob;
-        // the recorded pipeline runs it at 0 = keep every consecutive-pair edge).
+        // consecutive in some read's filtered journey (classic mode3::AnchorGraph
+        // rule). No windows, no het bubbles, no inter-window / trim / het-tip
+        // passes.
+        //
+        // The per-edge coverage threshold is fixed at 0, NOT reused from
+        // minInterWindowEdgeCoverage. filterByAnchorChaining has already run
+        // (above), so the filtered journeys are the source of truth: every
+        // consecutive pair surviving in a filtered journey is an adjacency the
+        // chaining step already validated. Re-gating those pairs on an edge
+        // coverage threshold measures a different quantity -- the number of reads
+        // sharing the *exact* adjacent transition, vs chaining's countCommon
+        // co-occurrence (with maxSkip look-back) -- so a branchy anchor whose
+        // reads fan out to several distinct successors can pass chaining yet have
+        // every adjacent transition below the threshold, leaving the anchor as an
+        // isolated (degree-0) vertex. Threshold 0 means "every consecutive pair
+        // in some filtered journey gets an edge", which is the intended rule and
+        // eliminates those spurious isolated vertices.
         static_cast<void>(anchorDovetailWindow);
-        const uint64_t minEdgeCoverage =
-            assemblerOptions.assemblyOptions.mode3Options.minInterWindowEdgeCoverage;
+        const uint64_t minEdgeCoverage = 0;
         cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
              << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
              << ")..." << endl;
