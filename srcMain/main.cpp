@@ -2677,6 +2677,10 @@ void dinara::main::assemble(
             minEdgeCoverage,
             threadCount);
 
+        // Het-anchor bubble transcription is temporarily disabled. The journey
+        // graph is exported as a plain consecutive-anchor graph with no het
+        // structure. Re-enable by flipping this to 1.
+#if 0
         // Transcribe abPOA-detected bubbles (SNPs and >=15bp indels) on the
         // journey anchor-graph edges into real het anchors + flank->arm->flank
         // edges. The journey graph connects consecutive anchors with no het
@@ -2719,6 +2723,7 @@ void dinara::main::assemble(
                 assembler.shasta2AnchorGraph->removeHetArmTips(*shasta2Anchors);
             if(hetTips == 0) break;
         }
+#endif // het-anchor bubble transcription (disabled)
 #else
         if(!windowTransitionsComputed) {
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
