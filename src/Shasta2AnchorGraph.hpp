@@ -133,6 +133,22 @@ public:
         uint64_t minEdgeCoverage,
         uint64_t threadCount);
 
+    // Tag type to select the direct per-read journey construction.
+    struct FromJourneysDirect {};
+
+    // Direct construction: one edge for every pair of anchors that are
+    // consecutive in some read's (already filtered) journey. The edge's read
+    // set is exactly the reads that traverse that adjacency, so RC == number of
+    // reads with posB == posA+1. This walks journeys read-by-read rather than
+    // aggregating per-anchor successors via findChildren; the two are
+    // equivalent, but this form makes the "edge per consecutive journey step"
+    // semantics explicit and lets us cross-check edge read counts.
+    Shasta2AnchorGraph(
+        const Shasta2Anchors&,
+        const Shasta2Journeys&,
+        FromJourneysDirect,
+        uint64_t threadCount);
+
     // Construct from anchor windows: each window becomes a chain of its
     // backbone anchors, and inter-window edges are discovered by walking
     // read journeys.

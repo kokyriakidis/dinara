@@ -101,6 +101,83 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
 
 
 
+// Direct per-read journey construction.
+// One edge per pair of anchors consecutive in some read's filtered journey.
+Shasta2AnchorGraph::Shasta2AnchorGraph(
+    const Shasta2Anchors& anchors,
+    const Shasta2Journeys& journeys,
+    FromJourneysDirect,
+    uint64_t threadCount) :
+    MappedMemoryOwner(anchors),
+    MultithreadedObject<Shasta2AnchorGraph>(*this)
+{
+    Shasta2AnchorGraph& anchorGraph = *this;
+    static_cast<void>(threadCount);
+
+    // Vertices: one per AnchorId (vertex_descriptor == AnchorId).
+    const uint64_t anchorCount = anchors.size();
+    for(Shasta2AnchorId anchorId=0; anchorId<anchorCount; anchorId++) {
+        add_vertex(anchorGraph);
+    }
+
+    // Walk every read's filtered journey and accumulate, for each consecutive
+    // pair (A,B), the list of oriented reads that traverse that exact adjacency.
+    // Journeys are already stored in ascending position order (see the filter's
+    // rebuild pass), so journey[p]->journey[p+1] is the adjacency.
+    std::map<std::pair<Shasta2AnchorId, Shasta2AnchorId>, vector<OrientedReadId> >
+        adjacencyReads;
+    const uint64_t orientedReadCount = journeys.size();
+    for(uint64_t oidValue=0; oidValue<orientedReadCount; oidValue++) {
+        const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto journey = journeys[orientedReadId];
+        for(uint64_t p=0; p+1<journey.size(); p++) {
+            const Shasta2AnchorId a = journey[p];
+            const Shasta2AnchorId b = journey[p+1];
+            adjacencyReads[{a, b}].push_back(orientedReadId);
+        }
+    }
+
+    // Create one edge per distinct adjacency. Build the edge's AnchorPair
+    // directly from the accumulated read set (which is exactly the adjacency
+    // read set), rather than recomputing it, so RC == reads-with-this-adjacency
+    // by construction.
+    nextEdgeId = 0;
+    for(auto& kv: adjacencyReads) {
+        const Shasta2AnchorId a = kv.first.first;
+        const Shasta2AnchorId b = kv.first.second;
+        vector<OrientedReadId>& reads = kv.second;
+
+        // Reads were appended in ascending oidValue order per read, but across
+        // reads the outer loop is already ascending, so the list is sorted.
+        // De-dup defensively (a read cannot have the same adjacency twice unless
+        // an anchor repeats consecutively, which journeys do not contain).
+        Shasta2AnchorPair anchorPair;
+        anchorPair.anchorIdA = a;
+        anchorPair.anchorIdB = b;
+        anchorPair.orientedReadIds = reads;
+
+        // Cross-check against the canonical adjacency computation. If these ever
+        // differ, journey walking and Shasta2AnchorPair disagree about which
+        // reads traverse the adjacency -- that would be a real construction bug.
+        Shasta2AnchorPair canonical(anchors, a, b, true);
+        DINARA_ASSERT(canonical.orientedReadIds.size() == anchorPair.orientedReadIds.size());
+
+        anchorPair.assertNoNegativeOffsets(anchors);
+        edge_descriptor e;
+        tie(e, ignore) = add_edge(
+            a, b,
+            Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
+            anchorGraph);
+        anchorGraph[e].useForAssembly = true;
+    }
+
+    cout << "The anchor graph (direct per-read journey construction) has "
+         << num_vertices(*this) << " vertices and "
+         << num_edges(*this) << " edges." << endl;
+}
+
+
+
 // Find detour window pairs.
 // A detour occurs when window X has inter-window edges entering window W
 // at backbone position i and exiting at position j > i. Returns the set

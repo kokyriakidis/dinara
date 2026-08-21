@@ -2649,32 +2649,24 @@ void dinara::main::assemble(
     {
 #if USE_JOURNEY_ANCHOR_GRAPH
         // Journey-based anchor graph: one edge per pair of anchors that are
-        // consecutive in some read's filtered journey (classic mode3::AnchorGraph
-        // rule). No windows, no het bubbles, no inter-window / trim / het-tip
-        // passes.
+        // consecutive in some read's filtered journey. No windows, no het
+        // bubbles, no inter-window / trim / het-tip passes.
         //
-        // The per-edge coverage threshold is fixed at 0, NOT reused from
-        // minInterWindowEdgeCoverage. filterByAnchorChaining has already run
-        // (above), so the filtered journeys are the source of truth: every
-        // consecutive pair surviving in a filtered journey is an adjacency the
-        // chaining step already validated. Re-gating those pairs on an edge
-        // coverage threshold measures a different quantity -- the number of reads
-        // sharing the *exact* adjacent transition, vs chaining's countCommon
-        // co-occurrence (with maxSkip look-back) -- so a branchy anchor whose
-        // reads fan out to several distinct successors can pass chaining yet have
-        // every adjacent transition below the threshold, leaving the anchor as an
-        // isolated (degree-0) vertex. Threshold 0 means "every consecutive pair
-        // in some filtered journey gets an edge", which is the intended rule and
-        // eliminates those spurious isolated vertices.
+        // Built via FromJourneysDirect, which walks each read's filtered journey
+        // and adds an edge for every consecutive pair. There is no separate edge
+        // coverage threshold: filterByAnchorChaining has already run (above), so
+        // the filtered journeys are the source of truth and every surviving
+        // consecutive pair becomes an edge. Because the chaining DP only links a
+        // chain-consecutive pair when countCommon(A,B) >= minCommonForBackbone,
+        // every resulting edge carries at least minCommonForBackbone co-occurring
+        // reads of support by construction.
         static_cast<void>(anchorDovetailWindow);
-        const uint64_t minEdgeCoverage = 0;
         cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
-             << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
-             << ")..." << endl;
+             << "(direct per-read consecutive-anchor edges)..." << endl;
         assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
             *shasta2Anchors,
             *shasta2Journeys,
-            minEdgeCoverage,
+            Shasta2AnchorGraph::FromJourneysDirect{},
             threadCount);
 
         // Het-anchor bubble transcription is temporarily disabled. The journey
