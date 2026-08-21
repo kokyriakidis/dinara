@@ -1170,7 +1170,7 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.minCommonForBackbone",
         value<uint64_t>(&assemblyOptions.mode3Options.minCommonForBackbone)->
-        default_value(2),
+        default_value(6),
         "Minimum common reads between consecutive backbone anchors. "
         "Backbone journeys are filtered to keep the longest subsequence "
         "where every consecutive pair meets this threshold. "
