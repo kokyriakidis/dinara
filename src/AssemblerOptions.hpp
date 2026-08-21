@@ -483,6 +483,15 @@ public:
     // backbone journeys for well-supported consecutive pairs.
     uint64_t maxSkipForBackbone;
 
+    // Minimum per-edge coverage for the journey anchor graph: an edge between
+    // consecutive journey anchors is kept only if at least this many reads
+    // traverse the adjacency (posB == posA+1). Default 0 keeps every consecutive
+    // pair (recommended: filterByAnchorChaining already validates support via
+    // minCommonForBackbone). Values > 0 threshold adjacency coverage, which can
+    // isolate well-supported anchors whose reads reach a neighbor through
+    // intermediate anchors.
+    uint64_t minJourneyEdgeCoverage;
+
     // Minimum anchor-pair coverage (common two-sided reads) for an
     // anchor-graph edge to be considered for per-edge MSA het detection
     // (experimental, DINARA_HET_ON_GRAPH=1). Edges below this are skipped.

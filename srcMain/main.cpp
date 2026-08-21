@@ -2652,14 +2652,18 @@ void dinara::main::assemble(
         // consecutive in some read's filtered journey. No windows, no het
         // bubbles, no inter-window / trim / het-tip passes.
         //
-        // The per-edge coverage threshold is fixed at 0. filterByAnchorChaining
-        // has already run (above), so the filtered journeys are the source of
-        // truth: every consecutive pair surviving in a filtered journey becomes
-        // an edge. Because the chaining DP only links a chain-consecutive pair
-        // when countCommon(A,B) >= minCommonForBackbone, every resulting edge
-        // carries at least minCommonForBackbone co-occurring reads of support.
+        // The per-edge coverage threshold defaults to 0 (see
+        // Assembly.mode3.minJourneyEdgeCoverage). filterByAnchorChaining has
+        // already run (above), so the filtered journeys are the source of truth:
+        // every consecutive pair surviving in a filtered journey becomes an
+        // edge. Because the chaining DP only links a chain-consecutive pair when
+        // countCommon(A,B) >= minCommonForBackbone, every resulting edge carries
+        // at least minCommonForBackbone co-occurring reads of support. Setting
+        // this option > 0 thresholds adjacency coverage instead, which can
+        // isolate well-supported anchors.
         static_cast<void>(anchorDovetailWindow);
-        const uint64_t minEdgeCoverage = 0;
+        const uint64_t minEdgeCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minJourneyEdgeCoverage;
         cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
              << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
              << ")..." << endl;

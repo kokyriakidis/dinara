@@ -1183,6 +1183,15 @@ void AssemblerOptions::addConfigurableOptions()
         "for well-supported consecutive anchor pairs. "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.minJourneyEdgeCoverage",
+        value<uint64_t>(&assemblyOptions.mode3Options.minJourneyEdgeCoverage)->
+        default_value(0),
+        "Minimum per-edge coverage for the journey anchor graph: an edge "
+        "between consecutive journey anchors is kept only if at least this "
+        "many reads traverse the adjacency. Default 0 keeps every consecutive "
+        "pair (support is already validated by minCommonForBackbone). Values "
+        "> 0 can isolate well-supported anchors. (Mode 3 assembly only).")
+
         ("Assembly.mode3.minCommonForHet",
         value<uint64_t>(&assemblyOptions.mode3Options.minCommonForHet)->
         default_value(12),
@@ -1636,6 +1645,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minInterWindowEdgeCoverage = " << minInterWindowEdgeCoverage << "\n";
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
+    s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
     s << "mode3.hetMinVaf = " << hetMinVaf << "\n";
