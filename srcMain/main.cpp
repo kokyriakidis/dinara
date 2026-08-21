@@ -2652,21 +2652,21 @@ void dinara::main::assemble(
         // consecutive in some read's filtered journey. No windows, no het
         // bubbles, no inter-window / trim / het-tip passes.
         //
-        // Built via FromJourneysDirect, which walks each read's filtered journey
-        // and adds an edge for every consecutive pair. There is no separate edge
-        // coverage threshold: filterByAnchorChaining has already run (above), so
-        // the filtered journeys are the source of truth and every surviving
-        // consecutive pair becomes an edge. Because the chaining DP only links a
-        // chain-consecutive pair when countCommon(A,B) >= minCommonForBackbone,
-        // every resulting edge carries at least minCommonForBackbone co-occurring
-        // reads of support by construction.
+        // The per-edge coverage threshold is fixed at 0. filterByAnchorChaining
+        // has already run (above), so the filtered journeys are the source of
+        // truth: every consecutive pair surviving in a filtered journey becomes
+        // an edge. Because the chaining DP only links a chain-consecutive pair
+        // when countCommon(A,B) >= minCommonForBackbone, every resulting edge
+        // carries at least minCommonForBackbone co-occurring reads of support.
         static_cast<void>(anchorDovetailWindow);
+        const uint64_t minEdgeCoverage = 0;
         cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
-             << "(direct per-read consecutive-anchor edges)..." << endl;
+             << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
+             << ")..." << endl;
         assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
             *shasta2Anchors,
             *shasta2Journeys,
-            Shasta2AnchorGraph::FromJourneysDirect{},
+            minEdgeCoverage,
             threadCount);
 
         // Het-anchor bubble transcription is temporarily disabled. The journey
