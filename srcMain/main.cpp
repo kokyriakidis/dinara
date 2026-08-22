@@ -2499,6 +2499,42 @@ void dinara::main::assemble(
     }
 #endif // !USE_JOURNEY_ANCHOR_GRAPH  (end of window + het-bubble pipeline)
 
+    // Append myloasm SNPmer het anchors to the export. Runs AFTER primary +
+    // window het anchors are appended (so hetAnchorFirstId still marks the
+    // primary/het boundary) and BEFORE the journey tie resolution below, so
+    // snpmer anchors PARTICIPATE in tie resolution: a snpmer anchor that pins a
+    // read at the same exported position as a primary or window het anchor is
+    // recorded in journeyTieDropMap and omitted by writeExternalAnchors, instead
+    // of triggering shasta2's "Invalid Journey ... Two anchors at the same
+    // position" assert at load time. These are export-only additional het
+    // anchors (no anchor-graph bubble edges); see Shasta2SnpmerAnchors.hpp.
+    //
+    // On by default. Set DINARA_SNPMER_ANCHORS=0 to disable. minMembers per
+    // allele is 2 (appendHetAnchorPair requires >= 2); override with
+    // DINARA_SNPMER_MIN_MEMBERS.
+    {
+        bool enabled = true;
+        if(const char* env = std::getenv("DINARA_SNPMER_ANCHORS")) {
+            enabled = (env[0] != '0');
+        }
+        if(enabled) {
+            cout << timestamp << "Appending myloasm SNPmer het anchors..." << endl;
+            const uint64_t minMembers = []() -> uint64_t {
+                if(const char* m = std::getenv("DINARA_SNPMER_MIN_MEMBERS")) {
+                    const long v = std::atol(m);
+                    if(v >= 2) return uint64_t(v);
+                }
+                return 2;   // appendHetAnchorPair requires >= 2 members
+            }();
+            const uint64_t appended = appendSnpmerHetAnchors(
+                assembler, inputFileNames, threadCount,
+                minMembers, /*requireBiallelic*/ true);
+            cout << timestamp << "Appended " << appended
+                 << " SNPmer allele anchors; store now has "
+                 << shasta2Anchors->size() << " anchors." << endl;
+        }
+    }
+
     // Global per-read journey tie resolution. shasta2 builds, for every oriented
     // read, the ordered list of ALL anchors that read belongs to (sorted by the
     // read's exported position) and asserts they are STRICTLY INCREASING; two
@@ -2616,41 +2652,6 @@ void dinara::main::assemble(
              << " read(s); dropping " << unitsDropped
              << " unit(s) across " << journeyTieDropMap.size()
              << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
-    }
-
-    // Append myloasm SNPmer het anchors to the export. Runs AFTER primary +
-    // window het anchors are appended (so hetAnchorFirstId still marks the
-    // primary/het boundary) and BEFORE writeExternalAnchors, so snpmer anchors
-    // join the exported set. These are export-only additional het anchors (no
-    // anchor-graph bubble edges); see Shasta2SnpmerAnchors.hpp. NOTE: this
-    // appends het anchors outside the window pipeline, so the journey tie
-    // resolution above has already run -- snpmer anchors are exported without
-    // tie-drop filtering.
-    //
-    // On by default. Set DINARA_SNPMER_ANCHORS=0 to disable. minMembers per
-    // allele is 2 (appendHetAnchorPair requires >= 2); override with
-    // DINARA_SNPMER_MIN_MEMBERS.
-    {
-        bool enabled = true;
-        if(const char* env = std::getenv("DINARA_SNPMER_ANCHORS")) {
-            enabled = (env[0] != '0');
-        }
-        if(enabled) {
-            cout << timestamp << "Appending myloasm SNPmer het anchors..." << endl;
-            const uint64_t minMembers = []() -> uint64_t {
-                if(const char* m = std::getenv("DINARA_SNPMER_MIN_MEMBERS")) {
-                    const long v = std::atol(m);
-                    if(v >= 2) return uint64_t(v);
-                }
-                return 2;   // appendHetAnchorPair requires >= 2 members
-            }();
-            const uint64_t appended = appendSnpmerHetAnchors(
-                assembler, inputFileNames, threadCount,
-                minMembers, /*requireBiallelic*/ true);
-            cout << timestamp << "Appended " << appended
-                 << " SNPmer allele anchors; store now has "
-                 << shasta2Anchors->size() << " anchors." << endl;
-        }
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
