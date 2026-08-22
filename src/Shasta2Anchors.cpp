@@ -11,6 +11,8 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 #include <iostream>
@@ -401,6 +403,18 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     uint64_t exportedCount = 0;
     uint64_t droppedMemberCount = 0;
 
+    // Optional dump of the EXACT exported (anchorId, orientedRead, rawPosition)
+    // tuples, so shasta2's journey-graph construction can be reconstructed
+    // offline to diagnose isolated circular chains. Enabled with
+    // DINARA_EXPORT_DUMP=<path>. shasta2 sorts each read's anchors by rawPosition
+    // and links consecutive ones, so this is all the input its graph needs.
+    std::FILE* expDump = nullptr;
+    if(const char* dp = std::getenv("DINARA_EXPORT_DUMP")) {
+        expDump = std::fopen(dp, "w");
+        if(expDump) std::fprintf(expDump,
+            "# anchorId\torientedReadValue\trawPosition\tisHet\n");
+    }
+
     // Predicate: is this (canonical anchor, read) member dropped to resolve a
     // journey position tie? The drop set is keyed on the canonical (even) id.
     const auto isDropped = [&](Shasta2AnchorId anchorId, ReadId readId) -> bool {
@@ -528,9 +542,16 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
             // External anchors store the raw position (first base of the k-mer).
             const uint32_t rawPosition = markerInfo.position - exportShift;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
+            if(expDump) {
+                std::fprintf(expDump, "%llu\t%llu\t%u\t%d\n",
+                    (unsigned long long)anchorId,
+                    (unsigned long long)markerInfo.orientedReadId.getValue(),
+                    rawPosition, isHetAnchor ? 1 : 0);
+            }
         }
         ++exportedCount;
     }
+    if(expDump) std::fclose(expDump);
 
     if(droppedMemberCount > 0) {
         cout << "Dropped " << droppedMemberCount

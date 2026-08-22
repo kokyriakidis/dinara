@@ -73,28 +73,33 @@ uint64_t dinara::appendSnpmerHetAnchors(
     //    split (key with the middle base cleared) so the two alleles of a   //
     //    site group.                                                        //
     //                                                                       //
-    // Every member is placed in the read's OWN sequencing frame (strand 0)  //
-    // at rawPosition = snpCol - hetKHalf, so appendHetAnchorPair's stored    //
-    // midpoint (rawPosition + hetKHalf) lands exactly on the SNP column      //
-    // snpCol in BOTH het-anchor modes: k=2 stores predecessor snpCol-1, k=0  //
-    // stores the SNP base snpCol itself (see HetAnchorK.hpp). It also        //
-    // generates the reverse-complement (strand 1) placement itself, mirrored //
-    // to L - snpCol so fwd + rc stored positions sum to readLen -- the same  //
-    // middle base in both oriented reads, matching the primary-anchor        //
-    // convention (AssemblerMarkers.cpp: strand1 = baseCount - k - position). //
-    //                                                                        //
-    // We deliberately do NOT pre-orient members by a per-SNP canonical       //
-    // strand: a read has one physical                                        //
-    // orientation, but two SNPs on it can each have their                    //
-    // canonical allele readable on OPPOSITE strands. Assigning per-SNP      //
-    // strands puts both a strand-0 and a strand-1 member on one read; the   //
-    // RC of the strand-1 member then lands on strand 0 on top of a          //
-    // neighboring strand-0 canonical member, producing two anchors at the   //
-    // same oriented-read position and crashing shasta2's journey builder.   //
-    // Allele separation does not need orientation -- it comes entirely from //
-    // the strand-invariant canonical key (allele0 and allele1 have distinct //
-    // keys). The het-bubble engine likewise uses each read's single         //
-    // alignment frame, never a per-SNP one.                                 //
+    // Each occurrence is placed in the CANONICAL genomic orientation of the //
+    // k-mer, i.e. the strand on which the read spells the canonical key:    //
+    //   o == 0 (forward k-mer == key): canonical member (readId, 0) at      //
+    //          rawPosition = snpCol - hetKHalf                              //
+    //   o == 1 (forward k-mer == RC(key)): canonical member (readId, 1) at  //
+    //          rawPosition = (L - snpCol) - hetKHalf                        //
+    // appendHetAnchorPair stores each member at rawPosition + hetKHalf (the //
+    // SNP column in that strand's frame) and mirrors it to the RC anchor,   //
+    // so fwd + rc stored positions sum to readLen -- the same middle base   //
+    // in both oriented reads (primary-anchor convention, AssemblerMarkers   //
+    // .cpp: strand1 = baseCount - k - position).                            //
+    //                                                                       //
+    // Why orient per occurrence rather than place everything on strand 0:  //
+    // a read has ONE physical orientation. If every occurrence is forced    //
+    // onto strand 0, two nearby SNP sites are traversed in one order by     //
+    // genomic-forward reads and the OPPOSITE order by genomic-reverse reads //
+    // (they read the RC), so shasta2 -- which orders each read's anchors by //
+    // stored position -- gets both A->B and B->A edges and builds a 2-anchor //
+    // cycle (an "isolated circular anchor chain"). Placing each occurrence  //
+    // in the canonical k-mer frame makes every read that carries the        //
+    // canonical allele agree on the strand and hence on the order, removing //
+    // those cycles. (Orientation does NOT cause position collisions -- the  //
+    // earlier crash was an off-by-one in the RC mirror, since fixed.)       //
+    //                                                                       //
+    // Allele separation still comes from the strand-invariant canonical key //
+    // (allele0 and allele1 have distinct keys); orientation only fixes the  //
+    // intra-read ORDER of anchors.                                          //
     // ------------------------------------------------------------------ //
     struct Member { uint32_t orientedValue; uint32_t rawPosition; };
     struct Allele { vector<Member> members; };
@@ -126,6 +131,7 @@ uint64_t dinara::appendSnpmerHetAnchors(
             continue;
         }
         const uint32_t L = uint32_t(reads.getReadRawSequenceLength(readId));
+        const auto seq = reads.getRead(readId);        // raw forward sequence
 
         for(size_t s = 0; s < R.n_snpmers; ++s) {
             ++occTotal;
@@ -137,17 +143,25 @@ uint64_t dinara::appendSnpmerHetAnchors(
 
             const uint32_t snpCol = pos + uint32_t(mid);   // forward SNP column
 
-            // Place the het marker in the read's own (strand 0) frame so its
-            // stored midpoint (rawPosition + hetKHalf) is exactly snpCol.
-            // k=2: rawPosition = snpCol-1 (predBase), stored midpoint snpCol.
-            // k=0: rawPosition = snpCol   (SNP base), stored midpoint snpCol.
-            // appendHetAnchorPair mirrors this onto strand 1 itself. No per-SNP
-            // orientation (see the block comment above for why that is unsafe).
-            if(snpCol < hetKHalf) { ++occOob; continue; }
-            const uint32_t rawPosition = snpCol - hetKHalf;
+            // Orientation of THIS occurrence: 0 if the read spells the canonical
+            // allele forward at the SNP column, 1 if it spells the complement
+            // (i.e. the read is the RC of the canonical k-mer here). Comparing
+            // the middle base is equivalent to comparing the whole k-mer to the
+            // key (verified: 100% agreement) and is O(1).
+            const uint8_t canonMid = uint8_t((key >> (2 * mid)) & 3ULL);
+            const uint8_t fwdMid = seq[snpCol].value;      // 0..3
+            const int o = (fwdMid == canonMid) ? 0 : 1;
+
+            // SNP column in the canonical strand's own frame, then shift by
+            // hetKHalf so appendHetAnchorPair's stored midpoint is that column.
+            // o==0: column = snpCol (forward frame).
+            // o==1: column = L - snpCol (RC frame; same physical base).
+            const uint32_t canonCol = (o == 0) ? snpCol : (L - snpCol);
+            if(canonCol < hetKHalf) { ++occOob; continue; }
+            const uint32_t rawPosition = canonCol - hetKHalf;
             if(uint64_t(rawPosition) + hetKHalf >= L) { ++occOob; continue; }
 
-            const OrientedReadId oid(readId, Strand(0));
+            const OrientedReadId oid(readId, Strand(o));
             alleleByKey[key].members.push_back(
                 Member{ oid.getValue(), rawPosition });
 
@@ -162,21 +176,39 @@ uint64_t dinara::appendSnpmerHetAnchors(
     (void)occAmbig;
 
     // ------------------------------------------------------------------ //
-    // 3. Per allele: dedup a read that occurs twice in the SAME allele     //
-    //    (keep one member). Per split: drop any read appearing in BOTH      //
-    //    alleles (paralog/repeat -- it cannot phase the site).              //
+    // 3. Per allele: DROP any read that occurs more than once in the same  //
+    //    allele. Per split: drop any read appearing in BOTH alleles         //
+    //    (paralog/repeat -- it cannot phase the site).                      //
     // ------------------------------------------------------------------ //
-    // Dedup within each allele by ReadId (both strands map to one ReadId).
+    // A key that occurs 2+ times on one read is a repeat: its SNP column is
+    // ambiguous, so keeping an arbitrary copy can put this read's anchor before
+    // OR after a neighboring anchor depending on which copy survived, producing
+    // A->B and B->A edges (a 2-anchor cycle). Drop the read from this allele
+    // entirely rather than keep one copy.
+    uint64_t repeatReadsDropped = 0;
     for(auto& kv : alleleByKey) {
         auto& m = kv.second.members;
         std::sort(m.begin(), m.end(),
             [](const Member& a, const Member& b) {
-                return a.orientedValue < b.orientedValue;
+                return (a.orientedValue >> 1) < (b.orientedValue >> 1);
             });
-        m.erase(std::unique(m.begin(), m.end(),
-            [](const Member& a, const Member& b) {
-                return (a.orientedValue >> 1) == (b.orientedValue >> 1);
-            }), m.end());
+        // Remove ALL members of any ReadId that appears more than once.
+        vector<Member> kept;
+        kept.reserve(m.size());
+        for(size_t i = 0; i < m.size();) {
+            size_t j = i;
+            while(j < m.size() &&
+                  (m[j].orientedValue >> 1) == (m[i].orientedValue >> 1)) {
+                ++j;
+            }
+            if(j - i == 1) {
+                kept.push_back(m[i]);
+            } else {
+                repeatReadsDropped += (j - i);
+            }
+            i = j;
+        }
+        m.swap(kept);
     }
 
     uint64_t paralogReadsDropped = 0;
@@ -290,7 +322,8 @@ uint64_t dinara::appendSnpmerHetAnchors(
          << " total, " << occKept << " placed, "
          << occUnmappedRead << " on unmapped reads, "
          << occOob << " out-of-bounds." << endl;
-    cout << timestamp << "  snpmer filtering: " << paralogReadsDropped
+    cout << timestamp << "  snpmer filtering: " << repeatReadsDropped
+         << " repeat-key members dropped, " << paralogReadsDropped
          << " paralog members dropped, " << allelesSkippedSmall
          << " alleles below minMembers(" << minMembersPerAllele << "), "
          << sitesSkippedNotBiallelic << " sites not biallelic." << endl;
