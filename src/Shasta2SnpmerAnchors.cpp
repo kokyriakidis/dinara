@@ -66,9 +66,24 @@ uint64_t dinara::appendSnpmerHetAnchors(
 
     // ------------------------------------------------------------------ //
     // 2. Bucket every SNPmer occurrence by its CANONICAL key (= one allele //
-    //    of one site) into (OrientedReadId, rawPosition) members, using the //
-    //    validated forward->oriented conversion. Track the split (key with  //
-    //    the middle base cleared) so the two alleles of a site group.       //
+    //    of one site) into (OrientedReadId, rawPosition) members. Track the //
+    //    split (key with the middle base cleared) so the two alleles of a   //
+    //    site group.                                                        //
+    //                                                                       //
+    // Every member is placed in the read's OWN sequencing frame (strand 0)  //
+    // at rawPosition = snpCol - 1; appendHetAnchorPair generates the        //
+    // reverse-complement (strand 1) placement itself. We deliberately do    //
+    // NOT pre-orient members by a per-SNP canonical strand: a read has one  //
+    // physical orientation, but two SNPs on it can each have their          //
+    // canonical allele readable on OPPOSITE strands. Assigning per-SNP      //
+    // strands puts both a strand-0 and a strand-1 member on one read; the   //
+    // RC of the strand-1 member then lands on strand 0 on top of a          //
+    // neighboring strand-0 canonical member, producing two anchors at the   //
+    // same oriented-read position and crashing shasta2's journey builder.   //
+    // Allele separation does not need orientation -- it comes entirely from //
+    // the strand-invariant canonical key (allele0 and allele1 have distinct //
+    // keys). The het-bubble engine likewise uses each read's single         //
+    // alignment frame, never a per-SNP one.                                 //
     // ------------------------------------------------------------------ //
     struct Member { uint32_t orientedValue; uint32_t rawPosition; };
     struct Allele { vector<Member> members; };
@@ -94,7 +109,6 @@ uint64_t dinara::appendSnpmerHetAnchors(
             occUnmappedRead += R.n_snpmers;
             continue;
         }
-        const auto seq = reads.getRead(readId);        // raw forward sequence
         const uint32_t L = uint32_t(reads.getReadRawSequenceLength(readId));
 
         for(size_t s = 0; s < R.n_snpmers; ++s) {
@@ -102,28 +116,21 @@ uint64_t dinara::appendSnpmerHetAnchors(
             const uint32_t pos = R.snpmers[s].pos;
             const uint64_t key = R.snpmers[s].key;
 
-            // Need the full k-mer window and the two oriented marker bases.
+            // Need the full k-mer window around the SNP column.
             if(uint64_t(pos) + uint64_t(k) > L) { ++occOob; continue; }
 
-            const uint8_t canonMid = uint8_t((key >> (2 * mid)) & 3ULL);
             const uint32_t snpCol = pos + uint32_t(mid);   // forward SNP column
-            const uint8_t fwdMid = seq[snpCol].value;      // Base value 0..3
 
-            // Strand whose oriented sequence reads the canonical allele base.
-            const int o = (fwdMid == canonMid) ? 0 : 1;
-
-            // predBase = first base of the k=2 marker in the ORIENTED frame.
-            uint32_t rawPosition;
-            if(o == 0) {
-                if(snpCol < 1) { ++occOob; continue; }
-                rawPosition = snpCol - 1;
-            } else {
-                if(L < snpCol + 2) { ++occOob; continue; }
-                rawPosition = L - snpCol - 2;
-            }
+            // Place the k=2 het marker in the read's own (strand 0) frame:
+            // predBase = snpCol-1, alleleBase = snpCol. appendHetAnchorPair
+            // stores it at rawPosition + hetK/2 = snpCol and mirrors it onto
+            // strand 1 itself. No per-SNP orientation (see the block comment
+            // above for why that is unsafe).
+            if(snpCol < 1) { ++occOob; continue; }
+            const uint32_t rawPosition = snpCol - 1;
             if(uint64_t(rawPosition) + 1 >= L) { ++occOob; continue; }
 
-            const OrientedReadId oid(readId, Strand(o));
+            const OrientedReadId oid(readId, Strand(0));
             alleleByKey[key].members.push_back(
                 Member{ oid.getValue(), rawPosition });
 

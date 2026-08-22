@@ -2605,6 +2605,10 @@ void dinara::main::assemble(
             }
         };
         uint64_t tieGroups = 0, unitsDropped = 0, readsWithTie = 0;
+        // Diagnostic: classify each tie group by the (het,primary) composition of
+        // its members, to confirm het-vs-het collisions (the per-SNP-orientation
+        // bug) are gone and the remaining ties are het-vs-primary.
+        uint64_t tgPrimaryVsHet = 0, tgHetVsHet = 0, tgPrimaryVsPrimary = 0;
         const uint64_t maxReport = 20;
         uint64_t reported = 0;
         for(auto& [oidValue, occ] : byRead) {
@@ -2619,6 +2623,16 @@ void dinara::main::assemble(
                 if(j - i > 1) {
                     ++tieGroups;
                     if(!readCounted) { ++readsWithTie; readCounted = true; }
+                    // Classify the group's composition (diagnostic).
+                    {
+                        uint64_t hetN = 0, priN = 0;
+                        for(size_t t = i; t < j; t++) {
+                            if(isHet(occ[t].second)) ++hetN; else ++priN;
+                        }
+                        if(priN && hetN) ++tgPrimaryVsHet;
+                        else if(hetN >= 2) ++tgHetVsHet;
+                        else ++tgPrimaryVsPrimary;
+                    }
                     // Choose the keeper among the tied canonical anchors.
                     Shasta2AnchorId keeper = occ[i].second;
                     for(size_t t = i + 1; t < j; t++) {
@@ -2652,6 +2666,9 @@ void dinara::main::assemble(
              << " read(s); dropping " << unitsDropped
              << " unit(s) across " << journeyTieDropMap.size()
              << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
+        cout << timestamp << "  tie groups by class: primary-vs-het="
+             << tgPrimaryVsHet << " het-vs-het=" << tgHetVsHet
+             << " primary-vs-primary=" << tgPrimaryVsPrimary << "." << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
