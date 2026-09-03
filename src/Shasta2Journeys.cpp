@@ -415,14 +415,61 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
         }
     }
 
-    // Pass B: sort each read's strand-0 list by position (ties broken by
-    // ascending anchorId -- correctness does not depend on which tied anchor
-    // sorts first, only that strand 1 is mirrored from strand 0, not sorted
-    // independently), then derive strand 1 by reversing + flipping.
+    // Pass B: sort each read's strand-0 list by position, then collapse any
+    // EXACT position tie down to a single survivor. Two different anchors
+    // legitimately CAN land on the same raw position on the same read: the
+    // per-edge margin proof (see Shasta2AnchorGraphHetOnGraph.cpp's file
+    // header) only guarantees separation from an edge's OWN flanking
+    // anchors, not from anchors created by some OTHER, independent edge that
+    // also happens to touch this read at the same base (common once real
+    // data has many overlapping anchor-graph edges) -- left unresolved, two
+    // such anchors land journey-adjacent with a zero offset and
+    // Shasta2AnchorPair::assertNoNegativeOffsets aborts the whole run. Same
+    // tie-break priority as main.cpp's external-anchor-export tie
+    // resolution: primary over het/hom, then higher coverage (member
+    // count), then lower anchor id. The loser is dropped from just THIS
+    // read's journey -- it keeps its other members and its own coverage
+    // count untouched, exactly like the export-side drop map.
+    auto isHetAnchor = [&](Shasta2AnchorId id) -> bool {
+        return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
+    };
+    auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
+        const bool aHet = isHetAnchor(a), bHet = isHetAnchor(b);
+        if(aHet != bHet) return !aHet;                      // primary wins
+        const uint64_t ca = anchors[a].size(), cb = anchors[b].size();
+        if(ca != cb) return ca > cb;                         // higher coverage wins
+        return a < b;                                        // lower id wins
+    };
+    uint64_t tieGroups = 0, unitsDropped = 0;
+
     filteredJourneys.assign(orientedReadCount, {});
     for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
         auto& v = strand0[readIdValue];
         std::sort(v.begin(), v.end());
+
+        if(!v.empty()) {
+            vector<pair<uint32_t, Shasta2AnchorId>> deduped;
+            deduped.reserve(v.size());
+            size_t i = 0;
+            while(i < v.size()) {
+                size_t j = i + 1;
+                while(j < v.size() && v[j].first == v[i].first) j++;
+                if(j - i == 1) {
+                    deduped.push_back(v[i]);
+                } else {
+                    ++tieGroups;
+                    Shasta2AnchorId keeper = v[i].second;
+                    for(size_t t = i + 1; t < j; t++) {
+                        if(keepAOverB(v[t].second, keeper)) keeper = v[t].second;
+                    }
+                    unitsDropped += (j - i - 1);
+                    deduped.push_back({v[i].first, keeper});
+                }
+                i = j;
+            }
+            v.swap(deduped);
+        }
+
         std::vector<Shasta2AnchorId>& out = filteredJourneys[2 * readIdValue];
         std::vector<Shasta2AnchorId>& outRc = filteredJourneys[2 * readIdValue + 1];
         out.reserve(v.size());
@@ -437,6 +484,11 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     }
     strand0.clear();
     strand0.shrink_to_fit();
+    if(tieGroups > 0) {
+        cout << timestamp << "Journeys rebuild: resolved " << tieGroups
+             << " same-position tie(s) across independent anchors, dropping "
+             << unitsDropped << " occurrence(s) (one survivor kept each)." << endl;
+    }
 
     // Pass C: rebuild the journeys VectorOfVectors in place from
     // filteredJourneys -- identical shape to filterByAnchorChaining's Pass B.
