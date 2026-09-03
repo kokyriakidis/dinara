@@ -2579,6 +2579,7 @@ void dinara::main::assemble(
             detectionGraph, *shasta2Anchors, minCommonForHet, threadCount);
         cout << timestamp << "transcribeHetBubbles results:\n"
              << "  edges total:             " << res.edgesTotal << "\n"
+             << "  edges skipped (RC mirror processed instead): " << res.edgesSkippedMirror << "\n"
              << "  edges considered:        " << res.edgesConsidered
              << " (coverage >= " << minCommonForHet << ")\n"
              << "  edges skipped coverage:  " << res.edgesSkippedCoverage << "\n"

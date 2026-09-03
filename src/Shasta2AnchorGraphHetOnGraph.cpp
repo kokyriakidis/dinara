@@ -460,6 +460,32 @@ HetOnGraphResult dinara::transcribeHetBubbles(
             const Shasta2AnchorGraphEdge& edge = graph[e];
             const Shasta2AnchorPair& anchorPair = edge.anchorPair;
 
+            // Detect each real site once. Edge (A, B) and its RC mirror
+            // (B^1, A^1) are the same physical bubble seen from opposite
+            // strands (every read's journey has a mirrored strand-1 twin,
+            // and the anchor graph is built from both), so MSA-ing both
+            // independently rediscovers the same site twice and mints two
+            // entirely separate (canonical, RC) anchor pairs for it -- which
+            // then collide when two of those four ids land on the same read
+            // at the same position (Shasta2Journeys::rebuildAfterNewAnchors's
+            // tie resolution is a necessary safety net regardless, but
+            // should fire far less often with this in place). Skip the
+            // direction whose mirror will also be visited; this is a pure
+            // function of the edge's own anchor ids, so it needs no
+            // cross-thread coordination. Falls back to processing anyway if
+            // the mirror edge doesn't exist (shouldn't happen given the
+            // graph's RC-symmetric construction, but safer than silently
+            // dropping a site that would then never be detected at all).
+            {
+                const Shasta2AnchorId mirrorSrc = anchorPair.anchorIdB ^ 1ULL;
+                const Shasta2AnchorId mirrorDst = anchorPair.anchorIdA ^ 1ULL;
+                if(anchorPair.anchorIdA > mirrorSrc &&
+                   boost::edge(mirrorSrc, mirrorDst, graph).second) {
+                    st.edgesSkippedMirror++;
+                    continue;
+                }
+            }
+
             const uint64_t coverage = anchorPair.size();
             if(coverage < minCommonForHet) { st.edgesSkippedCoverage++; continue; }
             st.edgesConsidered++;
@@ -528,6 +554,7 @@ HetOnGraphResult dinara::transcribeHetBubbles(
     for(const HetOnGraphResult& st: threadStats) {
         result.edgesConsidered        += st.edgesConsidered;
         result.edgesMsad              += st.edgesMsad;
+        result.edgesSkippedMirror     += st.edgesSkippedMirror;
         result.edgesSkippedCoverage   += st.edgesSkippedCoverage;
         result.edgesSkippedLen        += st.edgesSkippedLen;
         result.edgesSkippedIdentical  += st.edgesSkippedIdentical;

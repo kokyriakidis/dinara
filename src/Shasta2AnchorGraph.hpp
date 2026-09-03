@@ -37,6 +37,7 @@ namespace dinara {
             uint64_t edgesTotal = 0;        // all edges in the graph
             uint64_t edgesConsidered = 0;   // coverage >= minCommonForHet, MSA attempted
             uint64_t edgesMsad = 0;         // MSA actually produced (>=2 non-empty rows)
+            uint64_t edgesSkippedMirror = 0; // this edge's RC mirror is processed instead
             uint64_t edgesSkippedCoverage = 0;
             uint64_t edgesSkippedLen = 0;   // skipped by maxLen guard
             uint64_t edgesSkippedIdentical = 0; // all read sequences identical (no MSA)
