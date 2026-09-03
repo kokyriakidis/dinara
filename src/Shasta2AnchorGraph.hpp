@@ -28,9 +28,11 @@ namespace dinara {
         class Shasta2AnchorGraphEdge;
         class Shasta2Anchors;
 
-        // Result of the POA-topology transcription pass (transcribeHetBubbles):
-        // per-edge abPOA is used to find bubbles (SNPs and indels) on each edge,
-        // which are transcribed into real het anchors + flank->arm->flank edges.
+        // Result of the POA-topology detection pass (transcribeHetBubbles):
+        // per-edge abPOA is used to find real sites (SNPs and indels) on each
+        // edge, each transcribed into new het anchors (one per passing
+        // non-deletion allele). See Shasta2AnchorGraphHetOnGraph.cpp's file
+        // header for why this only appends anchors and never touches the graph.
         struct HetOnGraphResult {
             uint64_t edgesTotal = 0;        // all edges in the graph
             uint64_t edgesConsidered = 0;   // coverage >= minCommonForHet, MSA attempted
@@ -38,30 +40,30 @@ namespace dinara {
             uint64_t edgesSkippedCoverage = 0;
             uint64_t edgesSkippedLen = 0;   // skipped by maxLen guard
             uint64_t edgesSkippedIdentical = 0; // all read sequences identical (no MSA)
-            uint64_t edgesPlanned = 0;      // clean single-bubble edges transcribed
-            uint64_t edgesDeferredMultiSite = 0; // >1 bubble (iteration 2)
-            uint64_t edgesDeferredEndBubble = 0; // bubble touches a span end
-            uint64_t edgesDeferredComplex = 0;   // other unsupported shapes
-            uint64_t bubblesTranscribed = 0;
-            uint64_t hetAnchorsCreated = 0; // canonical het anchors appended (arms)
-            uint64_t armEdgesAdded = 0;     // flank->arm / arm->flank edges added
-            uint64_t deletionEdgesAdded = 0;// direct flank->flank (deletion allele)
-            uint64_t originalEdgesDisabled = 0;
+            uint64_t edgesPlanned = 0;      // edges with >=1 real site found
+            uint64_t edgesPlannedMultiSite = 0; // of edgesPlanned, those with >1 real site
+            uint64_t edgesDeferredEndBubble = 0; // the real-site chain would touch a span end
+            uint64_t edgesDeferredComplex = 0;   // other unsupported shapes (currently unused)
+            uint64_t sitesTranscribed = 0;  // total real sites found across all edges
+            uint64_t hetAnchorsCreated = 0; // new allele-arm anchors appended
             double elapsedSeconds = 0.0;
         };
 
-        // Transcribe abPOA-detected bubbles (SNPs and >=15bp indels) on
-        // anchor-graph edges into real het anchors and flank->arm->flank edges.
-        // For every edge whose two-sided coverage is at least minCommonForHet,
-        // an abPOA MSA is run over the reads' inter-anchor sequences; where the
-        // reads diverge (both alleles clearing the support floor), the mixed
-        // edge is replaced by a bubble whose arms are het anchors. This MUTATES
-        // the graph and the anchor store; it must be called serially in the
-        // journey path before tip removal. Planning is parallelized over
-        // threadCount (0 = hardware concurrency); anchor creation + wiring is
-        // serial. Returns counts for reporting.
+        // Detect abPOA local topology (SNPs and indels) on anchor-graph edges
+        // and append a new het anchor for each passing non-deletion allele at
+        // each real site (Shasta2Anchors::appendHetAnchorPair). For every edge
+        // whose two-sided coverage is at least minCommonForHet, an abPOA MSA is
+        // run over the reads' inter-anchor sequences; where reads diverge into
+        // >=2 alleles clearing the support floor, each non-deletion allele
+        // becomes a new anchor. This mutates the anchor store but NEVER the
+        // graph passed in -- the caller must rebuild journeys
+        // (Shasta2Journeys::rebuildAfterNewAnchors) and then a fresh
+        // Shasta2AnchorGraph from them before the new anchors take effect; see
+        // the .cpp file header for why. Detection is parallelized over
+        // threadCount (0 = hardware concurrency); anchor creation is serial.
+        // Returns counts for reporting.
         HetOnGraphResult transcribeHetBubbles(
-            Shasta2AnchorGraph&,
+            const Shasta2AnchorGraph&,
             Shasta2Anchors&,
             uint64_t minCommonForHet,
             uint64_t threadCount = 0);

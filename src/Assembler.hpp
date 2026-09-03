@@ -1020,7 +1020,24 @@ public:
         // minimizer) reaches this many bases. 0 disables. Dovetail / internal-
         // match classification is handled downstream by deleteInternalOverlaps
         // (ma_hit2arc), not here.
-        uint32_t minOverlapLength = 1000);
+        uint32_t minOverlapLength = 1000,
+        // Set when overlaps came from hifiasm_ovlp_opt_t::raw_candidates (the
+        // pre-alignment candidate set, no base-level alignment run at all).
+        // hifiasm's aligned path forward-adjusts a reverse-strand overlap's
+        // t_start/t_end to natural forward-read coordinates as part of
+        // producing the alignment; the raw path skips alignment entirely and
+        // never does that adjustment, leaving t_start/t_end for is_same_strand
+        // == 0 overlaps in ALIGNMENT orientation (positions along the
+        // reverse-complemented target) instead. Every other convention this
+        // function (and PafEntry/PafCandidateInterval) assumes -- "forward
+        // strand, matching Alignment::ts/te" -- requires natural-forward
+        // coordinates, so this flag tells the import loop to undo that missing
+        // adjustment itself: t_start' = tLen - t_end, t_end' = tLen - t_start,
+        // mirroring the fork's own aligned-path formula exactly. The native
+        // chain is NOT affected (it is in alignment-orientation in both modes
+        // already, and every consumer already re-derives forward positions
+        // from it per-strand -- see AssemblerMarkers.cpp's tPos handling).
+        bool rawCandidates = false);
 
 private:
     // Dedup + publish tail for the in-memory hifiasm overlap importer.
@@ -1414,9 +1431,15 @@ private:
         // Timing accumulators for variant clustering (per thread, in seconds)
         vector<double> threadProjectedAlignmentTime;  // Time spent in ProjectedAlignment construction
         vector<double> threadCollectionTime;          // Time spent in collectVariantClusteringPositionPairs
-        vector<uint64_t> threadFilteredByErrorRate; 
-        vector<uint64_t> threadFilteredByErrorRateGap; 
+        vector<uint64_t> threadFilteredByErrorRate;
+        vector<uint64_t> threadFilteredByErrorRateGap;
         vector<uint64_t> threadFilteredByGapCount;
+
+        // mapNativeChainToOrdinals verification: how much of hifiasm's native
+        // chain survives the position lookup + monotone filter into markers.
+        vector<uint64_t> threadChainAnchorsIn;      // raw anchors offered per candidate, summed
+        vector<uint64_t> threadChainAnchorsMapped;  // ordinals actually produced, summed
+        vector<uint64_t> threadDroppedEmptyOrdinals; // candidates dropped: zero mappable anchors
 
         // Thread-local packed CIGAR stores (hifiasm-style uint16_t tokens).
         // One store per thread to avoid locking.

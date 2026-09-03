@@ -1,47 +1,64 @@
-// Transcribe abPOA local topology into the Shasta2AnchorGraph.
+// Detect abPOA local topology on the Shasta2AnchorGraph and turn it into new
+// het/hom anchors.
 //
 // For each anchor-graph edge A -> B whose two-sided read coverage is at least
 // minCommonForHet, we run an abPOA MSA over the reads' inter-anchor sequences.
 // The MSA column matrix (msa_base[row][col], row order == anchorPair
 // orientedReadIds because sort_input_seq=0) is a materialization of the POA
-// graph in rank order. We read that topology and transcribe it into the anchor
-// graph's own vocabulary:
+// graph in rank order. We read that topology in the anchor graph's own
+// vocabulary:
 //
 //   * A column where every covered read carries the SAME non-gap base is a
-//     strict convergence point (a "hom" position). The edge's own endpoints A
-//     and B are the outer convergence points by construction (all reads share
-//     both). Interior convergence columns separate consecutive bubbles.
+//     strict convergence point. The edge's own endpoints A and B are the
+//     outer convergence points by construction (all reads share both).
 //
 //   * A maximal run of columns between two convergence points where reads
-//     disagree is a bubble. Reads are grouped by their exact subsequence over
-//     the run: each distinct group is an allele arm. An arm that clears the
-//     per-allele support floor becomes a het anchor (appendHetAnchorPair); the
-//     original mixed edge is replaced by flank -> arm -> flank edges. A read
-//     whose subsequence over the run is empty (it skips the run: a deletion
-//     allele) takes the direct flank -> flank edge, so the deletion IS the
-//     short path -- no arm anchor for it.
+//     disagree is a candidate site. Reads are grouped by their exact
+//     subsequence over the run: each distinct group is an allele. A group
+//     that clears the per-allele support floor is a passing allele; a run is
+//     a REAL site only when >=2 alleles pass. A read whose subsequence over
+//     the run is empty (it skips the run: a deletion allele) needs no new
+//     anchor -- see below.
 //
-// This unifies SNPs (a one-column bubble) and big indels (a multi-column
-// bubble, one side long / one side empty) with no size special-case: indel
-// length falls out of the run length, "both alleles pass" is just counting
-// reads per group.
+// This unifies SNPs (a one-column site) and indels (a multi-column site, one
+// side long / one side empty) with no size special-case.
 //
-// Two phases:
-//   1. Planning (parallel, read-only): per edge, build an EdgePlan describing
-//      the bubbles and their arms. Touches only the graph for reads; allocates
-//      no anchors, mutates nothing.
-//   2. Apply (serial): appendHetAnchorPair for each arm (grows the anchor
-//      store, so must be serial), add the matching graph vertices in lockstep
-//      (vertex_descriptor == AnchorId), wire the fwd + RC flank->arm->flank
-//      edges, and disable the original edge (+ its RC mirror).
+// What this file does NOT do: wire anything into the graph. Detection only
+// appends a new anchor per passing non-deletion allele
+// (Shasta2Anchors::appendHetAnchorPair) for each real site; it never touches
+// the anchor graph or disables anything. The deletion allele and any read not
+// in a passing allele (including every read on edges with no real site at
+// all) get no new anchor -- they simply have nothing inserted at that point
+// in their journey, so after the caller rebuilds journeys and the anchor
+// graph from scratch (Shasta2Journeys::rebuildAfterNewAnchors, then a fresh
+// Shasta2AnchorGraph), such a read naturally takes the direct flank->flank
+// edge. This replaces an earlier design that manually wired flank->arm->flank
+// (+ RC) edges in place: once new anchors just become ordinary entries in
+// each read's journey, the (already-verified) journey->anchor-graph builder
+// produces the correct topology for any number of sites per edge with no
+// special-casing, and reads outside every passing allele get the "direct"
+// edge for free instead of needing an explicit isDeletion/non-member case.
 //
-// Iteration 1 scope: to keep the point-anchor (k=2) representation provably
-// round-trippable, we only transcribe edges with exactly ONE interior bubble
-// that is flanked on both sides by the edge endpoints (a clean single-site
-// edge: one SNP, or one >=15bp indel, or one small indel). Edges with multiple
-// interior bubbles, or a bubble touching an end, are counted and left
-// unchanged for a later iteration. This matches the "sparse now, revisit if too
-// coarse" decision.
+// A run that fails the >=2-passing-allele floor is NOT a veto on the rest of
+// the edge -- it is simply not a site (absorbed into the surrounding
+// homozygous background), and every other run on the edge is evaluated
+// independently. Runs closer together than minConvergentGap() are merged
+// before this analysis, to absorb abPOA-fragmented single variants (see its
+// comment for the empirical motivation).
+//
+// Position-tie safety: a new anchor's stored position is (raw read position
+// of its first base) + hetAnchorKHalf(); the edge's own flank anchors store
+// (marker start + k/2). Shasta2AnchorPair::assertNoNegativeOffsets crashes if
+// two anchors adjacent in some read's rebuilt journey have non-increasing
+// positions for that read, so a new anchor's position must never tie or
+// cross its neighbors'. Requiring the surviving chain of real sites to be
+// strictly interior (first site doesn't touch column 0, last doesn't touch
+// the last column -- see analyzeEdgeMsa) guarantees at least one convergent
+// column of margin on each side, which is enough: Shasta2AnchorPair::get's
+// inter-anchor sequence runs from anchorA's own position to anchorB's own
+// position exclusive, so a site's raw position is always > anchorA's own
+// position (by at least hetAnchorKHalf) and, given the required trailing
+// margin, always < anchorB's own position for every member read.
 
 #include "Shasta2AnchorGraph.hpp"
 
@@ -54,12 +71,13 @@
 #include <boost/graph/iteration_macros.hpp>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -67,6 +85,47 @@ using namespace dinara;
 using namespace std;
 
 namespace {
+
+// Investigation aid (DINARA_HET_MULTISITE_DEBUG=1): tallies the shape of
+// multi-run edges (how many separate runs they contain, how far apart, and
+// why a run failed to become a real site) so the merge/absorb policy can be
+// tuned against what the data actually looks like. Thread-safe (mutex-
+// protected); negligible overhead when off.
+bool multiSiteDebugEnabled()
+{
+    static const bool on = (std::getenv("DINARA_HET_MULTISITE_DEBUG") != nullptr);
+    return on;
+}
+std::mutex multiSiteDebugMutex;
+std::map<uint64_t, uint64_t> multiSiteRunCountHistogram;   // runs.size() -> count
+std::map<uint64_t, uint64_t> multiSiteGapHistogram;        // gap (in columns) between consecutive runs, bucketed
+void recordMultiSiteShape(const vector<pair<uint64_t, uint64_t>>& runs)
+{
+    std::lock_guard<std::mutex> lock(multiSiteDebugMutex);
+    multiSiteRunCountHistogram[runs.size()]++;
+    for(uint64_t i = 0; i + 1 < runs.size(); i++) {
+        const uint64_t gap = runs[i + 1].first - runs[i].second;
+        // Bucket gaps geometrically so the histogram stays small.
+        uint64_t bucket = 0;
+        uint64_t g = gap;
+        while(g > 0) { bucket++; g >>= 1; }
+        multiSiteGapHistogram[bucket]++;
+    }
+}
+
+// For a run (on a multi-run edge) that failed the >=2-passing-alleles check:
+// how many distinct exact-subsequence groups it split into and how dominant
+// the largest group was, to tell apart "genuinely too many alleles" from "one
+// real consensus plus scattered noise elsewhere in the window".
+std::map<uint64_t, uint64_t> multiSiteFailGroupCountHistogram;       // distinct alleles -> occurrences
+std::map<uint64_t, uint64_t> multiSiteFailLargestGroupFracHistogram; // floor(10*largest/total) -> occurrences
+void recordMultiSiteFailure(uint64_t numGroups, uint64_t largestGroupSize, uint64_t total)
+{
+    std::lock_guard<std::mutex> lock(multiSiteDebugMutex);
+    multiSiteFailGroupCountHistogram[numGroups]++;
+    const uint64_t frac10 = (total > 0) ? (largestGroupSize * 10) / total : 0;
+    multiSiteFailLargestGroupFracHistogram[frac10]++;
+}
 
 // Longest-row length above which abpoa's DP can blow up memory on an
 // anchor-less span; such edges are skipped. Mirrors DINARA_IPOA_MAX_LEN on the
@@ -90,51 +149,64 @@ uint64_t alleleFloor(uint64_t coveredRows)
     return frac < 2 ? 2 : frac;
 }
 
-// One planned arm of one bubble: the reads carrying this allele and, for each,
-// the raw read position that pins its het anchor (the first base of the
-// allele's subsequence, in the read's own coordinate frame). Empty members ==
-// the deletion allele: no anchor, reads take the direct flank->flank edge.
-struct ArmPlan {
-    vector<pair<OrientedReadId, uint32_t>> members;   // (read, rawPosition)
-    bool isDeletion = false;                          // true => no arm anchor
-};
+// Minimum number of convergent columns required between two candidate sites
+// to keep them as separate sites; runs separated by fewer columns are merged
+// into one combined run instead. Empirically motivated: on a real test
+// region, over half of all inter-site gaps on multi-run edges were 1-3
+// columns, and edges with dozens of "sites" a few columns apart are far more
+// consistent with one messy, indel-shifted divergent region (which abPOA's
+// strict all-rows-identical convergence test fragments) than with that many
+// genuinely independent heterozygous sites. Not a biological law -- a
+// tunable heuristic; override with DINARA_HET_MIN_CONVERGENT_GAP.
+uint64_t minConvergentGap()
+{
+    static const uint64_t gap = [] () -> uint64_t {
+        const char* e = std::getenv("DINARA_HET_MIN_CONVERGENT_GAP");
+        if(e == nullptr) return 10;
+        return uint64_t(std::atoll(e));
+    }();
+    return gap;
+}
 
-// One planned bubble on an edge: the two flanking anchor ids (here always the
-// edge endpoints in iteration 1) and the allele arms.
-struct BubblePlan {
-    Shasta2AnchorId flankA = invalid<Shasta2AnchorId>;
-    Shasta2AnchorId flankB = invalid<Shasta2AnchorId>;
-    vector<ArmPlan> arms;
-};
+// One new anchor to create: an allele's member list ((read, raw position of
+// the allele's first base) pairs). The deletion allele and any allele that
+// doesn't clear the support floor need no anchor and never appear here.
+using ArmMembers = vector<pair<OrientedReadId, uint32_t>>;
 
-// The transcription plan for one edge. Empty bubbles => nothing to do.
-struct EdgePlan {
-    Shasta2AnchorGraph::edge_descriptor edge;
-    vector<BubblePlan> bubbles;
+// Everything found on one edge: every real site's non-deletion alleles,
+// flattened. Site boundaries do not matter beyond this function -- creating
+// each anchor and letting the caller rebuild journeys from scratch places it
+// correctly regardless of how many other sites share the edge.
+struct EdgeHetSites {
+    vector<ArmMembers> arms;
+    uint64_t siteCount = 0;   // number of real (>=2 passing alleles) sites found
 };
 
 // Result of analyzing one edge's MSA matrix.
 enum class AnalyzeResult {
-    NoBubble,        // fully homozygous span (all columns convergent)
-    Planned,         // exactly one clean interior bubble -> plan produced
-    DeferMultiSite,  // >1 interior bubble (iteration 2)
-    DeferEndBubble,  // a bubble touches column 0 or the last column
-    DeferComplex     // other unsupported shape
+    NoBubble,        // no real site found (fully homozygous, or every
+                     // non-convergent run was noise below the allele floor)
+    Planned,         // >=1 real site found; outSites has the new anchors
+    DeferEndBubble,  // the surviving chain of real sites would touch a span end
+    DeferComplex     // reserved, currently unused
 };
 
-// Analyze the row-major MSA matrix (rows == orientedReadIds order) for one edge
-// and, on the clean single-bubble case, fill `out`. `msa[r]` is row r's aligned
-// bases (value 0..3, or 4 for gap), all of length ncols. `posA[r]` is read r's
-// absolute base position of anchorA (so aligned column maps back to a raw read
-// position by counting that row's non-gap bases up to the column). `total` is
-// the row count.
+// Analyze the row-major MSA matrix (rows == anchorPair orientedReadIds order,
+// via buildEdgeMsa) for one edge. `msa[r]` is row r's aligned bases (value
+// 0..3, or 4 for gap), all of length ncols. `posA[r]` is read r's absolute
+// base position of anchorA (so an aligned column maps back to a raw read
+// position by counting that row's non-gap bases up to the column). `total`
+// is the row count. See the file header for the overall algorithm and the
+// position-tie safety argument behind the strictly-interior check below.
 AnalyzeResult analyzeEdgeMsa(
     const vector<vector<uint8_t>>& msa,
     const vector<uint32_t>& posA,
-    const vector<OrientedReadId>& rowRead,   // rowRead[r] == read of MSA row r
+    const vector<OrientedReadId>& rowRead,
     uint64_t total,
-    BubblePlan& out)
+    EdgeHetSites& outSites)
 {
+    outSites.arms.clear();
+    outSites.siteCount = 0;
     if(msa.empty()) return AnalyzeResult::NoBubble;
     const uint64_t ncols = msa.front().size();
     if(ncols == 0) return AnalyzeResult::NoBubble;
@@ -150,74 +222,114 @@ AnalyzeResult analyzeEdgeMsa(
         return true;
     };
 
-    // Find maximal runs of non-convergent columns (candidate bubbles).
-    vector<pair<uint64_t, uint64_t>> runs;   // [begin, end) column ranges
-    uint64_t c = 0;
-    while(c < ncols) {
-        if(isConvergent(c)) { c++; continue; }
-        uint64_t begin = c;
-        while(c < ncols && !isConvergent(c)) c++;
-        runs.push_back({begin, c});
-    }
-
-    if(runs.empty()) return AnalyzeResult::NoBubble;
-    if(runs.size() > 1) return AnalyzeResult::DeferMultiSite;
-
-    const auto [rbegin, rend] = runs.front();
-    // Iteration 1 requires the bubble to be strictly interior: at least one
-    // convergent column on each side (so both flanks are the edge endpoints and
-    // every read is defined before/after the run).
-    if(rbegin == 0 || rend == ncols) return AnalyzeResult::DeferEndBubble;
-
-    // Precompute, per row, the raw read position at column rbegin: posA[r] plus
-    // the number of that row's non-gap bases strictly before rbegin.
-    vector<uint32_t> rawAtRunStart(total);
-    for(uint64_t r=0; r<total; r++) {
-        uint32_t nonGap = 0;
-        for(uint64_t col=0; col<rbegin; col++) {
-            if(msa[r][col] < 4) nonGap++;
+    // Find maximal runs of non-convergent columns (candidate sites).
+    vector<pair<uint64_t, uint64_t>> rawRuns;   // [begin, end) column ranges
+    {
+        uint64_t c = 0;
+        while(c < ncols) {
+            if(isConvergent(c)) { c++; continue; }
+            uint64_t begin = c;
+            while(c < ncols && !isConvergent(c)) c++;
+            rawRuns.push_back({begin, c});
         }
-        rawAtRunStart[r] = posA[r] + nonGap;
     }
+    if(rawRuns.empty()) return AnalyzeResult::NoBubble;
 
-    // Group rows by their exact subsequence (non-gap bases) over [rbegin, rend).
-    // Key: the concatenated non-gap base values. Empty key == deletion allele.
-    std::map<vector<uint8_t>, vector<uint64_t>> groups;   // allele -> row indices
-    for(uint64_t r=0; r<total; r++) {
-        vector<uint8_t> allele;
-        for(uint64_t col=rbegin; col<rend; col++) {
-            const uint8_t b = msa[r][col];
-            if(b < 4) allele.push_back(b);
-        }
-        groups[allele].push_back(r);
-    }
-
-    // Build arms for groups that clear the per-allele floor.
-    const uint64_t floor = alleleFloor(total);
-    out = BubblePlan();
-    uint64_t passing = 0;
-    for(const auto& [allele, rows] : groups) {
-        if(rows.size() < floor) continue;
-        passing++;
-        ArmPlan arm;
-        if(allele.empty()) {
-            arm.isDeletion = true;   // no anchor; reads take flank->flank
+    // Merge runs separated by fewer than minConvergentGap() convergent
+    // columns into one combined run -- see minConvergentGap()'s comment.
+    vector<pair<uint64_t, uint64_t>> runs;
+    runs.push_back(rawRuns.front());
+    const uint64_t gapFloor = minConvergentGap();
+    for(uint64_t i = 1; i < rawRuns.size(); i++) {
+        const uint64_t gap = rawRuns[i].first - runs.back().second;
+        if(gap < gapFloor) {
+            runs.back().second = rawRuns[i].second;
         } else {
-            arm.members.reserve(rows.size());
+            runs.push_back(rawRuns[i]);
+        }
+    }
+
+    if(multiSiteDebugEnabled() && runs.size() > 1) recordMultiSiteShape(runs);
+
+    // Prefix non-gap counts per row, computed once, so converting any column
+    // into a raw read position is O(1) regardless of how many runs there are
+    // (avoids O(runs * ncols) work per row on many-site edges).
+    vector<vector<uint32_t>> prefixNonGap(total, vector<uint32_t>(ncols + 1, 0));
+    for(uint64_t r = 0; r < total; r++) {
+        for(uint64_t col = 0; col < ncols; col++) {
+            prefixNonGap[r][col + 1] = prefixNonGap[r][col] + (msa[r][col] < 4 ? 1 : 0);
+        }
+    }
+    auto rawPositionAtColumn = [&](uint64_t r, uint64_t col) -> uint32_t {
+        return posA[r] + prefixNonGap[r][col];
+    };
+
+    // Analyze each (merged) run independently. A run that fails the >=2-
+    // passing-allele floor is simply not a site -- absorbed into the
+    // surrounding background, not a veto -- so every other run on this edge
+    // is unaffected (see file header).
+    const uint64_t floor = alleleFloor(total);
+    vector<pair<uint64_t, uint64_t>> passingRuns;   // [begin, end) of real sites only
+    for(uint64_t ri = 0; ri < runs.size(); ri++) {
+        const auto [rbegin, rend] = runs[ri];
+
+        // Group rows by their exact subsequence (non-gap bases) over
+        // [rbegin, rend). Empty key == deletion allele.
+        std::map<vector<uint8_t>, vector<uint64_t>> groups;
+        for(uint64_t r=0; r<total; r++) {
+            vector<uint8_t> allele;
+            for(uint64_t col=rbegin; col<rend; col++) {
+                const uint8_t b = msa[r][col];
+                if(b < 4) allele.push_back(b);
+            }
+            groups[allele].push_back(r);
+        }
+
+        uint64_t passing = 0;
+        vector<ArmMembers> siteArms;
+        for(const auto& [allele, rows] : groups) {
+            if(rows.size() < floor) continue;
+            passing++;
+            if(allele.empty()) continue;   // deletion allele: no anchor needed
+            ArmMembers arm;
+            arm.reserve(rows.size());
             for(const uint64_t r: rows) {
                 // Pin the arm anchor at the first base of the allele on this
-                // read: rawAtRunStart[r] is the read's raw position of its first
-                // non-gap base at/after the run start, which for a member of a
-                // non-empty allele is exactly that allele's first base.
-                arm.members.push_back({rowRead[r], rawAtRunStart[r]});
+                // read: the raw position of its first non-gap base at/after
+                // the run start, which for a member of a non-empty allele is
+                // exactly that allele's first base.
+                arm.push_back({rowRead[r], rawPositionAtColumn(r, rbegin)});
             }
+            siteArms.push_back(std::move(arm));
         }
-        out.arms.push_back(std::move(arm));
+
+        if(passing < 2) {
+            if(multiSiteDebugEnabled() && runs.size() > 1) {
+                uint64_t largest = 0;
+                for(const auto& [allele, rows] : groups) {
+                    if(rows.size() > largest) largest = rows.size();
+                }
+                recordMultiSiteFailure(groups.size(), largest, total);
+            }
+            continue;
+        }
+
+        passingRuns.push_back({rbegin, rend});
+        outSites.siteCount++;
+        for(ArmMembers& arm: siteArms) outSites.arms.push_back(std::move(arm));
     }
 
-    // Need at least two passing alleles for a real bubble; otherwise this is
-    // effectively homozygous at the supported level (noise minority filtered).
-    if(passing < 2) return AnalyzeResult::NoBubble;
+    if(passingRuns.empty()) return AnalyzeResult::NoBubble;
+
+    // The chain of real sites must be strictly interior: the first can't
+    // start at column 0, the last can't end at the last column. See the file
+    // header for why this is required for position-tie safety, not just a
+    // scope choice.
+    if(passingRuns.front().first == 0 || passingRuns.back().second == ncols) {
+        outSites.arms.clear();
+        outSites.siteCount = 0;
+        return AnalyzeResult::DeferEndBubble;
+    }
 
     return AnalyzeResult::Planned;
 }
@@ -294,146 +406,10 @@ bool buildEdgeMsa(
 
 } // namespace
 
-// Serial apply phase. Consumes the per-thread EdgePlans, creates het anchors,
-// grows the graph vertex set in lockstep (vertex_descriptor == AnchorId), wires
-// the fwd + RC flank->arm->flank edges, and disables the original edges.
-// Defined at file scope (not in the anonymous namespace) so it can use the
-// graph's private helpers via the public API only.
-namespace dinara {
-void applyHetBubblePlans(
-    Shasta2AnchorGraph& graph,
-    Shasta2Anchors& anchors,
-    const vector<vector<EdgePlan>>& threadPlans,
-    HetOnGraphResult& result);
-}
-
-void dinara::applyHetBubblePlans(
-    Shasta2AnchorGraph& graph,
-    Shasta2Anchors& anchors,
-    const vector<vector<EdgePlan>>& threadPlans,
-    HetOnGraphResult& result)
-{
-    // Helper: keep graph vertices in lockstep with the anchor store. After an
-    // appendHetAnchorPair the store has 2 new anchors (canonical even, RC odd);
-    // add exactly enough vertices so vertex_descriptor == AnchorId still holds.
-    auto syncVertices = [&]() {
-        const uint64_t anchorCount = anchors.size();
-        while(num_vertices(graph) < anchorCount) {
-            boost::add_vertex(graph);
-        }
-    };
-
-    // Helper: add a directed edge idA -> idB carrying the intersection of the
-    // two anchors' member reads, after dropping non-forward offsets. Mirrors the
-    // window path's addHetEdge. Returns true if an edge was added.
-    auto addHetEdge = [&](Shasta2AnchorId idA, Shasta2AnchorId idB) -> bool {
-        const Shasta2Anchor anchorA = anchors[idA];
-        const Shasta2Anchor anchorB = anchors[idB];
-        Shasta2AnchorPair edgePair;
-        edgePair.anchorIdA = idA;
-        edgePair.anchorIdB = idB;
-        auto itA = anchorA.begin();
-        auto itB = anchorB.begin();
-        while(itA != anchorA.end() && itB != anchorB.end()) {
-            if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
-            if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
-            edgePair.orientedReadIds.push_back(itA->orientedReadId);
-            ++itA; ++itB;
-        }
-        edgePair.removeNegativeOffsets(anchors);
-        if(edgePair.orientedReadIds.empty()) return false;
-
-        // Offset: het anchors are synthetic k=2 markers with no real marker
-        // ordinals, so getAverageOffset (which indexes each read's marker array
-        // by ordinal) would read out of bounds. Compute the average base-offset
-        // directly from anchor member positions instead, which are valid for
-        // both primary and het anchors. All kept reads are strictly forward
-        // (positionB > positionA) after removeNegativeOffsets.
-        vector<pair<uint32_t, uint32_t>> anchorPositions;
-        edgePair.getAnchorPositions(anchors, anchorPositions);
-        uint64_t offsetSum = 0;
-        for(const auto& p: anchorPositions) {
-            offsetSum += uint64_t(p.second - p.first);
-        }
-        const uint32_t nominalOffset = anchorPositions.empty() ? 0 :
-            uint32_t(offsetSum / anchorPositions.size());
-
-        Shasta2AnchorGraph::edge_descriptor e;
-        bool added = false;
-        boost::tie(e, added) = boost::add_edge(
-            idA, idB,
-            Shasta2AnchorGraphEdge(edgePair, nominalOffset, graph.nextEdgeId++),
-            graph);
-        graph[e].useForAssembly = true;
-        return true;
-    };
-
-    // Build the RC member list for an arm: flip strand and mirror the raw
-    // position, matching appendHetAnchorPair's own RC formula so the two agree.
-    // We do NOT call appendHetAnchorPair for the RC arm separately -- that
-    // function already appends BOTH strands and returns the canonical id, with
-    // the RC at canonicalId+1. So here we only need the canonical member list.
-
-    for(const vector<EdgePlan>& plans: threadPlans) {
-        for(const EdgePlan& plan: plans) {
-            bool anyArmCreated = false;
-
-            for(const BubblePlan& bubble: plan.bubbles) {
-                result.bubblesTranscribed++;
-
-                for(const ArmPlan& arm: bubble.arms) {
-                    if(arm.isDeletion) {
-                        // Deletion allele: reads take the direct flank->flank
-                        // edge. That edge already exists (it is the original
-                        // edge) but will be disabled below; re-add a dedicated
-                        // flank->flank edge carrying just... the intersection of
-                        // the two flanks, which is all reads. Simplest correct
-                        // behavior: add flankA->flankB via addHetEdge.
-                        if(addHetEdge(bubble.flankA, bubble.flankB)) {
-                            result.deletionEdgesAdded++;
-                            anyArmCreated = true;
-                        }
-                        continue;
-                    }
-                    if(arm.members.size() < 2) continue;   // appendHetAnchorPair needs >=2
-
-                    const Shasta2AnchorId armId =
-                        anchors.appendHetAnchorPair(arm.members);
-                    syncVertices();
-                    result.hetAnchorsCreated++;
-
-                    // Wire fwd: flankA -> arm -> flankB.
-                    if(addHetEdge(bubble.flankA, armId))    result.armEdgesAdded++;
-                    if(addHetEdge(armId, bubble.flankB))    result.armEdgesAdded++;
-
-                    // Wire RC: flankB^1 -> arm^1 -> flankA^1. appendHetAnchorPair
-                    // placed the RC arm at armId+1; the flanks' RC ids are
-                    // flank^1 (canonical/RC pairing 2i/2i+1).
-                    const Shasta2AnchorId armRc = armId + 1;
-                    const Shasta2AnchorId flankArc = bubble.flankA ^ 1ULL;
-                    const Shasta2AnchorId flankBrc = bubble.flankB ^ 1ULL;
-                    if(uint64_t(flankBrc) < anchors.size() &&
-                       uint64_t(flankArc) < anchors.size()) {
-                        if(addHetEdge(flankBrc, armRc)) result.armEdgesAdded++;
-                        if(addHetEdge(armRc, flankArc)) result.armEdgesAdded++;
-                    }
-
-                    anyArmCreated = true;
-                }
-            }
-
-            if(anyArmCreated) {
-                graph.disableEdge(plan.edge);
-                result.originalEdgesDisabled++;
-            }
-        }
-    }
-}
-
 
 
 HetOnGraphResult dinara::transcribeHetBubbles(
-    Shasta2AnchorGraph& graph,
+    const Shasta2AnchorGraph& graph,
     Shasta2Anchors& anchors,
     uint64_t minCommonForHet,
     uint64_t threadCount)
@@ -456,16 +432,18 @@ HetOnGraphResult dinara::transcribeHetBubbles(
     if(threadCount > edgeCount && edgeCount > 0) threadCount = edgeCount;
 
     // ------------------------------------------------------------------
-    // Phase 1: planning (parallel, read-only). Each thread analyzes edges off a
-    // shared atomic counter and appends completed EdgePlans to a private list.
+    // Phase 1: detection (parallel, read-only). Each thread analyzes edges
+    // off a shared atomic counter and appends this edge's real-site alleles
+    // to a private list. The graph is never touched -- see the file header
+    // for why no wiring happens here.
     // ------------------------------------------------------------------
     std::atomic<uint64_t> nextEdge{0};
-    vector<vector<EdgePlan>> threadPlans(threadCount);
+    vector<vector<ArmMembers>> threadArms(threadCount);
     vector<HetOnGraphResult> threadStats(threadCount);
 
     auto planner = [&](uint64_t threadId) {
         HetOnGraphResult& st = threadStats[threadId];
-        vector<EdgePlan>& plans = threadPlans[threadId];
+        vector<ArmMembers>& arms = threadArms[threadId];
 
         IpoaAbHandle ah;
         vector<pair<Shasta2AnchorPair::Positions, Shasta2AnchorPair::Positions>> positions;
@@ -518,14 +496,10 @@ HetOnGraphResult dinara::transcribeHetBubbles(
             }
             st.edgesMsad++;
 
-            BubblePlan bubble;
-            const AnalyzeResult ar =
-                analyzeEdgeMsa(msa, posA, rowRead, rowRead.size(), bubble);
+            EdgeHetSites sites;
+            const AnalyzeResult ar = analyzeEdgeMsa(msa, posA, rowRead, rowRead.size(), sites);
             switch(ar) {
             case AnalyzeResult::NoBubble:
-                break;
-            case AnalyzeResult::DeferMultiSite:
-                st.edgesDeferredMultiSite++;
                 break;
             case AnalyzeResult::DeferEndBubble:
                 st.edgesDeferredEndBubble++;
@@ -533,16 +507,12 @@ HetOnGraphResult dinara::transcribeHetBubbles(
             case AnalyzeResult::DeferComplex:
                 st.edgesDeferredComplex++;
                 break;
-            case AnalyzeResult::Planned: {
-                bubble.flankA = anchorPair.anchorIdA;
-                bubble.flankB = anchorPair.anchorIdB;
-                EdgePlan plan;
-                plan.edge = e;
-                plan.bubbles.push_back(std::move(bubble));
-                plans.push_back(std::move(plan));
+            case AnalyzeResult::Planned:
                 st.edgesPlanned++;
+                if(sites.siteCount > 1) st.edgesPlannedMultiSite++;
+                st.sitesTranscribed += sites.siteCount;
+                for(ArmMembers& arm: sites.arms) arms.push_back(std::move(arm));
                 break;
-            }
             }
         }
     };
@@ -562,17 +532,47 @@ HetOnGraphResult dinara::transcribeHetBubbles(
         result.edgesSkippedLen        += st.edgesSkippedLen;
         result.edgesSkippedIdentical  += st.edgesSkippedIdentical;
         result.edgesPlanned           += st.edgesPlanned;
-        result.edgesDeferredMultiSite += st.edgesDeferredMultiSite;
+        result.edgesPlannedMultiSite  += st.edgesPlannedMultiSite;
+        result.sitesTranscribed       += st.sitesTranscribed;
         result.edgesDeferredEndBubble += st.edgesDeferredEndBubble;
         result.edgesDeferredComplex   += st.edgesDeferredComplex;
     }
 
+    if(multiSiteDebugEnabled()) {
+        std::lock_guard<std::mutex> lock(multiSiteDebugMutex);
+        cout << "Multi-run edge shape: run-count histogram (runs.size() -> edges):" << endl;
+        for(const auto& [runCount, edges]: multiSiteRunCountHistogram) {
+            cout << "  " << runCount << " runs: " << edges << " edges" << endl;
+        }
+        cout << "Multi-run edge shape: inter-run gap histogram (log2 bucket of column gap -> occurrences):" << endl;
+        for(const auto& [bucket, occurrences]: multiSiteGapHistogram) {
+            const uint64_t lo = (bucket == 0) ? 0 : (1ULL << (bucket - 1));
+            const uint64_t hi = (1ULL << bucket) - 1;
+            cout << "  [" << lo << "-" << hi << "] columns: " << occurrences << " gaps" << endl;
+        }
+        cout << "Absorbed runs (merged run, <2 passing alleles): distinct-allele-group histogram:" << endl;
+        for(const auto& [numGroups, occurrences]: multiSiteFailGroupCountHistogram) {
+            cout << "  " << numGroups << " distinct groups: " << occurrences << " (run,edge) absorptions" << endl;
+        }
+        cout << "Absorbed runs: largest-group-fraction histogram (floor(10*largest/total) -> occurrences):" << endl;
+        for(const auto& [frac10, occurrences]: multiSiteFailLargestGroupFracHistogram) {
+            cout << "  largest group covers [" << frac10*10 << "-" << (frac10+1)*10 << "]% of rows: " << occurrences << " absorptions" << endl;
+        }
+    }
+
     // ------------------------------------------------------------------
-    // Phase 2: apply (serial). appendHetAnchorPair grows the anchor store and
-    // add_vertex must keep vertex_descriptor == AnchorId, so this cannot be
-    // parallelized.
+    // Phase 2: apply (serial). appendHetAnchorPair grows the anchor store, so
+    // this cannot be parallelized. No graph mutation: the caller rebuilds
+    // journeys and the anchor graph from scratch once every new anchor has
+    // been appended (see file header).
     // ------------------------------------------------------------------
-    applyHetBubblePlans(graph, anchors, threadPlans, result);
+    for(vector<ArmMembers>& arms: threadArms) {
+        for(ArmMembers& arm: arms) {
+            if(arm.size() < 2) continue;   // appendHetAnchorPair requires >= 2
+            anchors.appendHetAnchorPair(arm);
+            result.hetAnchorsCreated++;
+        }
+    }
 
     const auto t1 = std::chrono::steady_clock::now();
     result.elapsedSeconds =

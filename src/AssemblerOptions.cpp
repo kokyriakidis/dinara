@@ -1471,7 +1471,6 @@ void OverlapCandidatesOptions::write(ostream& s) const
     s << "minChainMarkerCount = " << minChainMarkerCount << "\n";
     s << "minOverlapLength = " << minOverlapLength << "\n";
     s << "maxEndFuzz = " << maxEndFuzz << "\n";
-    s << "maxChainingFreq = " << maxChainingFreq << "\n";
 }
 
 

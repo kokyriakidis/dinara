@@ -412,68 +412,24 @@ void Shasta2AnchorPair::createChildren(
 
 uint32_t Shasta2AnchorPair::getAverageOffset(const Shasta2Anchors& anchors) const
 {
-    const uint32_t kHalf = uint32_t(anchors.k / 2);
+    // Use each member's own stored (RC-symmetric) Shasta2AnchorMarkerInfo
+    // position rather than indexing the read's marker array by ordinal: a
+    // het/hom anchor (Shasta2Anchors::appendHetAnchorPair) has no real marker
+    // ordinal (left invalid), so orientedReadMarkers[ordinal] would read out
+    // of bounds for any edge touching one. getAnchorPositions already reads
+    // exactly this field and is what assertNoNegativeOffsets/
+    // removeNegativeOffsets use, so this agrees with them by construction and
+    // returns the same value as before for primary-only edges (both compute
+    // marker start + k/2).
+    vector< pair<uint32_t, uint32_t> > anchorPositions;
+    getAnchorPositions(anchors, anchorPositions);
+    DINARA_ASSERT(anchorPositions.size() == orientedReadIds.size());
 
     uint64_t sumBaseOffset = 0;
-
-    const Shasta2Anchor anchorA = anchors[anchorIdA];
-    const Shasta2Anchor anchorB = anchors[anchorIdB];
-
-    const auto beginA = anchorA.begin();
-    const auto beginB = anchorB.begin();
-    const auto endA = anchorA.end();
-    const auto endB = anchorB.end();
-
-    auto itA = beginA;
-    auto itB = beginB;
-    auto it = orientedReadIds.begin();
-    const auto itEnd = orientedReadIds.end();
-    while(itA != endA and itB != endB and it != itEnd) {
-
-        if(itA->orientedReadId < itB->orientedReadId) {
-            ++itA;
-            continue;
-        }
-
-        if(itB->orientedReadId < itA->orientedReadId) {
-            ++itB;
-            continue;
-        }
-
-        // We found a common OrientedReadId.
-        const OrientedReadId orientedReadId = itA->orientedReadId;
-        DINARA_ASSERT(orientedReadId == itB->orientedReadId);
-
-        // Only process is this is one of our OrientedReadIds;
-        if(orientedReadId == *it) {
-            ++it;
-
-            const auto orientedReadMarkers = anchors.markers[orientedReadId.getValue()];
-
-            const uint32_t ordinalA = itA->ordinal;
-            const uint32_t ordinalB = itB->ordinal;
-            if(ordinalB < ordinalA) {       // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
-                throw runtime_error(
-                    "Order violation at anchor pair " +
-                    shasta2AnchorIdToString(anchorIdA) + " " +
-                    shasta2AnchorIdToString(anchorIdB) + " " +
-                    orientedReadId.getString() + " ordinals " +
-                    to_string(ordinalA) + " " +
-                    to_string(ordinalB));
-            }
-            const uint32_t positionA = orientedReadMarkers[ordinalA].position + kHalf;
-            const uint32_t positionB = orientedReadMarkers[ordinalB].position + kHalf;
-            DINARA_ASSERT(positionB >= positionA);      // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
-
-            const uint32_t offset = positionB - positionA;
-            sumBaseOffset += offset;
-        }
-
-        ++itA;
-        ++itB;
+    for(const auto& p : anchorPositions) {
+        DINARA_ASSERT(p.second >= p.first);      // Degenerate Shasta2AnchorPair with AnchorIdA==AnchorIdB is ok.
+        sumBaseOffset += uint64_t(p.second - p.first);
     }
-
-    DINARA_ASSERT(it == orientedReadIds.end());
 
     return uint32_t(std::round(double(sumBaseOffset) / double(size())));
 }

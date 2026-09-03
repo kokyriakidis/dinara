@@ -377,6 +377,117 @@ void Shasta2Journeys::filterByAnchorChaining(
 
 
 
+// Rebuild the journeys and positionInJourney from scratch using the current
+// anchor set, keyed by `position` instead of `ordinal` -- see the .hpp
+// comment for why. Strand 1 is never sorted independently: it is derived by
+// reversing strand 0's sorted list and flipping each anchor id, exactly like
+// filterThreadFunction's emitMirror, so the journey(R,1) ==
+// reverse(journey(R,0)) invariant holds regardless of how same-position ties
+// on strand 0 happen to be broken (ascending anchorId here, arbitrary but
+// deterministic). Runs serially: the anchor count here is small (tens of
+// thousands), so a second full pass is cheap and avoids any thread-safety
+// concerns in a rebuild that runs once, off the hot path.
+void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, uint64_t threadCount)
+{
+    performanceLog << timestamp << "Journeys rebuild (new anchors) begins." << endl;
+    DINARA_ASSERT(anchorsPointer);
+    DINARA_ASSERT(journeys.isOpen());
+    static_cast<void>(threadCount);
+
+    Shasta2Anchors& anchors = *anchorsPointer;
+    const uint64_t anchorCount = anchors.size();
+    const uint64_t orientedReadCount = journeys.size();
+    const uint64_t readCount = orientedReadCount / 2;
+    const Shasta2AnchorId hetFirst = anchors.hetAnchorFirstId;
+
+    // Pass A: collect, per read (strand 0 only), (position, anchorId) pairs by
+    // scanning primary anchors and the new anchor range only -- see the .hpp
+    // comment for why anchors in between (e.g. export-only SNPmer anchors)
+    // are excluded.
+    vector<vector<pair<uint32_t, Shasta2AnchorId>>> strand0(readCount);
+    for(Shasta2AnchorId anchorId = 0; anchorId < anchorCount; anchorId++) {
+        const bool isPrimary = (hetFirst == invalid<Shasta2AnchorId>) || (anchorId < hetFirst);
+        const bool isNew = (anchorId >= newAnchorsBegin);
+        if(!isPrimary && !isNew) continue;
+        for(const Shasta2AnchorMarkerInfo& info : anchors.anchorMarkerInfos[anchorId]) {
+            if((info.orientedReadId.getValue() & 1U) != 0U) continue;   // strand 1 done via mirror.
+            strand0[info.orientedReadId.getReadId()].push_back({info.position, anchorId});
+        }
+    }
+
+    // Pass B: sort each read's strand-0 list by position (ties broken by
+    // ascending anchorId -- correctness does not depend on which tied anchor
+    // sorts first, only that strand 1 is mirrored from strand 0, not sorted
+    // independently), then derive strand 1 by reversing + flipping.
+    filteredJourneys.assign(orientedReadCount, {});
+    for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
+        auto& v = strand0[readIdValue];
+        std::sort(v.begin(), v.end());
+        std::vector<Shasta2AnchorId>& out = filteredJourneys[2 * readIdValue];
+        std::vector<Shasta2AnchorId>& outRc = filteredJourneys[2 * readIdValue + 1];
+        out.reserve(v.size());
+        for(const auto& [position, anchorId] : v) {
+            static_cast<void>(position);
+            out.push_back(anchorId);
+        }
+        outRc.resize(out.size());
+        for(size_t k = 0; k < out.size(); k++) {
+            outRc[k] = out[out.size() - 1 - k] ^ 1ULL;
+        }
+    }
+    strand0.clear();
+    strand0.shrink_to_fit();
+
+    // Pass C: rebuild the journeys VectorOfVectors in place from
+    // filteredJourneys -- identical shape to filterByAnchorChaining's Pass B.
+    journeys.remove();
+    journeys.createNew(largeDataName("Shasta2Journeys"), largeDataPageSize);
+    journeys.beginPass1(orientedReadCount);
+    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
+        journeys.incrementCount(oidValue, filteredJourneys[oidValue].size());
+    }
+    journeys.beginPass2();
+    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
+        const auto journey = journeys[oidValue];
+        const std::vector<Shasta2AnchorId>& filtered = filteredJourneys[oidValue];
+        DINARA_ASSERT(journey.size() == filtered.size());
+        for(uint64_t i = 0; i < filtered.size(); i++) {
+            journey[i] = filtered[i];
+        }
+    }
+    journeys.endPass2(false, true);
+    filteredJourneys.clear();
+    filteredJourneys.shrink_to_fit();
+
+    // Pass D: reconcile positionInJourney for every anchor's marker infos
+    // (reset all to invalid, then set from the rebuilt journeys), identical
+    // shape to filterByAnchorChaining's Pass C.
+    for(uint64_t anchorId = 0; anchorId < anchors.anchorMarkerInfos.size(); anchorId++) {
+        for(Shasta2AnchorMarkerInfo& markerInfo : anchors.anchorMarkerInfos[anchorId]) {
+            markerInfo.positionInJourney = invalid<uint32_t>;
+        }
+    }
+    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
+        const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(oidValue));
+        const auto journey = journeys[oidValue];
+        for(uint64_t position = 0; position < journey.size(); position++) {
+            const Shasta2AnchorId anchorId = journey[position];
+            span<Shasta2AnchorMarkerInfo> markerInfos = anchors.anchorMarkerInfos[anchorId];
+            const auto it = std::lower_bound(markerInfos.begin(), markerInfos.end(), orientedReadId,
+                [](const Shasta2AnchorMarkerInfo& info, OrientedReadId oid) {
+                    return info.orientedReadId < oid;
+                });
+            if(it != markerInfos.end() and it->orientedReadId == orientedReadId) {
+                it->positionInJourney = uint32_t(position);
+            }
+        }
+    }
+
+    performanceLog << timestamp << "Journeys rebuild (new anchors) ends." << endl;
+}
+
+
+
 // Access from binary data.
 Shasta2Journeys::Shasta2Journeys(const MappedMemoryOwner& mappedMemoryOwner) :
     MultithreadedObject<Shasta2Journeys>(*this),

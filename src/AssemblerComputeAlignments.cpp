@@ -184,6 +184,9 @@ void Assembler::computeBaseAlignmentsAndStore(
     data.threadFilteredByErrorRate.assign(threadCount, 0);
     data.threadFilteredByErrorRateGap.assign(threadCount, 0);
     data.threadFilteredByGapCount.assign(threadCount, 0);
+    data.threadChainAnchorsIn.assign(threadCount, 0);
+    data.threadChainAnchorsMapped.assign(threadCount, 0);
+    data.threadDroppedEmptyOrdinals.assign(threadCount, 0);
 
     // If needed for variant clustering, resize this as well.
     if (assemblerInfo->readGraphCreationMethod == 5) {
@@ -267,6 +270,26 @@ void Assembler::computeBaseAlignmentsAndStore(
         cout << timestamp << "OverlapCigarStore: "
              << overlapCigarStore.tokenCount() << " tokens, "
              << mb(cigarTotalBytes) << " MB." << endl;
+    }
+
+    // Report mapNativeChainToOrdinals survival: how much of hifiasm's native
+    // chain made it through the position lookup + monotone filter into
+    // markers. A low mapped/in ratio, or a high dropped-candidate count,
+    // signals a position-frame or marker-creation mismatch upstream.
+    {
+        uint64_t anchorsIn = 0, anchorsMapped = 0, droppedEmpty = 0;
+        for(size_t threadId = 0; threadId < threadCount; threadId++) {
+            anchorsIn     += data.threadChainAnchorsIn[threadId];
+            anchorsMapped += data.threadChainAnchorsMapped[threadId];
+            droppedEmpty  += data.threadDroppedEmptyOrdinals[threadId];
+        }
+        const double mappedFraction = (anchorsIn > 0) ?
+            (100.0 * double(anchorsMapped) / double(anchorsIn)) : 0.0;
+        cout << timestamp << "Native chain anchors: " << anchorsIn
+             << " offered, " << anchorsMapped << " mapped to marker ordinals ("
+             << mappedFraction << "%)." << endl;
+        cout << timestamp << "Candidates dropped for zero mappable anchors: "
+             << droppedEmpty << " of " << candidateCount << "." << endl;
     }
 
     const auto tEnd = steady_clock::now();
@@ -374,6 +397,8 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                             orientedReadIds,
                             rec->readIdQ, rec->readIdT, rec->isSameStrand,
                             nativeChain, directAlignment.ordinals);
+                        data.threadChainAnchorsIn[threadId] += nativeChain.size();
+                        data.threadChainAnchorsMapped[threadId] += directAlignment.ordinals.size();
                     }
                 }
                 if(computeCigar) {
@@ -395,6 +420,7 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             // The chain size is only known after deriveChainFromInterval. Drop
             // pairs with no chain or fewer than Align.minAlignedMarkerCount anchors.
             if(directAlignment.ordinals.empty()) {
+                data.threadDroppedEmptyOrdinals[threadId]++;
                 continue;
             }
             if(minAlignedMarkerCount > 0 &&

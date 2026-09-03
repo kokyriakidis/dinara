@@ -37,7 +37,6 @@
 // hifiasm candidate-overlap detector (submodule). C API used to generate read
 // overlaps (with aligned intervals and CIGARs) directly in memory.
 #include "hifiasm_overlaps.h"
-#include "Shasta2SnpmerAnchors.hpp"
 
 
 using namespace dinara;
@@ -1685,11 +1684,16 @@ void dinara::main::assemble(
     // filter is not meaningful and is not applied on this path.
     cout << "Deferring marker creation to hifiasm native chain." << endl;
 
-    // Coverage distribution (coverageLow/Het/Hom) feeds phasing, EC, and the
-    // chaining-frequency cutoff. hifiasm already computed the marker k-mer count
-    // histogram while building the filter (ha_ft_gen), so we take its
-    // authoritative peaks directly instead of a second dinara-side histogram
-    // pass over every marker.
+    // Coverage distribution (coverageLow/Het/Hom) feeds phasing and EC.
+    // hifiasm already computed the marker k-mer count histogram while building
+    // the filter (ha_ft_gen), so we take its authoritative peaks directly
+    // instead of a second dinara-side histogram pass over every marker.
+    //
+    // NOTE: the actual chaining-frequency cutoff (hifiasm's low_occ/high_occ)
+    // is computed internally by the hifiasm submodule from its own hom_cov,
+    // not from dinara's OverlapCandidates.maxChainingFreq -- neither
+    // hifiasm_filter_opt_t nor hifiasm_ovlp_opt_t exposes a frequency-cutoff
+    // field, so that option cannot currently be threaded through to it.
     {
         const int homCov = hifiasm_filter_hom_cov(overlapReuseFilter);
         const int hetCov = hifiasm_filter_het_cov(overlapReuseFilter);
@@ -1702,12 +1706,6 @@ void dinara::main::assemble(
                 " low "  << dist.coverageLow <<
                 ", het " << dist.coverageHet <<
                 ", hom " << dist.coverageHom << endl;
-        // Effective chaining cutoff: min(coverageHom * 5, maxChainingFreq),
-        // matching hifiasm's min(hom_cov * 5, max_kmer_cnt) logic.
-        const uint64_t effectiveChainingFreq = min(dist.coverageHom * 5,
-            uint64_t(assemblerOptions.overlapCandidatesOptions.maxChainingFreq));
-        cout << "Chaining limited to frequency <= "
-             << effectiveChainingFreq << "." << endl;
     }
 
     // Initialize KmerChecker for HttpServer diagnostics (optional).
@@ -1726,24 +1724,54 @@ void dinara::main::assemble(
     // selection so (a) the reused filter's k-mer counts correspond to the
     // minimizers being filtered and (b) hifiasm's native chain anchors land 1:1
     // on dinara marker positions.
+    // raw_candidates skips hifiasm's own base-level alignment (gen_hc_r_alin_ea)
+    // entirely -- only the lightweight chainer (h_ec_lchain) runs -- since
+    // nothing downstream consumes hifiasm's CIGAR: markers/anchors are built
+    // from the native chain alone (createMarkersFromNativeChain), and dinara's
+    // own base-alignment layer already runs chain-only by default
+    // (AlignOptions.computeBaseAlignmentCigar == false). This is the same
+    // "raw pre-alignment candidate set" mode tests/hifiasm_overlap_parity.sh
+    // verifies against real hifiasm's own --dbg-ovec output. The one thing
+    // this mode changes that dinara must compensate for itself: hifiasm's
+    // aligned path forward-adjusts a reverse-strand overlap's t_start/t_end to
+    // natural-forward coordinates as part of alignment; the raw path never
+    // does that (there is no alignment step to do it in), so
+    // importAlignmentCandidatesFromMemory is told via rawCandidates below to
+    // undo the missing adjustment itself -- see its Assembler.hpp comment.
     hifiasm_ovlp_opt_t hifiOpt = {};
-    hifiOpt.threads      = int(threadCount);
-    hifiOpt.no_hpc       = 1;
-    hifiOpt.k_mer_length = markerK;
-    hifiOpt.mz_win       = markerK;
-    hifiOpt.filter       = overlapReuseFilter;
+    hifiOpt.threads        = int(threadCount);
+    hifiOpt.no_hpc         = 1;
+    hifiOpt.k_mer_length   = markerK;
+    hifiOpt.mz_win         = markerK;
+    hifiOpt.filter         = overlapReuseFilter;
+    hifiOpt.raw_candidates = 1;
     performanceLog << timestamp
         << "Overlap detection: no-HPC, k=w=" << markerK
-        << ", reusing prebuilt marker filter." << endl;
+        << ", reusing prebuilt marker filter, raw candidates only "
+        << "(no base-level alignment)." << endl;
 
     hifiasm_overlap_t* ov = nullptr;
     uint64_t nOv = 0;
     char* names = nullptr;
     uint64_t* nameOff = nullptr;
     uint64_t nReads = 0;
-    // Interval-only import: dinara discards hifiasm's base CIGAR (it derives the
-    // per-segment CIGAR itself), so request none.
+    // hifiasm's own already-computed base-level CIGAR (query-forward /
+    // target-alignment-orientation, same convention as the native chain).
+    // ha_detect_candidates_from_store() always computes this internally per
+    // overlap (concatenated across that overlap's aligned windows) regardless
+    // of whether it is requested here -- cigarOut only controls whether the
+    // already-computed tokens get copied out to the caller or discarded, so
+    // requesting it costs essentially nothing extra (measured: ~7.0s either
+    // way on the GIAB HG002 chr1:15-15.4Mb fixture, 989 reads).
+    // On by default; set DINARA_STORE_HIFIASM_CIGAR=0 to fall back to
+    // interval-only import (dinara re-derives the per-segment CIGAR with
+    // A*PA2 in computeBaseAlignmentsAndStore, as before this was wired up).
+    const bool storeHifiasmCigar = [](){
+        const char* env = std::getenv("DINARA_STORE_HIFIASM_CIGAR");
+        return env == nullptr || env[0] != '0';
+    }();
     uint16_t* cigar = nullptr;
+    uint64_t cigarLen = 0;
     // Native dense chain anchors: hifiasm's own colinear-DP chain per overlap.
     uint64_t* chain = nullptr;
     uint64_t chainLen = 0;
@@ -1752,7 +1780,8 @@ void dinara::main::assemble(
         << "loaded read store." << endl;
     const int rc = hifiasm_detect_overlaps_from_store(
         &hifiOpt, &ov, &nOv, &names, &nameOff, &nReads,
-        /*cigarOut*/ nullptr, /*cigarLenOut*/ nullptr,
+        storeHifiasmCigar ? &cigar : nullptr,
+        storeHifiasmCigar ? &cigarLen : nullptr,
         &chain, &chainLen);
     if(rc != 0) {
         hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
@@ -1761,20 +1790,26 @@ void dinara::main::assemble(
     }
     performanceLog << timestamp << "hifiasm produced " << nOv
         << " overlaps over " << nReads << " reads (in memory)." << endl;
+    cout << timestamp << "hifiasm CIGAR: " << (storeHifiasmCigar ?
+        (to_string(cigarLen) + " tokens requested and stored") :
+        string("not requested (interval-only import)")) << endl;
 
-    // Interval-only import: hifiasm supplies the candidate PAIRS and their
-    // query/target INTERVALS. dinara uses hifiasm's native dense chain anchors
-    // (its colinear-DP seeds, exported per overlap), mapped directly to marker
-    // ordinals in computeBaseAlignmentsAndStore. Because overlap detection runs
-    // no-HPC at the marker k, each anchor lands on a marker 1:1, so no
-    // re-chaining is needed. dinara then builds the per-segment CIGAR with A*PA2.
-    // This keeps hifiasm as the sole source of candidate pairs, intervals, AND
-    // chains.
+    // dinara uses hifiasm's native dense chain anchors (its colinear-DP seeds,
+    // exported per overlap), mapped directly to marker ordinals in
+    // computeBaseAlignmentsAndStore. Because overlap detection runs no-HPC at
+    // the marker k, each anchor lands on a marker 1:1, so no re-chaining is
+    // needed. When storeHifiasmCigar is on, hifiasm's own base-level CIGAR is
+    // ALSO stored per pair (HifiasmImportedCigarStore), available for reuse
+    // instead of recomputing an equivalent alignment with A*PA2 -- see
+    // ProjectedAlignment::constructFromHifiasmCigar (not yet wired into
+    // computeBaseAlignmentsAndStoreThreadFunction as of this change; storage
+    // only for now).
     assembler.importAlignmentCandidatesFromMemory(
         ov, nOv, names, nameOff, nReads,
-        /*cigar*/ nullptr, /*cigarLen*/ 0,
+        cigar, cigarLen,
         /*chain*/ chain, /*chainLen*/ chainLen, threadCount,
-        assemblerOptions.overlapCandidatesOptions.minOverlapLength);
+        assemblerOptions.overlapCandidatesOptions.minOverlapLength,
+        /*rawCandidates*/ bool(hifiOpt.raw_candidates));
 
     // Deferred marker creation: build the marker set from hifiasm's native chain
     // anchors (the shared k-mer positions), then persist. Must happen while
@@ -2499,41 +2534,79 @@ void dinara::main::assemble(
     }
 #endif // !USE_JOURNEY_ANCHOR_GRAPH  (end of window + het-bubble pipeline)
 
-    // Append myloasm SNPmer het anchors to the export. Runs AFTER primary +
-    // window het anchors are appended (so hetAnchorFirstId still marks the
-    // primary/het boundary) and BEFORE the journey tie resolution below, so
-    // snpmer anchors PARTICIPATE in tie resolution: a snpmer anchor that pins a
-    // read at the same exported position as a primary or window het anchor is
-    // recorded in journeyTieDropMap and omitted by writeExternalAnchors, instead
-    // of triggering shasta2's "Invalid Journey ... Two anchors at the same
-    // position" assert at load time. These are export-only additional het
-    // anchors (no anchor-graph bubble edges); see Shasta2SnpmerAnchors.hpp.
+    // Build the DETECTION anchor graph from the current (pre-het) journeys,
+    // run POA-based het-site detection on its edges to append new het
+    // anchors, rebuild journeys so the new anchors take their place in every
+    // affected read's journey, and rebuild the anchor graph fresh from the
+    // rebuilt journeys. This graph -- not the detection one -- is what
+    // everything downstream (export, GFA, assembly graph) uses.
     //
-    // On by default. Set DINARA_SNPMER_ANCHORS=0 to disable. minMembers per
-    // allele is 2 (appendHetAnchorPair requires >= 2); override with
-    // DINARA_SNPMER_MIN_MEMBERS.
+    // This must run BEFORE journey tie resolution and external-anchor export
+    // below, so shasta2Anchors holds every het anchor this pass creates before
+    // either one runs -- otherwise anchors created here would silently never
+    // reach the shasta2 export. See Shasta2AnchorGraphHetOnGraph.cpp's file
+    // header for why detection only appends anchors and never touches a graph
+    // directly.
+#if USE_JOURNEY_ANCHOR_GRAPH
+    // The per-edge coverage threshold defaults to 0 (see
+    // Assembly.mode3.minJourneyEdgeCoverage). filterByAnchorChaining has
+    // already run (above), so the filtered journeys are the source of truth:
+    // every consecutive pair surviving in a filtered journey becomes an edge.
+    static_cast<void>(anchorDovetailWindow);
+    const uint64_t minEdgeCoverage =
+        assemblerOptions.assemblyOptions.mode3Options.minJourneyEdgeCoverage;
+    // Snapshot the anchor count before transcribeHetBubbles appends anything,
+    // so the journeys rebuild below (Shasta2Journeys::rebuildAfterNewAnchors)
+    // can fold in exactly the new anchors it creates without also pulling in
+    // any other het/hom anchors some other pass might append for a purpose
+    // that doesn't include internal graph participation.
+    const Shasta2AnchorId newAnchorsBegin = shasta2Anchors->size();
     {
-        bool enabled = true;
-        if(const char* env = std::getenv("DINARA_SNPMER_ANCHORS")) {
-            enabled = (env[0] != '0');
-        }
-        if(enabled) {
-            cout << timestamp << "Appending myloasm SNPmer het anchors..." << endl;
-            const uint64_t minMembers = []() -> uint64_t {
-                if(const char* m = std::getenv("DINARA_SNPMER_MIN_MEMBERS")) {
-                    const long v = std::atol(m);
-                    if(v >= 2) return uint64_t(v);
-                }
-                return 2;   // appendHetAnchorPair requires >= 2 members
-            }();
-            const uint64_t appended = appendSnpmerHetAnchors(
-                assembler, inputFileNames, threadCount,
-                minMembers, /*requireBiallelic*/ true);
-            cout << timestamp << "Appended " << appended
-                 << " SNPmer allele anchors; store now has "
-                 << shasta2Anchors->size() << " anchors." << endl;
-        }
+        cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
+             << "(detection pass, consecutive-anchor edges, minEdgeCoverage="
+             << minEdgeCoverage << ")..." << endl;
+        Shasta2AnchorGraph detectionGraph(
+            *shasta2Anchors,
+            *shasta2Journeys,
+            minEdgeCoverage,
+            threadCount);
+
+        const uint64_t minCommonForHet =
+            assemblerOptions.assemblyOptions.mode3Options.minCommonForHet;
+        cout << timestamp << "transcribeHetBubbles: minCommonForHet="
+             << minCommonForHet << "..." << endl;
+        const HetOnGraphResult res = transcribeHetBubbles(
+            detectionGraph, *shasta2Anchors, minCommonForHet, threadCount);
+        cout << timestamp << "transcribeHetBubbles results:\n"
+             << "  edges total:             " << res.edgesTotal << "\n"
+             << "  edges considered:        " << res.edgesConsidered
+             << " (coverage >= " << minCommonForHet << ")\n"
+             << "  edges skipped coverage:  " << res.edgesSkippedCoverage << "\n"
+             << "  edges skipped length:    " << res.edgesSkippedLen << "\n"
+             << "  edges skipped identical: " << res.edgesSkippedIdentical << "\n"
+             << "  edges MSA'd:             " << res.edgesMsad << "\n"
+             << "  edges with real sites:   " << res.edgesPlanned
+             << " (of which multi-site: " << res.edgesPlannedMultiSite << ")\n"
+             << "  deferred end-bubble:     " << res.edgesDeferredEndBubble << "\n"
+             << "  deferred complex:        " << res.edgesDeferredComplex << "\n"
+             << "  sites transcribed:       " << res.sitesTranscribed << "\n"
+             << "  het anchors created:     " << res.hetAnchorsCreated << "\n"
+             << "  elapsed:                 " << res.elapsedSeconds << " s"
+             << endl;
+        // detectionGraph goes out of scope here -- superseded by the graph
+        // rebuilt from the updated journeys below.
     }
+
+    cout << timestamp << "Rebuilding journeys to include new het anchors..." << endl;
+    shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
+    cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
+         << "(final pass, minEdgeCoverage=" << minEdgeCoverage << ")..." << endl;
+    assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
+        *shasta2Anchors,
+        *shasta2Journeys,
+        minEdgeCoverage,
+        threadCount);
+#endif // USE_JOURNEY_ANCHOR_GRAPH
 
     // Global per-read journey tie resolution. shasta2 builds, for every oriented
     // read, the ordered list of ALL anchors that read belongs to (sorted by the
@@ -2692,88 +2765,86 @@ void dinara::main::assemble(
          << hetAnchorK()
          << (hetAnchorK() == 0 ? " (EXPERIMENTAL DINARA_HET_K=0)." : ".") << endl;
 
-    // Build and export the anchor graph, including het-anchor bubble edges.
-    // computeWindowTransitions fills the per-window transition fields the graph
-    // constructor consumes; the constructor then wires backbone chains,
-    // inter-window edges, and het bubbles. anchorDovetailWindow was populated
-    // above (with the windows). This is the second end product alongside the
-    // exported anchors. Skip if the high-connectivity het gate already
-    // computed it above -- see the note there for why the result would be
-    // identical either way.
+    // Verify and finalize the anchor graph (already built above for the
+    // journey path), then export it.
     {
 #if USE_JOURNEY_ANCHOR_GRAPH
-        // Journey-based anchor graph: one edge per pair of anchors that are
-        // consecutive in some read's filtered journey. No windows, no het
-        // bubbles, no inter-window / trim / het-tip passes.
-        //
-        // The per-edge coverage threshold defaults to 0 (see
-        // Assembly.mode3.minJourneyEdgeCoverage). filterByAnchorChaining has
-        // already run (above), so the filtered journeys are the source of truth:
-        // every consecutive pair surviving in a filtered journey becomes an
-        // edge. Because the chaining DP only links a chain-consecutive pair when
-        // countCommon(A,B) >= minCommonForBackbone, every resulting edge carries
-        // at least minCommonForBackbone co-occurring reads of support. Setting
-        // this option > 0 thresholds adjacency coverage instead, which can
-        // isolate well-supported anchors.
-        static_cast<void>(anchorDovetailWindow);
-        const uint64_t minEdgeCoverage =
-            assemblerOptions.assemblyOptions.mode3Options.minJourneyEdgeCoverage;
-        cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
-             << "(consecutive-anchor edges, minEdgeCoverage=" << minEdgeCoverage
-             << ")..." << endl;
-        assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            minEdgeCoverage,
-            threadCount);
+        // VERIFICATION: independently recompute the journey-consecutive
+        // (anchorA, anchorB) tally directly from the rebuilt journeys
+        // (bypassing findChildren/Shasta2AnchorPair entirely) and cross-check
+        // against every edge in the FINAL anchor graph.
+        if(const char* env = std::getenv("DINARA_VERIFY_ANCHOR_GRAPH")) {
+            if(env[0] != '0') {
+                cout << timestamp << "Verifying anchor graph construction "
+                        "against an independent journey walk..." << endl;
+                std::unordered_map<uint64_t, uint64_t> independentTally;
+                const uint64_t orientedReadCount = shasta2Journeys->size();
+                for(uint64_t v = 0; v < orientedReadCount; v++) {
+                    const OrientedReadId orientedReadId = OrientedReadId::fromValue(v);
+                    const auto journey = (*shasta2Journeys)[orientedReadId];
+                    for(uint64_t i = 0; i + 1 < journey.size(); i++) {
+                        const uint64_t a = uint64_t(journey[i]);
+                        const uint64_t b = uint64_t(journey[i + 1]);
+                        independentTally[(a << 32) | b]++;
+                    }
+                }
 
-        // Het-anchor bubble transcription is temporarily disabled. The journey
-        // graph is exported as a plain consecutive-anchor graph with no het
-        // structure. Re-enable by flipping this to 1.
-#if 0
-        // Transcribe abPOA-detected bubbles (SNPs and >=15bp indels) on the
-        // journey anchor-graph edges into real het anchors + flank->arm->flank
-        // edges. The journey graph connects consecutive anchors with no het
-        // structure of its own; this adds it. Coverage floor is
-        // Assembly.mode3.minCommonForHet.
-        {
-            const uint64_t minCommonForHet =
-                assemblerOptions.assemblyOptions.mode3Options.minCommonForHet;
-            cout << timestamp << "transcribeHetBubbles: minCommonForHet="
-                 << minCommonForHet << "..." << endl;
-            const HetOnGraphResult res = transcribeHetBubbles(
-                *assembler.shasta2AnchorGraph, *shasta2Anchors,
-                minCommonForHet, threadCount);
-            cout << timestamp << "transcribeHetBubbles results:\n"
-                 << "  edges total:             " << res.edgesTotal << "\n"
-                 << "  edges considered:        " << res.edgesConsidered
-                 << " (coverage >= " << minCommonForHet << ")\n"
-                 << "  edges skipped coverage:  " << res.edgesSkippedCoverage << "\n"
-                 << "  edges skipped length:    " << res.edgesSkippedLen << "\n"
-                 << "  edges skipped identical: " << res.edgesSkippedIdentical << "\n"
-                 << "  edges MSA'd:             " << res.edgesMsad << "\n"
-                 << "  edges transcribed:       " << res.edgesPlanned << "\n"
-                 << "  deferred multi-site:     " << res.edgesDeferredMultiSite << "\n"
-                 << "  deferred end-bubble:     " << res.edgesDeferredEndBubble << "\n"
-                 << "  deferred complex:        " << res.edgesDeferredComplex << "\n"
-                 << "  bubbles transcribed:     " << res.bubblesTranscribed << "\n"
-                 << "  het anchors created:     " << res.hetAnchorsCreated << "\n"
-                 << "  arm edges added:         " << res.armEdgesAdded << "\n"
-                 << "  deletion edges added:    " << res.deletionEdgesAdded << "\n"
-                 << "  original edges disabled: " << res.originalEdgesDisabled << "\n"
-                 << "  elapsed:                 " << res.elapsedSeconds << " s"
-                 << endl;
+                uint64_t edgesChecked = 0, edgesMismatched = 0, edgesUnsupported = 0;
+                auto edgeRange = boost::edges(*assembler.shasta2AnchorGraph);
+                for(auto it = edgeRange.first; it != edgeRange.second; ++it) {
+                    const auto& edge = (*assembler.shasta2AnchorGraph)[*it];
+                    const uint64_t a = edge.anchorPair.anchorIdA;
+                    const uint64_t b = edge.anchorPair.anchorIdB;
+                    const uint64_t declaredCoverage = edge.coverage();
+                    const auto tallyIt = independentTally.find((a << 32) | b);
+                    ++edgesChecked;
+                    if(tallyIt == independentTally.end()) {
+                        ++edgesUnsupported;
+                        cout << timestamp << "  MISMATCH: edge " << a << "->" << b
+                             << " coverage=" << declaredCoverage
+                             << " but independent walk found ZERO occurrences." << endl;
+                    } else if(tallyIt->second != declaredCoverage) {
+                        ++edgesMismatched;
+                        cout << timestamp << "  MISMATCH: edge " << a << "->" << b
+                             << " coverage=" << declaredCoverage
+                             << " independent tally=" << tallyIt->second << endl;
+                    }
+                }
+
+                uint64_t missingEdges = 0;
+                for(const auto& [key, count] : independentTally) {
+                    if(count < minEdgeCoverage) continue;
+                    const Shasta2AnchorId a = key >> 32;
+                    const Shasta2AnchorId b = key & 0xffffffffULL;
+                    const auto found = boost::edge(a, b, *assembler.shasta2AnchorGraph);
+                    if(!found.second) {
+                        ++missingEdges;
+                        if(missingEdges <= 20) {
+                            cout << timestamp << "  MISSING EDGE: " << a << "->" << b
+                                 << " independent tally=" << count
+                                 << " (>= minEdgeCoverage=" << minEdgeCoverage
+                                 << ") but no graph edge exists." << endl;
+                        }
+                    }
+                }
+
+                cout << timestamp << "Anchor graph verification: " << edgesChecked
+                     << " graph edges checked (" << edgesMismatched << " coverage mismatches, "
+                     << edgesUnsupported << " with zero independent support), "
+                     << independentTally.size() << " distinct journey-consecutive pairs found, "
+                     << missingEdges << " missing edges (tally >= minEdgeCoverage but no graph edge)."
+                     << endl;
+            }
         }
 
-        // Tip cleanup after transcription: disabling the original mixed edges
-        // can leave one-sided anchors, and the new het arms are exactly what
-        // removeHetArmTips is designed to finish. Iterate until stable.
+        // Tip cleanup: a het/hom anchor can still end up one-sided (e.g. if
+        // every one of its member reads happens to have it as the first/last
+        // entry of its filtered journey); iterate until stable.
         for(uint64_t tipPass = 0; ; ++tipPass) {
             const uint64_t hetTips =
                 assembler.shasta2AnchorGraph->removeHetArmTips(*shasta2Anchors);
             if(hetTips == 0) break;
         }
-#endif // het-anchor bubble transcription (disabled)
 #else
         if(!windowTransitionsComputed) {
             computeWindowTransitions(*shasta2Anchors, *shasta2Journeys, anchorWindows,
@@ -2863,7 +2934,7 @@ void dinara::main::assemble(
             externalAnchorGraphName, *shasta2Anchors, &journeyTieDropMap);
         cout << timestamp << "Wrote shasta2 anchor graph. Use "
              << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
-    }
+    } 
 
     // Build the assembly graph from the anchor graph. This collapses each
     // maximal non-branching anchor chain into a single segment (compress), so

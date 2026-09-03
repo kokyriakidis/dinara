@@ -291,7 +291,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const uint64_t* chain,
     uint64_t chainLen,
     uint64_t threadCount,
-    uint32_t minOverlapLength)
+    uint32_t minOverlapLength,
+    bool rawCandidates)
 {
     cout << timestamp << "Importing " << overlapCount
          << " hifiasm overlaps from memory..." << endl;
@@ -367,10 +368,24 @@ void Assembler::importAlignmentCandidatesFromMemory(
                 // reach kMinOverlapLen. Single length floor; 0 disables.
                 if(kMinOverlapLen > 0 && o.block_len < kMinOverlapLen) continue;
 
+                // Raw-candidate reverse-strand fix: see the rawCandidates
+                // parameter comment (Assembler.hpp) for why t_start/t_end need
+                // this adjustment only here, only for is_same_strand == 0. The
+                // flip is span-preserving (tEnd-tStart is unchanged), so it
+                // cannot affect any length-based filter -- only which absolute
+                // positions get recorded.
+                uint32_t tStart = o.t_start;
+                uint32_t tEnd = o.t_end;
+                if(rawCandidates && o.is_same_strand == 0) {
+                    const uint32_t tLen = uint32_t(reads->getReadRawSequenceLength(readId1));
+                    tStart = tLen - o.t_end;
+                    tEnd   = tLen - o.t_start;
+                }
+
                 PafEntry entry = makePafEntry(
                     readId0, readId1,
                     o.q_start, o.q_end,
-                    o.t_start, o.t_end,
+                    tStart, tEnd,
                     o.block_len, o.shared_seed, o.is_same_strand != 0);
                 // Remember which overlap this entry came from so the CIGAR of
                 // the entry that survives dedup can be recovered below.
@@ -411,6 +426,16 @@ void Assembler::importAlignmentCandidatesFromMemory(
         uint64_t cigarOverlaps = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), cigarLen);
         if(chain != nullptr) hifiasmImportedCigarStore.reserveChain(chainLen);
+        // Verification: does the imported CIGAR's own consumed span match the
+        // declared box (q_end-q_start / t_end-t_start)? The box comes from the
+        // pre-alignment chain-derived candidate interval (overlap_region::
+        // x_pos_s/e), while the CIGAR only concatenates the windows that
+        // gen_hc_r_alin_ea's alignment filter actually confirmed -- these are
+        // not guaranteed to be the same span if only SOME windows within an
+        // otherwise-surviving overlap failed to align.
+        uint64_t spanMatchCount = 0, spanMismatchCount = 0;
+        uint64_t spanMismatchBasesQ = 0, spanMismatchBasesT = 0;
+        uint64_t basesChecked = 0, basesAgree = 0, basesDisagree = 0;
         for(const PafEntry& e : entries) {
             if(e.sourceIndex == uint64_t(-1)) continue;
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
@@ -430,9 +455,120 @@ void Assembler::importAlignmentCandidatesFromMemory(
                     e.key, o.is_same_strand != 0,
                     span<const uint64_t>(chain + o.chain_offset, size_t(o.chain_len)));
             }
+
+            // Walk the JUST-STORED (already op2/op3-transposed, dinara
+            // convention) tokens to get the CIGAR's own query/target span.
+            const HifiasmImportedCigarStore::Record* rec =
+                hifiasmImportedCigarStore.find(e.key, o.is_same_strand != 0);
+            if(rec != nullptr) {
+                uint64_t qConsumed = 0, tConsumed = 0;
+                for(const CigarToken tok : hifiasmImportedCigarStore.tokensOf(*rec)) {
+                    if(opConsumesQuery(tok.op()))  qConsumed += tok.len();
+                    if(opConsumesTarget(tok.op())) tConsumed += tok.len();
+                }
+                const uint64_t declaredQ = uint64_t(o.q_end) - uint64_t(o.q_start);
+                const uint64_t declaredT = uint64_t(o.t_end) - uint64_t(o.t_start);
+                const bool spanMatches = (qConsumed == declaredQ && tConsumed == declaredT);
+                if(spanMatches) {
+                    ++spanMatchCount;
+                } else {
+                    ++spanMismatchCount;
+                    spanMismatchBasesQ += (declaredQ > qConsumed) ? (declaredQ - qConsumed) : (qConsumed - declaredQ);
+                    spanMismatchBasesT += (declaredT > tConsumed) ? (declaredT - tConsumed) : (tConsumed - declaredT);
+                }
+
+                // Direct base-content check. Builds the full box's query and
+                // target sequence (already in alignment order: target
+                // reverse-complemented up front for reverse-strand pairs), so
+                // the SAME qSub/tSub serve two purposes:
+                //  - for span-matching pairs (qi/ti start at 0): confirms the
+                //    op2/op3 transpose and overall token encoding are correct
+                //    for THIS raw token source, not just assumed from a
+                //    comment written against a possibly different one.
+                //  - for span-MISMATCHING pairs specifically: tests where the
+                //    CIGAR's covered region actually sits within the box,
+                //    instead of assuming it starts at o.q_start/o.t_start.
+                //    Anchor-at-start (qi/ti begin at 0, matching the
+                //    span-match case) means the shortfall is trailing;
+                //    anchor-at-end (qi/ti begin at declaredQ-qConsumed /
+                //    declaredT-tConsumed) means it's leading. Whichever
+                //    anchor actually produces agreeing match-op bases tells
+                //    us which is true, rather than assuming.
+                if(basesChecked < 2000000 || !spanMatches) {
+                    std::string qSub, tSub;
+                    qSub.reserve(o.q_end - o.q_start);
+                    for(uint32_t p = o.q_start; p < o.q_end; ++p) {
+                        qSub.push_back("ACGT"[reads->getRead(readId0)[p].value]);
+                    }
+                    tSub.reserve(o.t_end - o.t_start);
+                    for(uint32_t p = o.t_start; p < o.t_end; ++p) {
+                        tSub.push_back("ACGT"[reads->getRead(readId1)[p].value]);
+                    }
+                    if(o.is_same_strand == 0) {
+                        std::reverse(tSub.begin(), tSub.end());
+                        for(char& c : tSub) {
+                            c = (c == 'A') ? 'T' : (c == 'C') ? 'G' :
+                                (c == 'G') ? 'C' : 'A';
+                        }
+                    }
+
+                    auto walk = [&](size_t qi, size_t ti, uint64_t& agree, uint64_t& disagree) {
+                        for(const CigarToken tok : hifiasmImportedCigarStore.tokensOf(*rec)) {
+                            const uint8_t op = tok.op();
+                            for(uint16_t u = 0; u < tok.len(); ++u) {
+                                if(op == CigarOpMatch) {
+                                    if(qi < qSub.size() && ti < tSub.size() &&
+                                       qSub[qi] == tSub[ti]) ++agree;
+                                    else ++disagree;
+                                }
+                                if(opConsumesQuery(op))  ++qi;
+                                if(opConsumesTarget(op)) ++ti;
+                            }
+                        }
+                    };
+
+                    if(spanMatches) {
+                        uint64_t agree = 0, disagree = 0;
+                        walk(0, 0, agree, disagree);
+                        basesChecked += agree + disagree;
+                        basesAgree += agree;
+                        basesDisagree += disagree;
+                    } else {
+                        const uint64_t qGapForEndAnchor =
+                            (declaredQ > qConsumed) ? (declaredQ - qConsumed) : 0;
+                        const uint64_t tGapForEndAnchor =
+                            (declaredT > tConsumed) ? (declaredT - tConsumed) : 0;
+                        uint64_t agreeStart = 0, disagreeStart = 0;
+                        uint64_t agreeEnd = 0, disagreeEnd = 0;
+                        walk(0, 0, agreeStart, disagreeStart);
+                        walk(size_t(qGapForEndAnchor), size_t(tGapForEndAnchor), agreeEnd, disagreeEnd);
+                        const char* verdict =
+                            (disagreeStart == 0 && agreeStart > 0) ? "TRAILING gap (anchor-at-start correct)" :
+                            (disagreeEnd == 0 && agreeEnd > 0) ? "LEADING gap (anchor-at-end correct)" :
+                            "NEITHER anchor fully agrees (gap may be internal, or something else is wrong)";
+                        cout << timestamp << "  mismatch detail: declaredQ=" << declaredQ
+                             << " qConsumed=" << qConsumed << " declaredT=" << declaredT
+                             << " tConsumed=" << tConsumed
+                             << " | anchor-at-start: " << agreeStart << " agree/" << disagreeStart << " disagree"
+                             << " | anchor-at-end: " << agreeEnd << " agree/" << disagreeEnd << " disagree"
+                             << " | verdict: " << verdict << endl;
+                    }
+                }
+            }
         }
         cout << timestamp << "Imported hifiasm CIGARs for " << cigarOverlaps
              << " overlaps (" << cigarLen << " tokens)." << endl;
+        cout << timestamp << "CIGAR span vs declared box: " << spanMatchCount
+             << " exact match, " << spanMismatchCount << " differ";
+        if(spanMismatchCount > 0) {
+            cout << " (avg query gap " << (double(spanMismatchBasesQ) / double(spanMismatchCount))
+                 << " bp, avg target gap " << (double(spanMismatchBasesT) / double(spanMismatchCount)) << " bp)";
+        }
+        cout << "." << endl;
+        cout << timestamp << "CIGAR match-op base-content check: " << basesAgree
+             << " / " << basesChecked << " agree ("
+             << (basesChecked > 0 ? (100.0 * double(basesAgree) / double(basesChecked)) : 0.0)
+             << "%), " << basesDisagree << " disagree." << endl;
     } else {
         // Interval-only import: hifiasm's base CIGAR is discarded (cigar ==
         // nullptr). Store each surviving overlap's interval with ZERO CIGAR

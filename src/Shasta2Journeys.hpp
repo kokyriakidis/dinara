@@ -52,6 +52,31 @@ public:
         uint64_t maxSkipForBackbone,
         uint64_t threadCount);
 
+    // Rebuild the journeys and every anchor's positionInJourney from scratch,
+    // keyed by each occurrence's `position` field instead of `ordinal`.
+    // Unlike ordinal, position is defined for anchors appended after initial
+    // construction (e.g. Shasta2Anchors::appendHetAnchorPair het anchors,
+    // whose ordinal is always invalid) and is RC-symmetric by construction, so
+    // this lets newly-appended anchors take their correct place in every
+    // affected read's journey with no special-casing.
+    //
+    // Only two anchor ranges are included: primary anchors (id <
+    // anchors.hetAnchorFirstId) -- i.e. exactly what was already in the
+    // journeys -- and the new anchors in [newAnchorsBegin, anchors.size()).
+    // Any het/hom anchor in between (id in [hetAnchorFirstId,
+    // newAnchorsBegin)) is skipped: those would be anchors some OTHER caller
+    // appended for a purpose that does not include internal journey/anchor-
+    // graph participation (e.g. an export-only bolt-on not built with the
+    // position-margin safety this rebuild's callers rely on -- see
+    // Shasta2AnchorGraphHetOnGraph.cpp's file header). Pass newAnchorsBegin ==
+    // the anchor count captured right before appending the anchors this
+    // rebuild is meant to fold in.
+    //
+    // Call after appending new anchors and before rebuilding any
+    // Shasta2AnchorGraph from this object. Requires the Anchors pointer
+    // retained from initial creation.
+    void rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, uint64_t threadCount);
+
     // Return the Journey for an oriented read.
     Shasta2Journey operator[](OrientedReadId orientedReadId) const
     {
