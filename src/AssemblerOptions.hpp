@@ -496,6 +496,18 @@ public:
     // (experimental, DINARA_HET_ON_GRAPH=1). Edges below this are skipped.
     uint64_t minCommonForHet;
 
+    // Assumed per-read sequencing error rate used by the per-edge MSA het
+    // detector's allele significance test: a one-sided binomial test asks
+    // whether an allele's read count is explainable as errors misreading the
+    // run's dominant allele at this rate, or is significant enough (p <=
+    // 0.05) to be a real second haplotype. Same idea and default as the
+    // myloasm SNPmer caller's minor-allele test. Lower values make the test
+    // MORE PERMISSIVE (a given minor-allele count looks more surprising
+    // against a lower assumed noise floor, so fewer reads are needed to pass);
+    // higher values make it STRICTER (more minor-allele reads are needed to
+    // stand out above a higher assumed noise floor).
+    double hetErrorRate;
+
     // Minimum base span (first anchor to last anchor) for a read's
     // journey to be accepted as a window backbone.
     uint64_t minWindowBaseSpan;

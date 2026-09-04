@@ -14,11 +14,13 @@
 //
 //   * A maximal run of columns between two convergence points where reads
 //     disagree is a candidate site. Reads are grouped by their exact
-//     subsequence over the run: each distinct group is an allele. A group
-//     that clears the per-allele support floor is a passing allele; a run is
-//     a REAL site only when >=2 alleles pass. A read whose subsequence over
-//     the run is empty (it skips the run: a deletion allele) needs no new
-//     anchor -- see below.
+//     subsequence over the run: each distinct group is an allele. The
+//     largest group is the dominant allele; every other group passes only if
+//     a one-sided binomial test (myloasm-style, see binomialTailPValue)
+//     rejects "this count is just sequencing error misreading the dominant
+//     allele". A run is a REAL site only when >=2 alleles pass. A read whose
+//     subsequence over the run is empty (it skips the run: a deletion
+//     allele) needs no new anchor -- see below.
 //
 // This unifies SNPs (a one-column site) and indels (a multi-column site, one
 // side long / one side empty) with no size special-case.
@@ -69,6 +71,7 @@
 #include "WindowIntervalPoa.hpp"   // IpoaAbHandle
 
 #include <boost/graph/iteration_macros.hpp>
+#include <boost/math/distributions/binomial.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -140,13 +143,24 @@ int hetOnGraphMaxLen()
     return cap;
 }
 
-// Per-allele support floor: an arm must carry at least this many reads to
-// become an anchor. Coverage-relative: max(2, covered/5). appendHetAnchorPair
-// itself requires >= 2 members.
-uint64_t alleleFloor(uint64_t coveredRows)
+// Significance level for the allele test below, matching myloasm's SNPmer
+// caller exactly (a conventional threshold, not exposed as a tunable).
+constexpr double hetSignificance = 0.05;
+
+// One-sided binomial test, myloasm-style (get_snpmers_inplace_sort's
+// minor-allele test): the probability of observing AT LEAST `successes` reads
+// carrying a candidate allele, if they arose purely from sequencing errors
+// misreading the run's DOMINANT allele at rate `errorRate`. A p-value at or
+// below hetSignificance means the count is unlikely to be pure noise -- a
+// real second haplotype, not a guess from a fixed count/fraction floor.
+// P(X >= k) = 1 - P(X <= k-1); computed via boost::math's complement idiom
+// rather than 1-cdf(k-1) for numerical stability at small p-values. Returns
+// 1.0 (never significant) for trials == 0 or successes == 0.
+double binomialTailPValue(uint64_t trials, uint64_t successes, double errorRate)
 {
-    const uint64_t frac = coveredRows / 5;
-    return frac < 2 ? 2 : frac;
+    if(trials == 0 || successes == 0) return 1.0;
+    const boost::math::binomial_distribution<double> dist(double(trials), errorRate);
+    return boost::math::cdf(boost::math::complement(dist, double(successes) - 1.0));
 }
 
 // Minimum number of convergent columns required between two candidate sites
@@ -185,7 +199,7 @@ struct EdgeHetSites {
 // Result of analyzing one edge's MSA matrix.
 enum class AnalyzeResult {
     NoBubble,        // no real site found (fully homozygous, or every
-                     // non-convergent run was noise below the allele floor)
+                     // non-convergent run's alleles failed the significance test)
     Planned,         // >=1 real site found; outSites has the new anchors
     DeferEndBubble,  // the surviving chain of real sites would touch a span end
     DeferComplex     // reserved, currently unused
@@ -196,13 +210,16 @@ enum class AnalyzeResult {
 // 0..3, or 4 for gap), all of length ncols. `posA[r]` is read r's absolute
 // base position of anchorA (so an aligned column maps back to a raw read
 // position by counting that row's non-gap bases up to the column). `total`
-// is the row count. See the file header for the overall algorithm and the
-// position-tie safety argument behind the strictly-interior check below.
+// is the row count. `hetErrorRate` is the assumed per-read error rate for the
+// allele significance test (Assembly.mode3.hetErrorRate). See the file header
+// for the overall algorithm and the position-tie safety argument behind the
+// strictly-interior check below.
 AnalyzeResult analyzeEdgeMsa(
     const vector<vector<uint8_t>>& msa,
     const vector<uint32_t>& posA,
     const vector<OrientedReadId>& rowRead,
     uint64_t total,
+    double hetErrorRate,
     EdgeHetSites& outSites)
 {
     outSites.arms.clear();
@@ -265,10 +282,9 @@ AnalyzeResult analyzeEdgeMsa(
     };
 
     // Analyze each (merged) run independently. A run that fails the >=2-
-    // passing-allele floor is simply not a site -- absorbed into the
+    // passing-allele test is simply not a site -- absorbed into the
     // surrounding background, not a veto -- so every other run on this edge
     // is unaffected (see file header).
-    const uint64_t floor = alleleFloor(total);
     vector<pair<uint64_t, uint64_t>> passingRuns;   // [begin, end) of real sites only
     for(uint64_t ri = 0; ri < runs.size(); ri++) {
         const auto [rbegin, rend] = runs[ri];
@@ -285,10 +301,35 @@ AnalyzeResult analyzeEdgeMsa(
             groups[allele].push_back(r);
         }
 
+        // The dominant allele (most rows) is the implicit reference every
+        // other allele's read count gets tested against, exactly like
+        // myloasm's SNPmer caller treats its most-frequent k-mer -- it is
+        // never itself put through the significance test. `&allele` is a
+        // stable pointer into the map's own node storage (unaffected by
+        // insertions elsewhere, and this map is never modified after
+        // construction), so identifying "is this iteration the dominant one"
+        // by address is safe and avoids re-deriving/copying the key.
+        const vector<uint8_t>* dominantAllele = nullptr;
+        uint64_t dominantCount = 0;
+        for(const auto& [allele, rows] : groups) {
+            if(rows.size() > dominantCount) {
+                dominantCount = rows.size();
+                dominantAllele = &allele;
+            }
+        }
+
         uint64_t passing = 0;
         vector<ArmMembers> siteArms;
         for(const auto& [allele, rows] : groups) {
-            if(rows.size() < floor) continue;
+            if(rows.size() < 2) continue;   // appendHetAnchorPair's own floor
+            if(&allele != dominantAllele) {
+                // One-sided binomial test against the dominant allele's count
+                // (see binomialTailPValue): is this allele's read count
+                // explainable as sequencing error, or a real second haplotype?
+                const double pValue =
+                    binomialTailPValue(dominantCount, rows.size(), hetErrorRate);
+                if(pValue > hetSignificance) continue;
+            }
             passing++;
             if(allele.empty()) continue;   // deletion allele: no anchor needed
             ArmMembers arm;
@@ -305,11 +346,7 @@ AnalyzeResult analyzeEdgeMsa(
 
         if(passing < 2) {
             if(multiSiteDebugEnabled() && runs.size() > 1) {
-                uint64_t largest = 0;
-                for(const auto& [allele, rows] : groups) {
-                    if(rows.size() > largest) largest = rows.size();
-                }
-                recordMultiSiteFailure(groups.size(), largest, total);
+                recordMultiSiteFailure(groups.size(), dominantCount, total);
             }
             continue;
         }
@@ -412,6 +449,7 @@ HetOnGraphResult dinara::transcribeHetBubbles(
     const Shasta2AnchorGraph& graph,
     Shasta2Anchors& anchors,
     uint64_t minCommonForHet,
+    double hetErrorRate,
     uint64_t threadCount)
 {
     HetOnGraphResult result;
@@ -523,7 +561,7 @@ HetOnGraphResult dinara::transcribeHetBubbles(
             st.edgesMsad++;
 
             EdgeHetSites sites;
-            const AnalyzeResult ar = analyzeEdgeMsa(msa, posA, rowRead, rowRead.size(), sites);
+            const AnalyzeResult ar = analyzeEdgeMsa(msa, posA, rowRead, rowRead.size(), hetErrorRate, sites);
             switch(ar) {
             case AnalyzeResult::NoBubble:
                 break;

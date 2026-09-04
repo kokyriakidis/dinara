@@ -55,18 +55,20 @@ namespace dinara {
         // each real site (Shasta2Anchors::appendHetAnchorPair). For every edge
         // whose two-sided coverage is at least minCommonForHet, an abPOA MSA is
         // run over the reads' inter-anchor sequences; where reads diverge into
-        // >=2 alleles clearing the support floor, each non-deletion allele
-        // becomes a new anchor. This mutates the anchor store but NEVER the
-        // graph passed in -- the caller must rebuild journeys
-        // (Shasta2Journeys::rebuildAfterNewAnchors) and then a fresh
-        // Shasta2AnchorGraph from them before the new anchors take effect; see
-        // the .cpp file header for why. Detection is parallelized over
-        // threadCount (0 = hardware concurrency); anchor creation is serial.
-        // Returns counts for reporting.
+        // >=2 alleles clearing a one-sided binomial significance test against
+        // hetErrorRate (myloasm-style; see the .cpp file's binomialTailPValue),
+        // each non-deletion allele becomes a new anchor. This mutates the
+        // anchor store but NEVER the graph passed in -- the caller must
+        // rebuild journeys (Shasta2Journeys::rebuildAfterNewAnchors) and then a
+        // fresh Shasta2AnchorGraph from them before the new anchors take
+        // effect; see the .cpp file header for why. Detection is parallelized
+        // over threadCount (0 = hardware concurrency); anchor creation is
+        // serial. Returns counts for reporting.
         HetOnGraphResult transcribeHetBubbles(
             const Shasta2AnchorGraph&,
             Shasta2Anchors&,
             uint64_t minCommonForHet,
+            double hetErrorRate,
             uint64_t threadCount = 0);
 
         using Shasta2AnchorGraphBaseClass = boost::adjacency_list<

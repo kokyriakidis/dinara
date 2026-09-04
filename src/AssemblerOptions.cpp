@@ -1200,6 +1200,17 @@ void AssemblerOptions::addConfigurableOptions()
         "detection (enabled with DINARA_HET_ON_GRAPH=1). "
         "(Mode 3 assembly only).")
 
+        ("Assembly.mode3.hetErrorRate",
+        value<double>(&assemblyOptions.mode3Options.hetErrorRate)->
+        default_value(0.025, "0.025"),
+        "Assumed per-read sequencing error rate for the per-edge MSA het "
+        "detector's allele significance test (one-sided binomial test "
+        "against the run's dominant allele, myloasm-style; p <= 0.05 "
+        "accepts an allele as real). Used only by the experimental "
+        "per-edge het detector (DINARA_HET_ON_GRAPH=1), not hetMinVaf/"
+        "hetMinSupport, which are for the per-window abPOA MSA path. "
+        "(Mode 3 assembly only).")
+
         ("Assembly.mode3.minWindowBaseSpan",
         value<uint64_t>(&assemblyOptions.mode3Options.minWindowBaseSpan)->
         default_value(1000),
@@ -1646,6 +1657,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";
+    s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
     s << "mode3.hetMinVaf = " << hetMinVaf << "\n";
     s << "mode3.hetMinSupport = " << hetMinSupport << "\n";

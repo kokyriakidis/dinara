@@ -2573,10 +2573,12 @@ void dinara::main::assemble(
 
         const uint64_t minCommonForHet =
             assemblerOptions.assemblyOptions.mode3Options.minCommonForHet;
+        const double hetErrorRate =
+            assemblerOptions.assemblyOptions.mode3Options.hetErrorRate;
         cout << timestamp << "transcribeHetBubbles: minCommonForHet="
-             << minCommonForHet << "..." << endl;
+             << minCommonForHet << ", hetErrorRate=" << hetErrorRate << "..." << endl;
         const HetOnGraphResult res = transcribeHetBubbles(
-            detectionGraph, *shasta2Anchors, minCommonForHet, threadCount);
+            detectionGraph, *shasta2Anchors, minCommonForHet, hetErrorRate, threadCount);
         cout << timestamp << "transcribeHetBubbles results:\n"
              << "  edges total:             " << res.edgesTotal << "\n"
              << "  edges skipped (RC mirror processed instead): " << res.edgesSkippedMirror << "\n"
