@@ -259,8 +259,8 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
             continue;
         }
 
-        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
-        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorIdB;
 
         if(!vertexMap.contains(anchorId0)) {
             const vertex_descriptor v0 = add_vertex(
@@ -284,8 +284,8 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
             continue;
         }
 
-        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
-        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorIdB;
         const vertex_descriptor v0 = vertexMap.at(anchorId0);
         const vertex_descriptor v1 = vertexMap.at(anchorId1);
 
@@ -299,7 +299,7 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
 
         for(const Shasta2AnchorGraph::edge_descriptor eA: chain) {
             const Shasta2AnchorGraphEdge& edgeA = anchorGraph[eA];
-            edge.emplace_back(edgeA.anchorPair, edgeA.offset);
+            edge.emplace_back(anchorGraph.getAnchorPair(eA), edgeA.offset);
         }
     }
 
@@ -356,8 +356,8 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
             continue;
         }
 
-        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
-        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorIdB;
 
         if(!vertexMap.contains(anchorId0)) {
             const vertex_descriptor v0 = add_vertex(
@@ -382,8 +382,8 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
             continue;
         }
 
-        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorPair.anchorIdA;
-        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorPair.anchorIdB;
+        const Shasta2AnchorId anchorId0 = anchorGraph[chain.front()].anchorIdA;
+        const Shasta2AnchorId anchorId1 = anchorGraph[chain.back()].anchorIdB;
         const vertex_descriptor v0 = vertexMap.at(anchorId0);
         const vertex_descriptor v1 = vertexMap.at(anchorId1);
 
@@ -398,14 +398,14 @@ Shasta2AssemblyGraph::Shasta2AssemblyGraph(
         // Build the anchor chain and steps simultaneously.
         for(const Shasta2AnchorGraph::edge_descriptor eA: chain) {
             const Shasta2AnchorGraphEdge& edgeA = anchorGraph[eA];
-            edge.emplace_back(edgeA.anchorPair, edgeA.offset);
+            edge.emplace_back(anchorGraph.getAnchorPair(eA), edgeA.offset);
 
             // Add the source anchor of this step to the chain.
             // (The target of the last step is added after the loop.)
-            edge.anchorChain.push_back(edgeA.anchorPair.anchorIdA);
+            edge.anchorChain.push_back(edgeA.anchorIdA);
         }
         // Add the final anchor (target of the last step).
-        edge.anchorChain.push_back(anchorGraph[chain.back()].anchorPair.anchorIdB);
+        edge.anchorChain.push_back(anchorGraph[chain.back()].anchorIdB);
     }
 
     check();

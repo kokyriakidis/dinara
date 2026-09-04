@@ -79,9 +79,26 @@ namespace dinara {
             Shasta2AnchorGraphEdge>;
 }
 
+// An edge's oriented-read-ids live in Shasta2AnchorGraph::orientedReadIds
+// (one arena shared by every edge in the graph, exactly like upstream
+// shasta2's AnchorGraph), not embedded per edge -- each edge stores only the
+// begin/end indices of its own slice. This is a storage-layout choice, not a
+// construction-rule difference: a graph with hundreds of thousands of edges
+// previously gave each one its own independently heap-allocated
+// vector<OrientedReadId>, which is real fragmentation and per-vector
+// overhead at that scale. Get a usable Shasta2AnchorPair back out via
+// Shasta2AnchorGraph::getAnchorPair(edge_descriptor), which reconstructs one
+// (with its own owned copy of the read-id slice, same as before) on demand.
 class dinara::Shasta2AnchorGraphEdge {
 public:
-    Shasta2AnchorPair anchorPair;
+    Shasta2AnchorId anchorIdA = invalid<Shasta2AnchorId>;
+    Shasta2AnchorId anchorIdB = invalid<Shasta2AnchorId>;
+
+    // Begin/end indexes in Shasta2AnchorGraph::orientedReadIds for the
+    // OrientedReadIds that belong to this edge.
+    uint64_t orientedReadIdsBegin = invalid<uint64_t>;
+    uint64_t orientedReadIdsEnd = invalid<uint64_t>;
+
     uint64_t offset = invalid<uint64_t>;
     uint64_t id = invalid<uint64_t>;
     bool useForAssembly = false;
@@ -96,19 +113,31 @@ public:
     // (not just the reads using this specific anchor pair).
     uint64_t sharedReadCount = 0;
 
-    Shasta2AnchorGraphEdge(const Shasta2AnchorPair& anchorPair, uint64_t offset, uint64_t id) :
-        anchorPair(anchorPair),
+    Shasta2AnchorGraphEdge(
+        Shasta2AnchorId anchorIdA,
+        Shasta2AnchorId anchorIdB,
+        uint64_t orientedReadIdsBegin,
+        uint64_t orientedReadIdsEnd,
+        uint64_t offset,
+        uint64_t id) :
+        anchorIdA(anchorIdA),
+        anchorIdB(anchorIdB),
+        orientedReadIdsBegin(orientedReadIdsBegin),
+        orientedReadIdsEnd(orientedReadIdsEnd),
         offset(offset),
         id(id)
     {}
 
     Shasta2AnchorGraphEdge() {}
 
-    uint64_t coverage() const {return anchorPair.size();}
+    uint64_t coverage() const {return orientedReadIdsEnd - orientedReadIdsBegin;}
 
     template<class Archive> void serialize(Archive& ar, unsigned int /* version */)
     {
-        ar & anchorPair;
+        ar & anchorIdA;
+        ar & anchorIdB;
+        ar & orientedReadIdsBegin;
+        ar & orientedReadIdsEnd;
         ar & offset;
         ar & id;
         ar & useForAssembly;
@@ -163,6 +192,51 @@ public:
     Shasta2AnchorGraph(const MappedMemoryOwner&, const string& name);
 
     uint64_t nextEdgeId = 0;
+
+    // To reduce memory fragmentation, the OrientedReadIds of all edges are
+    // stored together in this vector (one arena for the whole graph), rather
+    // than each edge owning its own vector -- see Shasta2AnchorGraphEdge's
+    // comment. Shasta2AnchorGraphEdge::orientedReadIdsBegin/End index into it.
+    vector<OrientedReadId> orientedReadIds;
+
+    // Reconstruct a usable Shasta2AnchorPair for an edge (its own owned copy
+    // of the read-id slice, exactly as if it had never left one). Mirrors
+    // shasta2's own AnchorGraph::getAnchorPair.
+    Shasta2AnchorPair getAnchorPair(edge_descriptor e) const
+    {
+        const Shasta2AnchorGraphEdge& edge = (*this)[e];
+        return Shasta2AnchorPair(
+            edge.anchorIdA,
+            edge.anchorIdB,
+            span<const OrientedReadId>(
+                orientedReadIds.begin() + edge.orientedReadIdsBegin,
+                orientedReadIds.begin() + edge.orientedReadIdsEnd));
+    }
+
+    // Append edgeOrientedReadIds to the shared arena and add the edge.
+    // Centralizes nextEdgeId assignment and useForAssembly, matching what
+    // every construction call site used to do by hand.
+    edge_descriptor addEdge(
+        Shasta2AnchorId anchorIdA,
+        Shasta2AnchorId anchorIdB,
+        const vector<OrientedReadId>& edgeOrientedReadIds,
+        uint64_t offset,
+        bool useForAssembly = true)
+    {
+        const uint64_t begin = orientedReadIds.size();
+        orientedReadIds.insert(orientedReadIds.end(),
+            edgeOrientedReadIds.begin(), edgeOrientedReadIds.end());
+        const uint64_t end = orientedReadIds.size();
+        Shasta2AnchorGraph& anchorGraph = *this;
+        edge_descriptor e;
+        bool added = false;
+        boost::tie(e, added) = boost::add_edge(
+            anchorIdA, anchorIdB,
+            Shasta2AnchorGraphEdge(anchorIdA, anchorIdB, begin, end, offset, nextEdgeId++),
+            anchorGraph);
+        anchorGraph[e].useForAssembly = useForAssembly;
+        return e;
+    }
 
     void transitiveReduction(
         uint64_t transitiveReductionMaxEdgeCoverage,
@@ -271,6 +345,7 @@ public:
     template<class Archive> void serialize(Archive& ar, unsigned int /* version */)
     {
         ar & boost::serialization::base_object<Shasta2AnchorGraphBaseClass>(*this);
+        ar & orientedReadIds;
     }
     void save(ostream&) const;
     void load(istream&);

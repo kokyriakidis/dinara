@@ -6,6 +6,7 @@
 #include "ReadId.hpp"
 
 // Standard library.
+#include "span.hpp"
 #include "utility.hpp"
 #include "vector.hpp"
 
@@ -43,6 +44,21 @@ public:
     Shasta2AnchorPair() = default;
     Shasta2AnchorPair(const Shasta2AnchorPair&) = default;
     Shasta2AnchorPair& operator=(const Shasta2AnchorPair&) = default;
+
+    // Direct construction from already-known data -- no computation, the
+    // caller is responsible for correctness. Used to reconstruct a pair from
+    // an AnchorGraph edge's stored (anchorIdA, anchorIdB) plus its index
+    // range into the graph's shared orientedReadIds arena (see
+    // Shasta2AnchorGraph::getAnchorPair), mirroring shasta2's own
+    // AnchorPair(AnchorId, AnchorId, span<const OrientedReadId>) constructor.
+    Shasta2AnchorPair(
+        Shasta2AnchorId anchorIdA,
+        Shasta2AnchorId anchorIdB,
+        span<const OrientedReadId> orientedReadIds) :
+        anchorIdA(anchorIdA),
+        anchorIdB(anchorIdB),
+        orientedReadIds(orientedReadIds.begin(), orientedReadIds.end())
+    {}
 
     // This finds AnchorPairs as follows:
     // - anchorIdA is as specified.

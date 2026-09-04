@@ -495,8 +495,7 @@ HetOnGraphResult dinara::transcribeHetBubbles(
             if(ei >= edgeCount) break;
 
             const Shasta2AnchorGraph::edge_descriptor e = edgeList[ei];
-            const Shasta2AnchorGraphEdge& edge = graph[e];
-            const Shasta2AnchorPair& anchorPair = edge.anchorPair;
+            const Shasta2AnchorPair anchorPair = graph.getAnchorPair(e);
 
             // Detect each real site once. Edge (A, B) and its RC mirror
             // (B^1, A^1) are the same physical bubble seen from opposite

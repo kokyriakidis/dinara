@@ -85,13 +85,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
                 continue;
             }
             DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
-            edge_descriptor e;
-            tie(e, ignore) = add_edge(
+            anchorGraph.addEdge(
                 anchorPair.anchorIdA,
                 anchorPair.anchorIdB,
-                Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-                anchorGraph);
-            anchorGraph[e].useForAssembly = true;
+                anchorPair.orientedReadIds,
+                anchorPair.getAverageOffset(anchors));
         }
     }
 
@@ -332,13 +330,11 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             return false;
         }
         DINARA_ASSERT(anchors.countCommon(anchorIdA, anchorIdB) > 0);
-        edge_descriptor e;
-        tie(e, ignore) = add_edge(
+        anchorGraph.addEdge(
             anchorPair.anchorIdA,
             anchorPair.anchorIdB,
-            Shasta2AnchorGraphEdge(anchorPair, anchorPair.getAverageOffset(anchors), nextEdgeId++),
-            anchorGraph);
-        anchorGraph[e].useForAssembly = true;
+            anchorPair.orientedReadIds,
+            anchorPair.getAverageOffset(anchors));
         return true;
     };
 
@@ -424,12 +420,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
             else                        ++hetEdgesDroppedNegOffset;
             return false;
         }
-        edge_descriptor e;
-        tie(e, ignore) = add_edge(
-            idA, idB,
-            Shasta2AnchorGraphEdge(pair, nominalOffset, nextEdgeId++),
-            anchorGraph);
-        anchorGraph[e].useForAssembly = true;
+        anchorGraph.addEdge(idA, idB, pair.orientedReadIds, nominalOffset);
         return true;
     };
 
@@ -2836,7 +2827,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
     {
         uint64_t emptyEdgeCount = 0;
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraph) {
-            if(anchorGraph[e].anchorPair.orientedReadIds.empty()) {
+            if(anchorGraph[e].coverage() == 0) {
                 ++emptyEdgeCount;
             }
         }
@@ -2888,7 +2879,7 @@ Shasta2AnchorGraph::Shasta2AnchorGraph(
         BGL_FORALL_EDGES(e, anchorGraph, Shasta2AnchorGraphBaseClass) {
             const auto& dEdge = anchorGraph[e];
             if(!dEdge.useForAssembly) continue;
-            const auto& ap = dEdge.anchorPair;
+            const Shasta2AnchorPair ap = anchorGraph.getAnchorPair(e);
             if(ap.orientedReadIds.empty()) continue;
 
             const Shasta2Anchor anchorA = anchors[ap.anchorIdA];
@@ -3833,13 +3824,10 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                     if(bypassPair.size() > 0) {
 
                         // Create forward edge.
-                        edge_descriptor eBypass;
-                        tie(eBypass, ignore) = add_edge(
-                            uint64_t(bypassFrom), uint64_t(bypassTo),
-                            Shasta2AnchorGraphEdge(bypassPair,
-                                bypassPair.getAverageOffset(anchors), nextEdgeId++),
-                            anchorGraph);
-                        anchorGraph[eBypass].useForAssembly = true;
+                        anchorGraph.addEdge(
+                            bypassFrom, bypassTo,
+                            bypassPair.orientedReadIds,
+                            bypassPair.getAverageOffset(anchors));
 
                         // Create RC mirror edge.
                         const Shasta2AnchorId rcFrom = Shasta2AnchorId(uint64_t(bypassFrom) ^ 1ULL);
@@ -3848,13 +3836,10 @@ uint64_t Shasta2AnchorGraph::removeInternalConnections(
                             Shasta2AnchorPair rcPair(anchors, rcTo, rcFrom, false);
                             rcPair.assertNoNegativeOffsets(anchors);
                             if(rcPair.size() > 0) {
-                                edge_descriptor eRc;
-                                tie(eRc, ignore) = add_edge(
-                                    uint64_t(rcTo), uint64_t(rcFrom),
-                                    Shasta2AnchorGraphEdge(rcPair,
-                                        rcPair.getAverageOffset(anchors), nextEdgeId++),
-                                    anchorGraph);
-                                anchorGraph[eRc].useForAssembly = true;
+                                anchorGraph.addEdge(
+                                    rcTo, rcFrom,
+                                    rcPair.orientedReadIds,
+                                    rcPair.getAverageOffset(anchors));
                             }
                         }
                         ++totalBypasses;

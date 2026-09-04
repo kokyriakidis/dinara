@@ -2796,8 +2796,8 @@ void dinara::main::assemble(
                 auto edgeRange = boost::edges(*assembler.shasta2AnchorGraph);
                 for(auto it = edgeRange.first; it != edgeRange.second; ++it) {
                     const auto& edge = (*assembler.shasta2AnchorGraph)[*it];
-                    const uint64_t a = edge.anchorPair.anchorIdA;
-                    const uint64_t b = edge.anchorPair.anchorIdB;
+                    const uint64_t a = edge.anchorIdA;
+                    const uint64_t b = edge.anchorIdB;
                     const uint64_t declaredCoverage = edge.coverage();
                     const auto tallyIt = independentTally.find((a << 32) | b);
                     ++edgesChecked;

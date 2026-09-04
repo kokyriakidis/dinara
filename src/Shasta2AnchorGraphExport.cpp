@@ -137,9 +137,11 @@ void Shasta2AnchorGraph::saveForShasta2(
     //
     // A backward shared read is not an error: it is a repeat/paralog/inversion
     // signature and is NOT written to this edge. The per-edge read list below is
-    // dEdge.anchorPair.orientedReadIds, which the Shasta2AnchorPair builder
-    // already restricted to reads that are forward on the pair (positionInJourney
-    // is the position-sorted rank, so backward reads are excluded). shasta2 then
+    // dinaraGraph.orientedReadIds[dEdge.orientedReadIdsBegin,
+    // dEdge.orientedReadIdsEnd), which the Shasta2AnchorPair builder that
+    // populated it already restricted to reads that are forward on the pair
+    // (positionInJourney is the position-sorted rank, so backward reads are
+    // excluded). shasta2 then
     // (a) uses that forward-only list verbatim in getAverageOffset and
     // (b) rebuilds each read's journey by sorting its anchors by position, so a
     // backward read yields its own valid increasing journey. Earlier this pass
@@ -190,8 +192,8 @@ void Shasta2AnchorGraph::saveForShasta2(
         // skipped (shasta2 will not see it). A backward read is counted, not
         // fatal: it is excluded from this edge's serialized read list below.
         {
-            const Shasta2Anchor anchorA = anchors[dEdge.anchorPair.anchorIdA];
-            const Shasta2Anchor anchorB = anchors[dEdge.anchorPair.anchorIdB];
+            const Shasta2Anchor anchorA = anchors[dEdge.anchorIdA];
+            const Shasta2Anchor anchorB = anchors[dEdge.anchorIdB];
             auto itA = anchorA.begin();
             auto itB = anchorB.begin();
             const auto endA = anchorA.end();
@@ -200,8 +202,8 @@ void Shasta2AnchorGraph::saveForShasta2(
                 if(itA->orientedReadId < itB->orientedReadId) { ++itA; continue; }
                 if(itB->orientedReadId < itA->orientedReadId) { ++itB; continue; }
                 const ReadId sharedReadId = itA->orientedReadId.getReadId();
-                if(isDroppedFromAnchor(dEdge.anchorPair.anchorIdA, sharedReadId) ||
-                   isDroppedFromAnchor(dEdge.anchorPair.anchorIdB, sharedReadId)) {
+                if(isDroppedFromAnchor(dEdge.anchorIdA, sharedReadId) ||
+                   isDroppedFromAnchor(dEdge.anchorIdB, sharedReadId)) {
                     ++itA;
                     ++itB;
                     continue;
@@ -230,10 +232,11 @@ void Shasta2AnchorGraph::saveForShasta2(
         // anchor (journey-tie resolution) would fail its terminal
         // it == orientedReadIds.end() assertion.
         const uint64_t begin = shastaGraph.orientedReadIds.size();
-        for(const auto& rid : dEdge.anchorPair.orientedReadIds) {
+        for(uint64_t idx = dEdge.orientedReadIdsBegin; idx < dEdge.orientedReadIdsEnd; idx++) {
+            const OrientedReadId rid = dinaraGraph.orientedReadIds[idx];
             const ReadId readId = rid.getReadId();
-            if(isDroppedFromAnchor(dEdge.anchorPair.anchorIdA, readId) ||
-               isDroppedFromAnchor(dEdge.anchorPair.anchorIdB, readId)) {
+            if(isDroppedFromAnchor(dEdge.anchorIdA, readId) ||
+               isDroppedFromAnchor(dEdge.anchorIdB, readId)) {
                 ++droppedEdgeReadCount;
                 continue;
             }
@@ -258,8 +261,8 @@ void Shasta2AnchorGraph::saveForShasta2(
         }
 
         shasta2::AnchorGraphEdge shastaEdge(
-            dEdge.anchorPair.anchorIdA,
-            dEdge.anchorPair.anchorIdB,
+            dEdge.anchorIdA,
+            dEdge.anchorIdB,
             begin, end,
             dEdge.id,
             /* useForAssembly */ true);

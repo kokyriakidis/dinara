@@ -70,7 +70,7 @@ Shasta2LocalAnchorGraph::Shasta2LocalAnchorGraph(
             if(edgesMarkedForAssembly and (not anchorGraph[eG].useForAssembly)) {
                 continue;
             }
-            if(anchorGraph[eG].anchorPair.size() < minCoverage) {
+            if(anchorGraph[eG].coverage() < minCoverage) {
             	continue;
             }
             const Shasta2AnchorGraph::vertex_descriptor v1G = target(eG, anchorGraph);
@@ -93,7 +93,7 @@ Shasta2LocalAnchorGraph::Shasta2LocalAnchorGraph(
             if(edgesMarkedForAssembly and (not anchorGraph[eG].useForAssembly)) {
                 continue;
             }
-            if(anchorGraph[eG].anchorPair.size() < minCoverage) {
+            if(anchorGraph[eG].coverage() < minCoverage) {
             	continue;
             }
             const Shasta2AnchorGraph::vertex_descriptor v1G = source(eG, anchorGraph);
@@ -128,7 +128,7 @@ Shasta2LocalAnchorGraph::Shasta2LocalAnchorGraph(
             if(edgesMarkedForAssembly and (not anchorGraph[eG].useForAssembly)) {
                 continue;
             }
-            if(anchorGraph[eG].anchorPair.size() < minCoverage) {
+            if(anchorGraph[eG].coverage() < minCoverage) {
             	continue;
             }
             const Shasta2AnchorGraph::vertex_descriptor v1G = target(eG, anchorGraph);
@@ -327,7 +327,7 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
 
         const Shasta2AnchorGraph::edge_descriptor eG = edge.eG;
         const Shasta2AnchorGraphEdge& edgeG = anchorGraph[eG];
-        const Shasta2AnchorPair& anchorPair = edgeG.anchorPair;
+        const Shasta2AnchorPair anchorPair = anchorGraph.getAnchorPair(eG);
         DINARA_ASSERT(anchorPair.anchorIdA == anchorId0);
         DINARA_ASSERT(anchorPair.anchorIdB == anchorId1);
 
@@ -995,7 +995,7 @@ void Shasta2LocalAnchorGraph::writeEdges(
     BGL_FORALL_EDGES(eL, graph, Shasta2LocalAnchorGraph) {
         const Shasta2LocalAnchorGraphEdge& edgeL = graph[eL];
         const Shasta2AnchorGraphEdge& edgeG = anchorGraph[edgeL.eG];
-        const Shasta2AnchorPair& anchorPair = edgeG.anchorPair;
+        const Shasta2AnchorPair anchorPair = anchorGraph.getAnchorPair(edgeL.eG);
         const uint64_t coverage = anchorPair.orientedReadIds.size();
         const uint64_t offset = edgeG.offset;
 
@@ -1071,8 +1071,7 @@ void Shasta2LocalAnchorGraph::writeEdges(
     BGL_FORALL_EDGES(eL, graph, Shasta2LocalAnchorGraph) {
         const Shasta2LocalAnchorGraphEdge& edgeL = graph[eL];
         const Shasta2AnchorGraphEdge& edgeG = anchorGraph[edgeL.eG];
-        const Shasta2AnchorPair& anchorPair = edgeG.anchorPair;
-        const uint64_t coverage = anchorPair.orientedReadIds.size();
+        const uint64_t coverage = edgeG.coverage();
 
         const vertex_descriptor v0 = source(eL, graph);
         const vertex_descriptor v1 = target(eL, graph);
