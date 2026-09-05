@@ -1724,31 +1724,48 @@ void dinara::main::assemble(
     // selection so (a) the reused filter's k-mer counts correspond to the
     // minimizers being filtered and (b) hifiasm's native chain anchors land 1:1
     // on dinara marker positions.
-    // raw_candidates skips hifiasm's own base-level alignment (gen_hc_r_alin_ea)
-    // entirely -- only the lightweight chainer (h_ec_lchain) runs -- since
-    // nothing downstream consumes hifiasm's CIGAR: markers/anchors are built
-    // from the native chain alone (createMarkersFromNativeChain), and dinara's
-    // own base-alignment layer already runs chain-only by default
-    // (AlignOptions.computeBaseAlignmentCigar == false). This is the same
-    // "raw pre-alignment candidate set" mode tests/hifiasm_overlap_parity.sh
-    // verifies against real hifiasm's own --dbg-ovec output. The one thing
-    // this mode changes that dinara must compensate for itself: hifiasm's
-    // aligned path forward-adjusts a reverse-strand overlap's t_start/t_end to
-    // natural-forward coordinates as part of alignment; the raw path never
-    // does that (there is no alignment step to do it in), so
-    // importAlignmentCandidatesFromMemory is told via rawCandidates below to
-    // undo the missing adjustment itself -- see its Assembler.hpp comment.
+    // Align.useHifiasmBaseAlignment (default true) selects hifiasm's ALIGNED
+    // overlap path: candidate detection followed by gen_hc_r_alin_ea's
+    // base-level alignment and filter. That path is the default because it is
+    // the only source of hifiasm's per-overlap CIGAR, and that CIGAR is the one
+    // thing dinara cannot reconstruct for itself: it spans the full overlap BOX
+    // (x_pos_s..x_pos_e), which chaining extends outward along the diagonal to a
+    // read end (Hash_Table.cpp), whereas dinara's own A*PA2 layer can only align
+    // BETWEEN consecutive chain anchors and so never covers the flanks. Measured
+    // on the GIAB fixture: box 11337 bases vs chain span 9472. With a CIGAR over
+    // the whole box, any position in it can be mapped between the two reads
+    // (OverlapCigarStore::queryToTarget), which chain-only alignment cannot do.
+    //
+    // The costs this buys, both measured on the same fixture: hifiasm's
+    // alignment adds ~1.09 s to overlap detection, and its filter drops the
+    // candidate set from 47146 to 29851 (overlaps whose windows fail to align).
+    // The CIGARs are not separable from the filter -- both come from the aligned
+    // path -- so taking one means taking the other.
+    //
+    // Setting this false restores the raw pre-alignment candidate set (only
+    // h_ec_lchain runs, no CIGAR): faster and more permissive, and the mode
+    // tests/hifiasm_overlap_parity.sh verifies against real hifiasm's own
+    // --dbg-ovec output. The one thing the raw mode changes that dinara must
+    // compensate for itself: hifiasm's aligned path forward-adjusts a
+    // reverse-strand overlap's t_start/t_end to natural-forward coordinates as
+    // part of alignment; the raw path never does that (there is no alignment
+    // step to do it in), so importAlignmentCandidatesFromMemory is told via
+    // rawCandidates below to undo the missing adjustment itself -- see its
+    // Assembler.hpp comment.
     hifiasm_ovlp_opt_t hifiOpt = {};
     hifiOpt.threads        = int(threadCount);
     hifiOpt.no_hpc         = 1;
     hifiOpt.k_mer_length   = markerK;
     hifiOpt.mz_win         = markerK;
     hifiOpt.filter         = overlapReuseFilter;
-    hifiOpt.raw_candidates = 1;
+    hifiOpt.raw_candidates =
+        assemblerOptions.alignOptions.useHifiasmBaseAlignment ? 0 : 1;
     performanceLog << timestamp
         << "Overlap detection: no-HPC, k=w=" << markerK
-        << ", reusing prebuilt marker filter, raw candidates only "
-        << "(no base-level alignment)." << endl;
+        << ", reusing prebuilt marker filter, "
+        << (hifiOpt.raw_candidates ?
+            "raw candidates only (no base-level alignment)." :
+            "WITH hifiasm base-level alignment.") << endl;
 
     hifiasm_overlap_t* ov = nullptr;
     uint64_t nOv = 0;
@@ -2561,7 +2578,9 @@ void dinara::main::assemble(
     // any other het/hom anchors some other pass might append for a purpose
     // that doesn't include internal graph participation.
     const Shasta2AnchorId newAnchorsBegin = shasta2Anchors->size();
-    {
+    const bool doTranscribeHetBubbles =
+        assemblerOptions.assemblyOptions.mode3Options.transcribeHetBubbles;
+    if(doTranscribeHetBubbles) {
         cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
              << "(detection pass, consecutive-anchor edges, minEdgeCoverage="
              << minEdgeCoverage << ")..." << endl;
@@ -2598,10 +2617,16 @@ void dinara::main::assemble(
              << endl;
         // detectionGraph goes out of scope here -- superseded by the graph
         // rebuilt from the updated journeys below.
-    }
 
-    cout << timestamp << "Rebuilding journeys to include new het anchors..." << endl;
-    shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
+        cout << timestamp << "Rebuilding journeys to include new het anchors..." << endl;
+        shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
+    } else {
+        cout << timestamp << "Het-bubble transcription disabled "
+             << "(Assembly.mode3.transcribeHetBubbles false): building the "
+             << "anchor graph once from the journeys, no het anchors created."
+             << endl;
+        static_cast<void>(newAnchorsBegin);
+    }
     cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
          << "(final pass, minEdgeCoverage=" << minEdgeCoverage << ")..." << endl;
     assembler.shasta2AnchorGraph = make_shared<Shasta2AnchorGraph>(

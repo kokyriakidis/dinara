@@ -267,6 +267,29 @@ public:
     double errorRate() const;
     double errorRateGaps() const;
     double errorRateRle() const;
+
+    // Fraction of the anchored query span that lies in windows which
+    // individually aligned within their error budget. This is a port of
+    // hifiasm's overlap acceptance rule (align_hc_ed_post_extz + pass_qovlp in
+    // Correct.cpp): the query is cut into windows of windowLength on a global
+    // grid, each window allows floor(windowQueryLength * windowErrorRate)
+    // errors -- bumped to 1 for a zero budget on a window of >= 4 bases
+    // (hifiasm's Adjust_Threshold) and capped at maxWindowErrors (hifiasm's
+    // THRESHOLD_MAX_SIZE, the aligner's band limit) -- and a window that stays
+    // within its budget contributes its full query length.
+    //
+    // Unlike hifiasm this measures only the ANCHORED span (first to last chain
+    // anchor); hifiasm additionally extends past the anchors and counts those
+    // bases, where divergence is highest. So this is systematically more
+    // permissive than hifiasm at the same rate, by design.
+    //
+    // Requires constructQuickRawSparse() to have run: it reads sparseMismatches
+    // and sparseIndels, so it is meaningless (returns 0) after
+    // constructChainOnly().
+    double alignedWindowFraction(
+        uint32_t windowLength,
+        double windowErrorRate,
+        uint32_t maxWindowErrors) const;
     double Q() const;
     double QRle() const;
 

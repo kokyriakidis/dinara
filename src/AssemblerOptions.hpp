@@ -256,6 +256,29 @@ public:
     // this flag only gates whether it runs.
     bool computeBaseAlignmentCigar = false;
 
+    // Run hifiasm's aligned overlap path (candidate detection + base-level
+    // alignment + filter) rather than the raw pre-alignment candidate set. True
+    // by default: it is the only source of hifiasm's per-overlap CIGAR, which
+    // spans the full overlap box including the flanks that chaining extends
+    // past the outermost anchor -- a span dinara's own A*PA2 layer cannot reach,
+    // since it only aligns between consecutive chain anchors. See the long
+    // comment at the hifiOpt setup in srcMain/main.cpp for the measured costs
+    // (slower overlap detection, a smaller candidate set) and why the CIGARs and
+    // the filtering cannot be taken separately.
+    bool useHifiasmBaseAlignment = true;
+
+    // Windowed overlap acceptance, a port of hifiasm's align_hc_ed_post_extz +
+    // pass_qovlp rule (see ProjectedAlignment::alignedWindowFraction). Unlike
+    // maxErrorRate, which is a single average over the whole overlap, this is a
+    // LOCAL criterion: an overlap that averages well but contains one badly
+    // diverging stretch fails it. Both filters are applied; they reject
+    // different alignments.
+    //
+    // Inactive unless computeBaseAlignmentCigar is true (there are no base-level
+    // errors to window without it), and disabled outright by a fraction of 0.
+    uint32_t alignmentWindowLength = 375;           // hifiasm WINDOW_OHC (ONT)
+    double minAlignedWindowFraction = 0.9;          // hifiasm OVERLAP_THRESHOLD_HIFI_FILTER
+
     // Overlap/base DP scoring parameters (used to compute AlignmentInfo::dpScore from a base-level CIGAR).
     // These should be configured to match hifiasm's overlap-alignment scoring model.
     // Current hifiasm overlap scoring is single-affine: gapCost(k) = O1 + k*E1.
@@ -490,6 +513,16 @@ public:
     // isolate well-supported anchors whose reads reach a neighbor through
     // intermediate anchors.
     uint64_t minJourneyEdgeCoverage;
+
+    // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
+    // anchor graph, append a het anchor per detected allele, rebuild journeys,
+    // and rebuild the anchor graph. False by default: the current pipeline
+    // stops at collapsing hifiasm's filtered overlaps into anchors and
+    // exporting them, leaving locus disambiguation to shasta2's downstream
+    // read-following, which sees whole journeys rather than one edge at a time.
+    // With this false the anchor graph is built ONCE from the journeys and no
+    // het anchor is ever created, so every mode3 het* option below is inert.
+    bool transcribeHetBubbles = false;
 
     // Minimum anchor-pair coverage (common two-sided reads) for an
     // anchor-graph edge to be considered for per-edge MSA het detection

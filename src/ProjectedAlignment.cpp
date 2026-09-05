@@ -1219,6 +1219,77 @@ double ProjectedAlignment::errorRate() const
 
 
 
+double ProjectedAlignment::alignedWindowFraction(
+    uint32_t windowLength,
+    double windowErrorRate,
+    uint32_t maxWindowErrors) const
+{
+    if(windowLength == 0) return 0.;
+    if(cigarRead0End <= cigarRead0Start) return 0.;
+    const uint32_t spanBegin = cigarRead0Start;
+    const uint32_t spanEnd   = cigarRead0End;
+    const uint32_t span      = spanEnd - spanBegin;
+
+    // Windows sit on a global grid of multiples of windowLength, exactly like
+    // hifiasm's get_win_se_by_normalize_xs((x_pos_s/w_l)*w_l, ...): the first
+    // window is truncated at spanBegin rather than starting there, so two
+    // overlaps covering the same locus get the same window boundaries.
+    const uint32_t gridBegin = (spanBegin / windowLength) * windowLength;
+    const uint64_t windowCount =
+        (uint64_t(spanEnd - gridBegin) + windowLength - 1) / windowLength;
+    if(windowCount == 0) return 0.;
+
+    // Error count per window, attributed by query position.
+    vector<uint32_t> windowErrors(windowCount, 0);
+    auto windowOf = [&](uint32_t queryPosition) -> uint64_t {
+        // Clamp: an indel recorded at the span end must not fall off the array.
+        if(queryPosition < spanBegin) queryPosition = spanBegin;
+        if(queryPosition >= spanEnd) queryPosition = spanEnd - 1;
+        return (queryPosition - gridBegin) / windowLength;
+    };
+
+    // Each mismatch is one error at its own query position.
+    for(const ProjectedAlignmentSparseMismatch& mismatch: sparseMismatches) {
+        windowErrors[windowOf(mismatch.position0)]++;
+    }
+
+    for(const ProjectedAlignmentSparseIndel& indel: sparseIndels) {
+        if(indel.op == 'D') {
+            // A*PA2 'D' consumes read0/query, so its bases span query
+            // positions [position0, position0 + length) and can straddle a
+            // window boundary -- charge each base to the window it lands in.
+            for(uint32_t i = 0; i < indel.length; i++) {
+                windowErrors[windowOf(indel.position0 + i)]++;
+            }
+        } else {
+            // 'I' consumes read1/target only: it occupies no query bases, so
+            // the whole event is charged to the window holding its query
+            // position.
+            windowErrors[windowOf(indel.position0)] += indel.length;
+        }
+    }
+
+    // A window passes if it stayed within its error budget; passing windows
+    // contribute their full query length (hifiasm: z->align_length += ql).
+    uint64_t alignedLength = 0;
+    for(uint64_t w = 0; w < windowCount; w++) {
+        const uint32_t windowBegin = max(spanBegin, uint32_t(gridBegin + w * windowLength));
+        const uint32_t windowEnd   = min(spanEnd, uint32_t(gridBegin + (w + 1) * windowLength));
+        if(windowEnd <= windowBegin) continue;
+        const uint32_t windowQueryLength = windowEnd - windowBegin;
+
+        uint32_t threshold = uint32_t(double(windowQueryLength) * windowErrorRate);
+        if(threshold == 0 && windowQueryLength >= 4) threshold = 1;   // Adjust_Threshold
+        if(threshold > maxWindowErrors) threshold = maxWindowErrors;  // THRESHOLD_MAX_SIZE
+
+        if(windowErrors[w] <= threshold) alignedLength += windowQueryLength;
+    }
+
+    return double(alignedLength) / double(span);
+}
+
+
+
 double ProjectedAlignment::errorRateGaps() const
 {
     // One-sided denominator, consistent with errorRate().

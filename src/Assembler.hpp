@@ -1434,6 +1434,10 @@ private:
         vector<uint64_t> threadFilteredByErrorRate;
         vector<uint64_t> threadFilteredByErrorRateGap;
         vector<uint64_t> threadFilteredByGapCount;
+        // Candidates rejected by the windowed (local) overlap filter, i.e. those
+        // that passed the average error rate but failed
+        // Align.minAlignedWindowFraction.
+        vector<uint64_t> threadFilteredByWindowFraction;
 
         // mapNativeChainToOrdinals verification: how much of hifiasm's native
         // chain survives the position lookup + monotone filter into markers.

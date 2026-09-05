@@ -20,6 +20,7 @@
 // Standard libraries.
 #include "chrono.hpp"
 #include <cmath>
+
 #include <filesystem>
 #include "iterator.hpp"
 #include "tuple.hpp"
@@ -184,6 +185,7 @@ void Assembler::computeBaseAlignmentsAndStore(
     data.threadFilteredByErrorRate.assign(threadCount, 0);
     data.threadFilteredByErrorRateGap.assign(threadCount, 0);
     data.threadFilteredByGapCount.assign(threadCount, 0);
+    data.threadFilteredByWindowFraction.assign(threadCount, 0);
     data.threadChainAnchorsIn.assign(threadCount, 0);
     data.threadChainAnchorsMapped.assign(threadCount, 0);
     data.threadDroppedEmptyOrdinals.assign(threadCount, 0);
@@ -292,6 +294,20 @@ void Assembler::computeBaseAlignmentsAndStore(
              << droppedEmpty << " of " << candidateCount << "." << endl;
     }
 
+    {
+        uint64_t byErrorRate = 0;
+        uint64_t byWindowFraction = 0;
+        for(size_t threadId=0; threadId<data.threadFilteredByErrorRate.size(); threadId++) {
+            byErrorRate += data.threadFilteredByErrorRate[threadId];
+        }
+        for(size_t threadId=0; threadId<data.threadFilteredByWindowFraction.size(); threadId++) {
+            byWindowFraction += data.threadFilteredByWindowFraction[threadId];
+        }
+        cout << timestamp << "Alignments rejected: " << byErrorRate
+             << " by average error rate, " << byWindowFraction
+             << " by windowed filter." << endl;
+    }
+
     const auto tEnd = steady_clock::now();
     const double elapsedSeconds = seconds(tEnd - tBegin);
     performanceLog << timestamp << "Done computing alignments. Elapsed time: " << elapsedSeconds << " s." << endl;
@@ -316,6 +332,13 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
         size_t(alignOptions.minAlignedMarkerCount) : 0;
     const double maxErrorRate = alignOptions.maxErrorRate;
     const bool computeCigar = alignOptions.computeBaseAlignmentCigar;
+    const uint32_t alignmentWindowLength = alignOptions.alignmentWindowLength;
+    const double minAlignedWindowFraction = alignOptions.minAlignedWindowFraction;
+    // hifiasm's THRESHOLD_MAX_SIZE: the banded aligner's own band limit, which
+    // caps the per-window error budget. Not a tuning knob, so it is not exposed
+    // as an option -- it only exists to mirror hifiasm's behaviour on long
+    // windows.
+    constexpr uint32_t maxWindowErrors = 31;
     const int64_t dpMatchScore = alignOptions.overlapDpMatchScore;
     const int64_t dpMismatchScore = alignOptions.overlapDpMismatchScore;
     const int64_t dpGapOpen1 = alignOptions.overlapDpGapOpen1;
@@ -433,6 +456,20 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             if(projectedErrorRate > maxErrorRate) {
                 data.threadFilteredByErrorRate[threadId]++;
                 continue;
+            }
+
+            // Windowed (local) filter: hifiasm's acceptance rule, which rejects
+            // overlaps that are fine on average but contain a badly diverging
+            // stretch. Needs base-level errors, so it can only run when the
+            // CIGAR was computed above.
+            if(computeCigar && minAlignedWindowFraction > 0.) {
+                const double alignedWindowFraction =
+                    projectedAlignment.alignedWindowFraction(
+                        alignmentWindowLength, maxErrorRate, maxWindowErrors);
+                if(alignedWindowFraction < minAlignedWindowFraction) {
+                    data.threadFilteredByWindowFraction[threadId]++;
+                    continue;
+                }
             }
 
             // Create alignment info summary from the derived-chain alignment.

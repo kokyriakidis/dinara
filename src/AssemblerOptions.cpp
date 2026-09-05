@@ -536,6 +536,36 @@ void AssemblerOptions::addConfigurableOptions()
         "CIGAR-based consumer (phasing/MSA) is enabled. The error-rate filter "
         "is inactive when this is false.")
 
+        ("Align.useHifiasmBaseAlignment",
+        value<bool>(&alignOptions.useHifiasmBaseAlignment)->
+        default_value(true),
+        "If true (default), run hifiasm's aligned overlap path: candidate "
+        "detection followed by base-level alignment and its window filter. "
+        "This is the only source of hifiasm's per-overlap CIGAR, which covers "
+        "the full overlap box (including the flanks chaining extends past the "
+        "outermost anchor) and so supports position mapping between the two "
+        "reads anywhere in the overlap. It costs more time and yields a "
+        "smaller, alignment-filtered candidate set. If false, emit the raw "
+        "pre-alignment candidate set instead: faster and more permissive, but "
+        "no CIGAR.")
+
+        ("Align.alignmentWindowLength",
+        value<uint32_t>(&alignOptions.alignmentWindowLength)->
+        default_value(375),
+        "Query window length for the windowed overlap filter. Matches "
+        "hifiasm's WINDOW_OHC (375 for ONT, WINDOW_HC 775 for HiFi).")
+
+        ("Align.minAlignedWindowFraction",
+        value<double>(&alignOptions.minAlignedWindowFraction)->
+        default_value(0.9),
+        "Minimum fraction of the anchored query span that must lie in windows "
+        "aligning within their own error budget (Align.maxErrorRate per "
+        "window, capped at 31 errors). Port of hifiasm's "
+        "OVERLAP_THRESHOLD_HIFI_FILTER. Unlike Align.maxErrorRate this is a "
+        "local criterion: an overlap that averages well but has one badly "
+        "diverging stretch is rejected. Set to 0 to disable. Inactive unless "
+        "Align.computeBaseAlignmentCigar is true.")
+
         ("Align.overlapDp.matchScore",
         value<int64_t>(&alignOptions.overlapDpMatchScore)->
         default_value(2),
@@ -1192,6 +1222,17 @@ void AssemblerOptions::addConfigurableOptions()
         "pair (support is already validated by minCommonForBackbone). Values "
         "> 0 can isolate well-supported anchors. (Mode 3 assembly only).")
 
+        ("Assembly.mode3.transcribeHetBubbles",
+        value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
+        default_value(false),
+        "If true, run per-edge MSA het detection: append a het anchor per "
+        "detected allele, rebuild journeys, and rebuild the anchor graph from "
+        "them. False by default -- the pipeline collapses hifiasm's filtered "
+        "overlaps into anchors and exports those, leaving locus "
+        "disambiguation to shasta2's downstream read-following, which has "
+        "whole journeys as context instead of one edge at a time. When false "
+        "every other Assembly.mode3.het* option is inert.")
+
         ("Assembly.mode3.minCommonForHet",
         value<uint64_t>(&assemblyOptions.mode3Options.minCommonForHet)->
         default_value(12),
@@ -1499,6 +1540,10 @@ void AlignOptions::write(ostream& s) const
     s << "maxErrorRate = " << maxErrorRate << "\n";
     s << "computeBaseAlignmentCigar = " <<
         convertBoolToPythonString(computeBaseAlignmentCigar) << "\n";
+    s << "useHifiasmBaseAlignment = " <<
+        convertBoolToPythonString(useHifiasmBaseAlignment) << "\n";
+    s << "alignmentWindowLength = " << alignmentWindowLength << "\n";
+    s << "minAlignedWindowFraction = " << minAlignedWindowFraction << "\n";
     s << "overlapDp.matchScore = " << overlapDpMatchScore << "\n";
     s << "overlapDp.mismatchScore = " << overlapDpMismatchScore << "\n";
     s << "overlapDp.gapOpen1 = " << overlapDpGapOpen1 << "\n";
@@ -1656,6 +1701,8 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
+    s << "mode3.transcribeHetBubbles = " <<
+        convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";
     s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
     s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
