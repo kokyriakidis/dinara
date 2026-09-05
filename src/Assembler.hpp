@@ -1009,11 +1009,9 @@ public:
         const uint16_t* cigar,
         uint64_t cigarLen,
         // Native dense chain-anchor arena (packed (q_start<<32)|t_start) shared
-        // by all overlaps via hifiasm_overlap_t::chain_offset/chain_len. There
-        // is no fallback: the chain is the ONLY source of marker ordinals
-        // (mapNativeChainToOrdinals), so with chain == nullptr every candidate
-        // ends up with an empty ordinal list and is dropped by the
-        // empty-ordinals guard in computeBaseAlignmentsAndStore.
+        // by all overlaps via hifiasm_overlap_t::chain_offset/chain_len.
+        // Required whenever overlapCount > 0 (asserted): it is the only source
+        // of marker ordinals (mapNativeChainToOrdinals), with no fallback.
         const uint64_t* chain,
         uint64_t chainLen,
         uint64_t threadCount = 0,

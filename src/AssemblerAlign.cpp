@@ -294,6 +294,13 @@ void Assembler::importAlignmentCandidatesFromMemory(
     uint32_t minOverlapLength,
     bool rawCandidates)
 {
+    // The native chain is the only source of marker ordinals, so importing
+    // overlaps without one silently yields a run with no anchors at all: every
+    // candidate would reach computeBaseAlignmentsAndStore with an empty ordinal
+    // list and be dropped there. Fail loudly instead. Conditioned on
+    // overlapCount because hifiasm leaves the arena null when it finds nothing.
+    DINARA_ASSERT(overlapCount == 0 || chain != nullptr);
+
     cout << timestamp << "Importing " << overlapCount
          << " hifiasm overlaps from memory..." << endl;
     const auto tBegin = steady_clock::now();
