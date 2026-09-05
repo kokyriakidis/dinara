@@ -1226,6 +1226,21 @@ void dinara::main::assemble(
             to_string(maxK) + ".");
     }
 
+    // k must be even. Note this rules out matching hifiasm's own default of 51,
+    // and it is not free: anchor positions are marker MIDPOINTS (marker start +
+    // k/2), and a midpoint mirrors exactly under reverse complement only when
+    // 2*(k/2) == k-1, i.e. only for ODD k. Measured at k=50 on the GIAB fixture:
+    // midpoint1 - ((len-1) - midpoint0) == +1 for 200454/200454 markers, with no
+    // other value occurring. That offset is uniform across every marker, so
+    // relative positions, offsets and orderings are unaffected -- but code that
+    // compares a strand-0 position against a strand-1 position expecting an
+    // exact mirror will be off by one.
+    //
+    // The original reason for requiring even k is not recorded here and was not
+    // rediscovered; the only concrete dependency found in the tree is the
+    // dormant AssemblerAbpoaMultiSegmentMSA.cpp, which extends its backbone by
+    // k/2 per side to cover a full k-mer. Do not relax this guard without
+    // establishing what else assumes it.
     if((assemblerOptions.kmersOptions.k % 2) == 1) {
         throw runtime_error("Invalid value specified for --Kmers.k. Must be even.");
     }
@@ -1839,6 +1854,7 @@ void dinara::main::assemble(
         ov, nOv, names, nameOff, nReads,
         chain, chainLen, threadCount);
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
+
 
     hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
     free(chain);  // native chain arena (plain uint64_t array; owned by caller)
