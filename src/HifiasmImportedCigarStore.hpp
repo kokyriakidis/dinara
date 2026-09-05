@@ -40,6 +40,25 @@ namespace dinara {
             uint32_t tStart = 0;
             uint32_t tEnd = 0;
             bool isSameStrand = true;
+            // What the CIGAR itself accounts for: the summed query-consuming and
+            // target-consuming op lengths. These are NOT always qEnd-qStart /
+            // tEnd-tStart. hifiasm's in-memory record pairs the overlap BOX
+            // (x_pos_s..x_pos_e) with the concatenation of only the windows that
+            // aligned -- ecovlp.cpp skips is_ualn_win when building the token
+            // stream -- so a window that failed to align leaves the box and the
+            // tokens describing different spans, with nothing marking where the
+            // hole was. (hifiasm's file PAF cannot show this: it emits one record
+            // per window, each carrying its own window's bounds, so coordinates
+            // and CIGAR always agree there.) Measured: 36/29851 records (0.12%)
+            // on the small GIAB fixture, 1201/251791 (0.48%, mean ~1068bp) at
+            // 251k overlaps -- it scales the wrong way.
+            //
+            // So before walking the tokens, compare these against the box. When
+            // they disagree the token stream cannot be walked from qStart/tStart
+            // without desynchronising, and the record carries no information
+            // about whether the missing span is leading, trailing or internal.
+            uint32_t cigarQuerySpan = 0;
+            uint32_t cigarTargetSpan = 0;
             // Native dense chain anchors for this overlap (hifiasm's colinear-DP
             // seeds), each packed (q_start<<32)|t_start in the query-forward /
             // target-alignment-orientation frame. Slice into chainArena.
@@ -92,6 +111,12 @@ namespace dinara {
             rec.tStart = tStart;
             rec.tEnd = tEnd;
             rec.isSameStrand = isSameStrand;
+            // The transpose already visits every token, so accumulate what the
+            // CIGAR spans here rather than in a second pass. Lengths are summed
+            // in DINARA's convention (post-transpose), matching qStart/qEnd and
+            // tStart/tEnd.
+            uint64_t querySpan = 0;
+            uint64_t targetSpan = 0;
             for(size_t i = 0; i < tokens.size(); ++i) {
                 const CigarToken raw(tokens[i]);
                 const uint8_t op = raw.op();
@@ -99,7 +124,11 @@ namespace dinara {
                     (op == CigarOpIns) ? CigarOpDel :
                     (op == CigarOpDel) ? CigarOpIns : op;
                 arena.emplace_back(CigarToken(dinaraOp, raw.len()));
+                if(opConsumesQuery(dinaraOp))  querySpan  += raw.len();
+                if(opConsumesTarget(dinaraOp)) targetSpan += raw.len();
             }
+            rec.cigarQuerySpan  = uint32_t(querySpan);
+            rec.cigarTargetSpan = uint32_t(targetSpan);
             (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
         }
 

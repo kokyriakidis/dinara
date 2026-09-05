@@ -461,11 +461,11 @@ void Assembler::importAlignmentCandidatesFromMemory(
             const HifiasmImportedCigarStore::Record* rec =
                 hifiasmImportedCigarStore.find(e.key, o.is_same_strand != 0);
             if(rec != nullptr) {
-                uint64_t qConsumed = 0, tConsumed = 0;
-                for(const CigarToken tok : hifiasmImportedCigarStore.tokensOf(*rec)) {
-                    if(opConsumesQuery(tok.op()))  qConsumed += tok.len();
-                    if(opConsumesTarget(tok.op())) tConsumed += tok.len();
-                }
+                // add() accumulated these while transposing the tokens; read
+                // them back rather than re-walking, so the stored spans and the
+                // ones checked here can never drift apart.
+                const uint64_t qConsumed = rec->cigarQuerySpan;
+                const uint64_t tConsumed = rec->cigarTargetSpan;
                 const uint64_t declaredQ = uint64_t(o.q_end) - uint64_t(o.q_start);
                 const uint64_t declaredT = uint64_t(o.t_end) - uint64_t(o.t_start);
                 const bool spanMatches = (qConsumed == declaredQ && tConsumed == declaredT);
