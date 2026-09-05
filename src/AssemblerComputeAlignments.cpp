@@ -322,10 +322,15 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
     const AlignOptions& alignOptions = *data.alignOptions;
     auto& threadAlignmentData = data.threadAlignmentData[threadId];
     const auto& candidates = alignmentCandidates.candidates;
-    // Every candidate carries an imported hifiasm CIGAR (candidates and the
-    // CIGAR store come from the SAME deduped import list, keyed identically).
-    // The marker-ordinal chain is DERIVED per candidate from the hifiasm overlap
-    // box (deriveChainFromInterval); there is no separate chaining DP.
+    // Candidates and the CIGAR store come from the SAME deduped import list,
+    // keyed identically, so a candidate's record is always findable. Whether
+    // that record carries CIGAR tokens depends on the overlap mode: hifiasm's
+    // aligned path exports them (Align.useHifiasmBaseAlignment, the default),
+    // the raw candidate path leaves cigarTokenCount == 0.
+    //
+    // The marker-ordinal chain is TRANSLATED from hifiasm's own native chain
+    // anchors (mapNativeChainToOrdinals) -- exact-position lookup plus a KmerId
+    // equality check, then a monotone filter. No chaining DP runs here.
     const uint32_t markerK = uint32_t(assemblerInfo->k);
     const bool collectProjectedTiming = (assemblerInfo->readGraphCreationMethod == 5);
     const size_t minAlignedMarkerCount = (alignOptions.minAlignedMarkerCount > 0) ?
@@ -360,10 +365,10 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
         for(uint64_t candidateIndex = begin; candidateIndex != end; candidateIndex++) {
             const OrientedReadPair& candidate = candidates[candidateIndex];
 
-            // The marker-ordinal chain is derived from hifiasm's overlap box
-            // (deriveChainFromInterval) after the CIGAR walk below. The chain
-            // size is only known after that derivation, so the
-            // minAlignedMarkerCount support filter is applied there.
+            // The marker-ordinal chain is translated from hifiasm's native
+            // chain anchors below (mapNativeChainToOrdinals). Its size is only
+            // known after that translation drops unresolvable and non-monotone
+            // anchors, so the minAlignedMarkerCount filter is applied there.
             orientedReadIds[0] = OrientedReadId(candidate.readIds[0], 0);
             orientedReadIds[1] = OrientedReadId(candidate.readIds[1], candidate.isSameStrand ? 0 : 1);
             const array<LongBaseSequenceView, 2> sequenceViews = {
@@ -440,7 +445,7 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
                 data.threadProjectedAlignmentTime[threadId] += seconds(steady_clock::now() - tProjStart);
             }
 
-            // The chain size is only known after deriveChainFromInterval. Drop
+            // The chain size is only known after mapNativeChainToOrdinals. Drop
             // pairs with no chain or fewer than Align.minAlignedMarkerCount anchors.
             if(directAlignment.ordinals.empty()) {
                 data.threadDroppedEmptyOrdinals[threadId]++;
