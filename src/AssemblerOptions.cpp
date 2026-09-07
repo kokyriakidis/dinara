@@ -1222,6 +1222,32 @@ void AssemblerOptions::addConfigurableOptions()
         "pair (support is already validated by minCommonForBackbone). Values "
         "> 0 can isolate well-supported anchors. (Mode 3 assembly only).")
 
+        ("Assembly.mode3.detectSnpSites",
+        value<bool>(&assemblyOptions.mode3Options.detectSnpSites)->
+        default_value(false),
+        "If true, scan the imported hifiasm CIGARs for candidate SNP sites and "
+        "report the disagreement-fraction distribution. Detection only: creates "
+        "no anchors and changes nothing downstream. Requires "
+        "Align.useHifiasmBaseAlignment.")
+
+        ("Assembly.mode3.snpSiteMinDisagree",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinDisagree)->
+        default_value(2),
+        "Minimum number of covering partners that must disagree at a position "
+        "for it to be a candidate SNP site.")
+
+        ("Assembly.mode3.snpSiteMinFraction",
+        value<double>(&assemblyOptions.mode3Options.snpSiteMinFraction)->
+        default_value(0.2),
+        "Minimum fraction of covering partners that disagree, for a candidate "
+        "SNP site.")
+
+        ("Assembly.mode3.snpSiteMaxFraction",
+        value<double>(&assemblyOptions.mode3Options.snpSiteMaxFraction)->
+        default_value(0.8),
+        "Maximum fraction of covering partners that disagree. A share near 1.0 "
+        "means every partner disagrees, i.e. this read carries the error.")
+
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
         default_value(false),
@@ -1701,6 +1727,11 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
+    s << "mode3.detectSnpSites = " <<
+        convertBoolToPythonString(detectSnpSites) << "\n";
+    s << "mode3.snpSiteMinDisagree = " << snpSiteMinDisagree << "\n";
+    s << "mode3.snpSiteMinFraction = " << snpSiteMinFraction << "\n";
+    s << "mode3.snpSiteMaxFraction = " << snpSiteMaxFraction << "\n";
     s << "mode3.transcribeHetBubbles = " <<
         convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";

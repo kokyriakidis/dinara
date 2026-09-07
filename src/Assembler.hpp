@@ -351,6 +351,16 @@ public:
         uint64_t threadCount
     );
 
+    // Candidate SNP-site detection straight from the imported hifiasm CIGARs.
+    // Counts, per position of each read, how many overlapping partners disagree
+    // there, and reports the distribution. Detection only: creates no anchors
+    // and changes nothing downstream. See AssemblerCigarSnpSites.cpp.
+    void detectCigarSnpSites(
+        uint64_t minDisagreeCount,
+        double minDisagreeFraction,
+        double maxDisagreeFraction,
+        uint64_t threadCount);
+
     // New unified alignment flow with evidence storage.
     void computeBaseAlignmentsAndStore(
         const AlignOptions&,

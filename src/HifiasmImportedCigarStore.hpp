@@ -165,6 +165,18 @@ namespace dinara {
 
         bool empty() const { return sameStrand.empty() && reverseStrand.empty(); }
 
+        // Visit every stored record. The store is keyed by (pairKey, strand)
+        // for per-pair lookup, so a consumer that needs "all overlaps involving
+        // read r" has to build that index itself; this is the way in.
+        template<class F> void forEachRecord(F&& f) const {
+            for(const auto& [key, rec]: sameStrand)    { (void)key; f(rec); }
+            for(const auto& [key, rec]: reverseStrand) { (void)key; f(rec); }
+        }
+
+        uint64_t recordCount() const {
+            return sameStrand.size() + reverseStrand.size();
+        }
+
     private:
         // Flat token arena (native hifiasm frame).
         std::vector<CigarToken> arena;

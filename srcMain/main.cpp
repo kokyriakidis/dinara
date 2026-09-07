@@ -1872,6 +1872,18 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
+    // Candidate SNP sites straight from the imported CIGARs. Off by default,
+    // and detection-only: it reports the disagreement-fraction distribution and
+    // creates nothing. Runs here because it needs only the CIGAR store (which
+    // lives for the rest of the run) and the reads.
+    if(assemblerOptions.assemblyOptions.mode3Options.detectSnpSites) {
+        assembler.detectCigarSnpSites(
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinDisagree,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinFraction,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMaxFraction,
+            threadCount);
+    }
+
     // Build a vector of ReadIds sorted by read length (longest first).
     const Reads& reads = assembler.getReads();
     const ReadId readCount = reads.readCount();

@@ -514,6 +514,21 @@ public:
     // intermediate anchors.
     uint64_t minJourneyEdgeCoverage;
 
+    // Candidate SNP-site detection from the imported hifiasm CIGARs
+    // (Assembler::detectCigarSnpSites). Detection and reporting only -- it
+    // creates no anchors and changes nothing downstream; it exists to measure
+    // whether the disagreement-fraction signal separates real het sites from
+    // sequencing error before anything is built on it. Needs
+    // Align.useHifiasmBaseAlignment (the default), since it reads the CIGARs.
+    bool detectSnpSites = false;
+    // A position is a candidate when at least this many covering partners
+    // disagree AND the disagreeing share falls in [min, max]. The upper bound
+    // is the point: a share near 1.0 means every partner disagrees, so the odd
+    // base is this read's own error rather than a second haplotype.
+    uint64_t snpSiteMinDisagree = 2;
+    double snpSiteMinFraction = 0.2;
+    double snpSiteMaxFraction = 0.8;
+
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,
     // and rebuild the anchor graph. False by default: the current pipeline
