@@ -359,7 +359,6 @@ public:
         uint64_t minDisagreeCount,
         double minDisagreeFraction,
         double maxDisagreeFraction,
-        bool includeIndels,
         uint64_t threadCount);
 
     // New unified alignment flow with evidence storage.

@@ -1252,13 +1252,6 @@ void AssemblerOptions::addConfigurableOptions()
         "the rare allele, which measurably removes real biallelic sites -- see "
         "AssemblerOptions.hpp. Diagnostic only.")
 
-        ("Assembly.mode3.snpSiteIncludeIndels",
-        value<bool>(&assemblyOptions.mode3Options.snpSiteIncludeIndels)->
-        default_value(true),
-        "Count indels as disagreements during SNP-site detection, not just "
-        "mismatches. hifiasm counts only mismatches, so a het indel with no "
-        "nearby substitution is invisible without this.")
-
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
         default_value(false),
@@ -1743,8 +1736,6 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinDisagree = " << snpSiteMinDisagree << "\n";
     s << "mode3.snpSiteMinFraction = " << snpSiteMinFraction << "\n";
     s << "mode3.snpSiteMaxFraction = " << snpSiteMaxFraction << "\n";
-    s << "mode3.snpSiteIncludeIndels = " <<
-        convertBoolToPythonString(snpSiteIncludeIndels) << "\n";
     s << "mode3.transcribeHetBubbles = " <<
         convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";

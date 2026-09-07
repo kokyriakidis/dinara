@@ -543,12 +543,6 @@ public:
     uint64_t snpSiteMinDisagree = 2;
     double snpSiteMinFraction = 0.0;
     double snpSiteMaxFraction = 1.0;
-    // Count indels as disagreements too. hifiasm's markSNP_detail counts only
-    // mismatches -- its oper 2 and 3 branches just advance the cursors -- so a
-    // het indel with no nearby substitution is never flagged at all. The abPOA
-    // route did find those, as multi-column sites with one empty allele, so
-    // leaving this off is a real scope regression for phasing.
-    bool snpSiteIncludeIndels = true;
 
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,

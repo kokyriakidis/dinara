@@ -75,7 +75,6 @@ void Assembler::detectCigarSnpSites(
     uint64_t minDisagreeCount,
     double minDisagreeFraction,
     double maxDisagreeFraction,
-    bool includeIndels,
     uint64_t threadCount)
 {
     if(hifiasmImportedCigarStore.empty()) {
@@ -182,12 +181,7 @@ void Assembler::detectCigarSnpSites(
         vector<uint16_t> disagree;
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
-        // Index 4 is the GAP allele: a partner that has no base opposite
-        // this position at all. hifiasm models the same thing as
-        // haplotype_evdience::type == 2. Without it an indel site looks
-        // monoallelic, because every read carries the same BASE there and
-        // they differ only in whether bases exist alongside it.
-        vector<std::array<uint16_t, 5>> alleleCounts;
+        vector<std::array<uint16_t, 4>> alleleCounts;
         for(;;) {
             const ReadId readId = nextReadId.fetch_add(1);
             if(readId >= readCount) break;
@@ -264,48 +258,22 @@ void Assembler::detectCigarSnpSites(
                 // runs are visited per base. Indel runs consume one side only
                 // and say nothing about a position's allele, so they just
                 // advance the relevant cursor.
-                auto selfPositionAt = [&](uint64_t offset) -> uint64_t {
-                    if(selfIsQuery)          return qPos + offset;
-                    if(rec->isSameStrand)    return tPos + offset;
-                    return uint64_t(targetLength) - 1 - (tPos + offset);
-                };
-                auto noteDisagreement = [&](uint64_t self) {
-                    if(self < readLength && disagree[self] < 0xffff) disagree[self]++;
-                };
-
                 for(const CigarToken token: hifiasmImportedCigarStore.tokensOf(*rec)) {
                     const uint8_t op = token.op();
                     const uint16_t length = token.len();
                     if(op == CigarOpMismatch) {
                         for(uint16_t i = 0; i < length; i++) {
-                            noteDisagreement(selfPositionAt(i));
-                        }
-                    } else if(includeIndels && op != CigarOpMatch) {
-                        // An indel is a disagreement too, and a het indel is
-                        // invisible without this: hifiasm's markSNP_detail only
-                        // ever counts mismatches (oper 2 and 3 just advance the
-                        // cursors), so a site with no nearby substitution is
-                        // never flagged. The abPOA route did find these, as
-                        // multi-column sites with one empty allele.
-                        //
-                        // Which side the run consumes decides the attribution.
-                        const bool consumesSelf = selfIsQuery ?
-                            opConsumesQuery(op) : opConsumesTarget(op);
-                        if(consumesSelf) {
-                            // This read carries bases the partner lacks: every
-                            // one of them is a position where they disagree.
-                            for(uint16_t i = 0; i < length; i++) {
-                                noteDisagreement(selfPositionAt(i));
+                            uint64_t self;
+                            if(selfIsQuery) {
+                                self = qPos + i;
+                            } else if(rec->isSameStrand) {
+                                self = tPos + i;
+                            } else {
+                                self = uint64_t(targetLength) - 1 - (tPos + i);
                             }
-                        } else {
-                            // The partner carries bases this read lacks. There
-                            // is no position of ours inside the gap, so charge
-                            // it to the base immediately before it -- the usual
-                            // anchor-base convention.
-                            const uint64_t at = selfPositionAt(0);
-                            const bool descending = (!selfIsQuery && !rec->isSameStrand);
-                            if(descending) noteDisagreement(at + 1);
-                            else if(at > 0) noteDisagreement(at - 1);
+                            if(self < readLength && disagree[self] < 0xffff) {
+                                disagree[self]++;
+                            }
                         }
                     }
                     if(opConsumesQuery(op))  qPos += length;
@@ -397,7 +365,7 @@ void Assembler::detectCigarSnpSites(
             // the few that fall inside a run are found by binary search and
             // their partner offsets computed directly.
             if(!ownedPositions.empty()) {
-                alleleCounts.assign(ownedPositions.size(), {0, 0, 0, 0, 0});
+                alleleCounts.assign(ownedPositions.size(), {0, 0, 0, 0});
                 // Seed with this read's own base -- it is a member too.
                 for(size_t k = 0; k < ownedPositions.size(); k++) {
                     const Base self =
@@ -422,26 +390,6 @@ void Assembler::detectCigarSnpSites(
                     for(const CigarToken token: hifiasmImportedCigarStore.tokensOf(*rec)) {
                         const uint8_t op = token.op();
                         const uint16_t length = token.len();
-                        const bool selfConsuming = selfIsQuery ?
-                            opConsumesQuery(op) : opConsumesTarget(op);
-                        if(includeIndels && op != CigarOpMatch &&
-                           op != CigarOpMismatch && selfConsuming) {
-                            // This read has bases the partner lacks: opposite
-                            // each of them the partner's allele is a GAP.
-                            const bool descending = (!selfIsQuery && !rec->isSameStrand);
-                            const int64_t first = selfIsQuery ? int64_t(qPos) :
-                                (rec->isSameStrand ? int64_t(tPos) :
-                                 int64_t(targetLength) - 1 - int64_t(tPos));
-                            const int64_t last = descending ?
-                                (first - int64_t(length) + 1) : (first + int64_t(length) - 1);
-                            auto it = std::lower_bound(ownedPositions.begin(),
-                                ownedPositions.end(),
-                                uint32_t(std::max<int64_t>(0, std::min(first, last))));
-                            for(; it != ownedPositions.end() &&
-                                  int64_t(*it) <= std::max(first, last); ++it) {
-                                alleleCounts[size_t(it - ownedPositions.begin())][4]++;
-                            }
-                        }
                         if(op == CigarOpMatch || op == CigarOpMismatch) {
                             // Self positions covered by this run, as a range.
                             // Reverse-strand targets run backwards.
