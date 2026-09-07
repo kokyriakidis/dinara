@@ -17,17 +17,35 @@
 //
 //   Scan    Positions where enough partners disagree are candidate sites.
 //
-//   Pass 2  (not done here) Re-walk to collect which partner carries which
-//           allele -- needed to build anchors, because the AGREEING reads are
-//           as much a part of a site as the disagreeing ones.
+//   Pass 2  Re-walk, for OWNED sites only, to collect which partner carries
+//           which allele -- needed to build anchors, because the AGREEING reads
+//           are as much a part of a site as the disagreeing ones. "Owned" means
+//           this read has the lowest ReadId among those covering the site, which
+//           deduplicates the ~coverage-fold redundant detections before the
+//           expensive pass rather than after it.
 //
-// This file implements pass 1 and the scan, and reports the distribution. It
-// creates no anchors and changes nothing downstream: the point is to find out
-// whether the disagreement-fraction signal actually separates het sites from
-// sequencing error before anything is built on top of it. The expected shape is
-// bimodal -- a read's own error makes ~all partners disagree, a het site makes
-// ~half disagree -- but ONT errors are systematic in homopolymers, so whether
-// that separation is real is an empirical question, not an assumption.
+// Detection is deliberately PERMISSIVE, matching hifiasm's own criterion: a
+// position is a candidate when at least 2 covering partners disagree, with no
+// frequency cutoff (Correct.cpp: snp_threshold = 1, tested as
+// flag[i] > snp_threshold, and nothing more). Deciding whether a minority
+// allele is real belongs downstream -- to a binomial test against the assumed
+// error rate, and to homopolymer/repeat/strand-bias filters -- not to a
+// frequency cutoff here.
+//
+// That was measured rather than assumed. A [0.2, 0.8] fraction window cut 3662
+// sites to 518 on the GIAB fixture: it does remove real junk (2129 monoallelic
+// sites down to 49), but it also discards 1027 of 1493 BIALLELIC sites, 69% of
+// them. Those are the low-VAF tails -- a second allele carried by a few of ~34
+// reads, or the owning read itself carrying the rare allele -- which is exactly
+// the population a statistical test exists to adjudicate and a frequency cutoff
+// cannot.
+//
+// The reported disagreement-fraction histogram is trimodal on this data: a mass
+// near 0 (one partner's error), a bump at ~0.5 (a second haplotype), and a spike
+// at 1.0 (this read's own error). It is kept as a diagnostic, not used as a
+// filter.
+//
+// This file creates no anchors and changes nothing downstream.
 
 #include "Assembler.hpp"
 #include "HifiasmImportedCigarStore.hpp"

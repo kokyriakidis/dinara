@@ -522,12 +522,27 @@ public:
     // Align.useHifiasmBaseAlignment (the default), since it reads the CIGARs.
     bool detectSnpSites = false;
     // A position is a candidate when at least this many covering partners
-    // disagree AND the disagreeing share falls in [min, max]. The upper bound
-    // is the point: a share near 1.0 means every partner disagrees, so the odd
-    // base is this read's own error rather than a second haplotype.
+    // disagree, and (optionally) the disagreeing share falls in [min, max].
+    //
+    // The defaults are hifiasm's criterion exactly: >= 2 disagreeing partners
+    // and NO fraction constraint (Correct.cpp uses snp_threshold = 1, tested as
+    // flag[i] > snp_threshold, with nothing else). Detection is deliberately
+    // permissive; deciding whether a minority allele is real belongs to the
+    // statistical and context filters downstream, not to a frequency cutoff
+    // here.
+    //
+    // Measured on the GIAB fixture: a [0.2, 0.8] window cut 3662 sites to 518,
+    // which does remove real junk (2129 monoallelic sites down to 49) but also
+    // discards 1027 of 1493 BIALLELIC sites -- 69% of them. Those sit in the
+    // tails: a second allele carried by only a few of ~34 reads, or the owning
+    // read itself carrying the rare allele. A frequency cutoff cannot separate
+    // "rare real allele" from "recurrent error"; a binomial test against the
+    // assumed error rate can, which is why hifiasm has no such cutoff.
+    //
+    // The fraction bounds are kept as a diagnostic, defaulted off.
     uint64_t snpSiteMinDisagree = 2;
-    double snpSiteMinFraction = 0.2;
-    double snpSiteMaxFraction = 0.8;
+    double snpSiteMinFraction = 0.0;
+    double snpSiteMaxFraction = 1.0;
 
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,

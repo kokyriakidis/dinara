@@ -1238,15 +1238,19 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.snpSiteMinFraction",
         value<double>(&assemblyOptions.mode3Options.snpSiteMinFraction)->
-        default_value(0.2),
-        "Minimum fraction of covering partners that disagree, for a candidate "
-        "SNP site.")
+        default_value(0.0),
+        "Minimum fraction of covering partners that disagree. Defaults to 0 "
+        "(off): detection matches hifiasm's criterion, which applies no "
+        "frequency cutoff and defers the judgement to downstream filters. "
+        "Diagnostic only.")
 
         ("Assembly.mode3.snpSiteMaxFraction",
         value<double>(&assemblyOptions.mode3Options.snpSiteMaxFraction)->
-        default_value(0.8),
-        "Maximum fraction of covering partners that disagree. A share near 1.0 "
-        "means every partner disagrees, i.e. this read carries the error.")
+        default_value(1.0),
+        "Maximum fraction of covering partners that disagree. Defaults to 1 "
+        "(off). Setting it below 1 discards sites where the owning read carries "
+        "the rare allele, which measurably removes real biallelic sites -- see "
+        "AssemblerOptions.hpp. Diagnostic only.")
 
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
