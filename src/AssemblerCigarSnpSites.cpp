@@ -95,11 +95,17 @@ void Assembler::detectCigarSnpSites(
     std::array<std::atomic<uint64_t>, 21> fractionHistogram{};
     for(auto& bucket: fractionHistogram) bucket.store(0);
     std::atomic<uint64_t> candidateSites{0}, positionsExamined{0};
+    std::atomic<uint64_t> ownedSites{0}, allelesTotal{0};
+    std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
+    std::array<std::atomic<uint64_t>, 9> alleleCountHistogram{};
+    for(auto& bucket: alleleCountHistogram) bucket.store(0);
 
     std::atomic<ReadId> nextReadId{0};
     auto worker = [&]() {
         vector<uint16_t> disagree;
         vector<int32_t> coverDelta;
+        vector<uint32_t> localCandidates, ownedPositions;
+        vector<std::array<uint16_t, 4>> alleleCounts;
         for(;;) {
             const ReadId readId = nextReadId.fetch_add(1);
             if(readId >= readCount) break;
@@ -174,6 +180,7 @@ void Assembler::detectCigarSnpSites(
             // this read's own error: near 1.0 means every partner disagrees, so
             // the odd base is almost certainly ours.
             uint64_t localSites = 0, localExamined = 0;
+            localCandidates.clear();
             std::array<uint64_t, 21> localHistogram{};
             int32_t running = 0;
             for(uint32_t position = 0; position < readLength; position++) {
@@ -188,8 +195,140 @@ void Assembler::detectCigarSnpSites(
                 if(bad >= minDisagreeCount &&
                    fraction >= minDisagreeFraction && fraction <= maxDisagreeFraction) {
                     ++localSites;
+                    localCandidates.push_back(position);
                 }
             }
+            // Ownership. Every read covering a locus registers it, so the same
+            // site is found once per covering read (~coverage times over).
+            // Rather than emitting all of them and merging afterwards, each read
+            // asks cheaply whether it OWNS the site -- lowest ReadId among the
+            // reads covering that position -- and only the owner does pass 2.
+            // That removes the redundancy before any expensive work, not after.
+            // Cost is candidates x records interval tests, both small.
+            //
+            // Two reads viewing the same locus agree on the owner because they
+            // minimise over the same covering set. They can disagree only where
+            // their overlap sets differ, which costs an occasional duplicate,
+            // not a systematic failure.
+            ownedPositions.clear();
+            for(const uint32_t position: localCandidates) {
+                ReadId owner = readId;
+                for(const HifiasmImportedCigarStore::Record* rec: records) {
+                    const bool selfIsQuery = (rec->readIdQ == readId);
+                    const uint32_t from = selfIsQuery ? rec->qStart : rec->tStart;
+                    const uint32_t to   = selfIsQuery ? rec->qEnd   : rec->tEnd;
+                    if(position >= from && position < to) {
+                        const ReadId partner =
+                            selfIsQuery ? ReadId(rec->readIdT) : ReadId(rec->readIdQ);
+                        if(partner < owner) owner = partner;
+                    }
+                }
+                if(owner == readId) ownedPositions.push_back(position);
+            }
+            ownedSites.fetch_add(ownedPositions.size(), std::memory_order_relaxed);
+
+            // PASS 2, for owned sites only: which base does each covering read
+            // carry? The agreeing reads are one of the two allele arms, so they
+            // matter as much as the disagreeing ones -- this is hifiasm's
+            // addSNPtohaplotype step.
+            //
+            // Still no per-base loop over match runs. A run spans a contiguous
+            // range of self positions, and the owned positions are sorted, so
+            // the few that fall inside a run are found by binary search and
+            // their partner offsets computed directly.
+            if(!ownedPositions.empty()) {
+                alleleCounts.assign(ownedPositions.size(), {0, 0, 0, 0});
+                // Seed with this read's own base -- it is a member too.
+                for(size_t k = 0; k < ownedPositions.size(); k++) {
+                    const Base self =
+                        reads->getOrientedReadBase(OrientedReadId(readId, 0), ownedPositions[k]);
+                    if(self.value < 4) alleleCounts[k][self.value]++;
+                }
+
+                for(const HifiasmImportedCigarStore::Record* rec: records) {
+                    const bool selfIsQuery = (rec->readIdQ == readId);
+                    const uint32_t targetLength =
+                        uint32_t(reads->getRead(ReadId(rec->readIdT)).baseCount);
+                    // The partner, in the orientation the alignment sees it.
+                    // The query side is always forward; the target side is
+                    // reverse-complemented exactly when the overlap is.
+                    const OrientedReadId partner = selfIsQuery ?
+                        OrientedReadId(ReadId(rec->readIdT), rec->isSameStrand ? 0 : 1) :
+                        OrientedReadId(ReadId(rec->readIdQ), 0);
+                    uint64_t qPos = rec->qStart;
+                    uint64_t tPos = rec->isSameStrand ?
+                        rec->tStart : (targetLength - rec->tEnd);
+
+                    for(const CigarToken token: hifiasmImportedCigarStore.tokensOf(*rec)) {
+                        const uint8_t op = token.op();
+                        const uint16_t length = token.len();
+                        if(op == CigarOpMatch || op == CigarOpMismatch) {
+                            // Self positions covered by this run, as a range.
+                            // Reverse-strand targets run backwards.
+                            const bool descending = (!selfIsQuery && !rec->isSameStrand);
+                            const int64_t first = selfIsQuery ? int64_t(qPos) :
+                                (rec->isSameStrand ? int64_t(tPos) :
+                                 int64_t(targetLength) - 1 - int64_t(tPos));
+                            const int64_t last = descending ?
+                                (first - int64_t(length) + 1) : (first + int64_t(length) - 1);
+                            const int64_t lo = std::min(first, last);
+                            const int64_t hi = std::max(first, last);
+
+                            auto it = std::lower_bound(ownedPositions.begin(),
+                                ownedPositions.end(), uint32_t(std::max<int64_t>(0, lo)));
+                            for(; it != ownedPositions.end() && int64_t(*it) <= hi; ++it) {
+                                const int64_t offset = descending ?
+                                    (first - int64_t(*it)) : (int64_t(*it) - first);
+                                if(offset < 0 || offset >= int64_t(length)) continue;
+                                const uint32_t partnerPosition = uint32_t(
+                                    (selfIsQuery ? tPos : qPos) + uint64_t(offset));
+                                Base base =
+                                    reads->getOrientedReadBase(partner, partnerPosition);
+                                // Express the partner's base in THIS read's
+                                // forward frame. When this read is the target of
+                                // a reverse-strand overlap the alignment sees it
+                                // reverse-complemented, so an alignment match
+                                // means partner == complement(our forward base).
+                                // Without this the allele identity is the
+                                // complement of what it should be.
+                                if(!selfIsQuery && !rec->isSameStrand && base.value < 4) {
+                                    base.value = uint8_t(3 - base.value);
+                                }
+                                if(base.value < 4) {
+                                    alleleCounts[size_t(it - ownedPositions.begin())]
+                                        [base.value]++;
+                                }
+                                // Self-check: at a MATCH column the two bases
+                                // must be identical. If the orientation handling
+                                // above is wrong this is where it shows.
+                                if(op == CigarOpMatch) {
+                                    const Base self = reads->getOrientedReadBase(
+                                        OrientedReadId(readId, 0), *it);
+                                    matchColumnsChecked.fetch_add(1, std::memory_order_relaxed);
+                                    if(self.value == base.value) {
+                                        matchColumnsAgree.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        if(opConsumesQuery(op))  qPos += length;
+                        if(opConsumesTarget(op)) tPos += length;
+                    }
+                }
+
+                // How many distinct bases does each site actually carry?
+                for(const auto& counts: alleleCounts) {
+                    uint64_t distinct = 0, total = 0;
+                    for(const uint16_t c: counts) {
+                        total += c;
+                        if(c >= 2) distinct++;   // a lone read is not an allele
+                    }
+                    allelesTotal.fetch_add(total, std::memory_order_relaxed);
+                    alleleCountHistogram[std::min<size_t>(8, size_t(distinct))]
+                        .fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             candidateSites.fetch_add(localSites, std::memory_order_relaxed);
             positionsExamined.fetch_add(localExamined, std::memory_order_relaxed);
             for(size_t i = 0; i < localHistogram.size(); i++) {
@@ -215,6 +354,20 @@ void Assembler::detectCigarSnpSites(
          << candidateSites.load() << " candidate sites (>= " << minDisagreeCount
          << " disagreeing, fraction in [" << minDisagreeFraction << ", "
          << maxDisagreeFraction << "]), in " << elapsed << " s." << endl;
+    cout << "  distinct sites owned (deduplicated across covering reads): "
+         << ownedSites.load() << endl;
+    {
+        const uint64_t checked = matchColumnsChecked.load();
+        const uint64_t agree = matchColumnsAgree.load();
+        cout << "  match-column self-check: " << agree << " / " << checked
+             << " agree (" << (checked ? 100.0*double(agree)/double(checked) : 0.0)
+             << "%) -- must be 100%, else the orientation handling is wrong" << endl;
+    }
+    cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;
+    for(size_t i = 0; i < alleleCountHistogram.size(); i++) {
+        const uint64_t count = alleleCountHistogram[i].load();
+        if(count) cout << "    " << i << " alleles: " << count << endl;
+    }
     cout << "  disagreement-fraction histogram (bucket = fraction of covering "
             "partners that disagree):" << endl;
     for(size_t i = 0; i < fractionHistogram.size(); i++) {
