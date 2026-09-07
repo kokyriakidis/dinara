@@ -1252,6 +1252,12 @@ void AssemblerOptions::addConfigurableOptions()
         "the rare allele, which measurably removes real biallelic sites -- see "
         "AssemblerOptions.hpp. Diagnostic only.")
 
+        ("Assembly.mode3.snpSiteStrandBiasPValue",
+        value<double>(&assemblyOptions.mode3Options.snpSiteStrandBiasPValue)->
+        default_value(0.01),
+        "Fisher exact p-value below which a candidate site's minority allele "
+        "is judged strand-biased and dropped.")
+
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
         default_value(false),
@@ -1736,6 +1742,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinDisagree = " << snpSiteMinDisagree << "\n";
     s << "mode3.snpSiteMinFraction = " << snpSiteMinFraction << "\n";
     s << "mode3.snpSiteMaxFraction = " << snpSiteMaxFraction << "\n";
+    s << "mode3.snpSiteStrandBiasPValue = " << snpSiteStrandBiasPValue << "\n";
     s << "mode3.transcribeHetBubbles = " <<
         convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";

@@ -1882,6 +1882,7 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinFraction,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMaxFraction,
             assemblerOptions.assemblyOptions.mode3Options.hetErrorRate,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteStrandBiasPValue,
             threadCount);
     }
 

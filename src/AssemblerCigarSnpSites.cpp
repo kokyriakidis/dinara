@@ -55,6 +55,7 @@
 #include "timestamp.hpp"
 #include "chrono.hpp"
 #include "hetSignificance.hpp"
+#include "PhasingKmeansTypes.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -77,6 +78,7 @@ void Assembler::detectCigarSnpSites(
     double minDisagreeFraction,
     double maxDisagreeFraction,
     double hetErrorRate,
+    double strandBiasPValue,
     uint64_t threadCount)
 {
     if(hifiasmImportedCigarStore.empty()) {
@@ -158,6 +160,8 @@ void Assembler::detectCigarSnpSites(
     for(auto& bucket: fractionHistogram) bucket.store(0);
     std::atomic<uint64_t> candidateSites{0}, positionsExamined{0};
     std::atomic<uint64_t> ownedSites{0}, allelesTotal{0}, significantSites{0};
+    std::atomic<uint64_t> droppedHomopolymer{0}, droppedRepeat{0};
+    std::atomic<uint64_t> droppedStrandBias{0}, sitesAfterFilters{0};
     std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
     for(auto& bucket: significanceHistogram) bucket.store(0);
     std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
@@ -185,7 +189,12 @@ void Assembler::detectCigarSnpSites(
         vector<uint16_t> disagree;
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
-        vector<std::array<uint16_t, 4>> alleleCounts;
+        vector<uint8_t> contextBuffer;
+        // [base][strand]: strand 0 = partner aligned same-strand as the
+        // owning read, 1 = reverse. A real variant should appear on both;
+        // an allele seen only one way is the signature of a strand-specific
+        // systematic error, which is what the Fisher test below tests for.
+        vector<std::array<std::array<uint16_t, 2>, 4>> alleleCounts;
         for(;;) {
             const ReadId readId = nextReadId.fetch_add(1);
             if(readId >= readCount) break;
@@ -369,12 +378,12 @@ void Assembler::detectCigarSnpSites(
             // the few that fall inside a run are found by binary search and
             // their partner offsets computed directly.
             if(!ownedPositions.empty()) {
-                alleleCounts.assign(ownedPositions.size(), {0, 0, 0, 0});
+                alleleCounts.assign(ownedPositions.size(), {});
                 // Seed with this read's own base -- it is a member too.
                 for(size_t k = 0; k < ownedPositions.size(); k++) {
                     const Base self =
                         reads->getOrientedReadBase(OrientedReadId(readId, 0), ownedPositions[k]);
-                    if(self.value < 4) alleleCounts[k][self.value]++;
+                    if(self.value < 4) alleleCounts[k][self.value][0]++;
                 }
 
                 for(const HifiasmImportedCigarStore::Record* rec: records) {
@@ -428,7 +437,7 @@ void Assembler::detectCigarSnpSites(
                                 }
                                 if(base.value < 4) {
                                     alleleCounts[size_t(it - ownedPositions.begin())]
-                                        [base.value]++;
+                                        [base.value][rec->isSameStrand ? 0 : 1]++;
                                 }
                                 // Self-check against the reads themselves, which
                                 // needs no second hifiasm run and so cannot be
@@ -470,13 +479,46 @@ void Assembler::detectCigarSnpSites(
                 // minority one? That is the same test the abPOA detector
                 // applies (now shared, see hetSignificance.hpp), so both
                 // detectors agree on what counts as a site.
-                for(const auto& counts: alleleCounts) {
+                for(size_t k = 0; k < alleleCounts.size(); k++) {
+                    const auto& strandCounts = alleleCounts[k];
+                    std::array<uint16_t, 4> counts{};
+                    for(int b = 0; b < 4; b++) {
+                        counts[b] = uint16_t(strandCounts[b][0] + strandCounts[b][1]);
+                    }
                     uint64_t distinct = 0, total = 0, dominant = 0;
                     for(const uint16_t c: counts) {
                         total += c;
                         if(c >= 2) distinct++;   // a lone read is not an allele
                         if(c > dominant) dominant = c;
                     }
+
+                    // Sequence-context gates, evaluated on THIS read around the
+                    // site. Statistics cannot save us here: ONT homopolymer and
+                    // short-tandem-repeat errors are systematic, so reads
+                    // disagree there consistently and the site looks
+                    // convincingly biallelic to any significance test. Only
+                    // context can reject it. Same primitive the window path
+                    // uses -- unit length 1 is a homopolymer, 2..6 an STR.
+                    const uint32_t sitePosition = ownedPositions[k];
+                    bool inHomopolymer = false, inStr = false;
+                    {
+                        const uint32_t lo = (sitePosition > 16) ? (sitePosition - 16) : 0;
+                        const uint32_t hi = std::min<uint32_t>(readLength, sitePosition + 17);
+                        contextBuffer.clear();
+                        for(uint32_t q = lo; q < hi; q++) {
+                            contextBuffer.push_back(
+                                reads->getOrientedReadBase(OrientedReadId(readId, 0), q).value);
+                        }
+                        KmVarKey key{};
+                        key.type = KmVarType::Snp;
+                        key.pos = uint32_t(sitePosition - lo);
+                        inHomopolymer = kmIsRepeatUnitRange(
+                            contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 1, 1);
+                        inStr = kmIsRepeatUnitRange(
+                            contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 2, 6);
+                    }
+                    if(inHomopolymer) droppedHomopolymer.fetch_add(1, std::memory_order_relaxed);
+                    if(inStr)         droppedRepeat.fetch_add(1, std::memory_order_relaxed);
                     allelesTotal.fetch_add(total, std::memory_order_relaxed);
                     alleleCountHistogram[std::min<size_t>(8, size_t(distinct))]
                         .fetch_add(1, std::memory_order_relaxed);
@@ -496,6 +538,39 @@ void Assembler::detectCigarSnpSites(
                     if(passing >= 2) significantSites.fetch_add(1, std::memory_order_relaxed);
                     significanceHistogram[std::min<size_t>(4, size_t(passing))]
                         .fetch_add(1, std::memory_order_relaxed);
+
+                    // Strand bias, on the strongest minority allele. A real
+                    // variant is seen from both directions; one that is not is
+                    // the signature of a strand-specific systematic error.
+                    // Same form as the longcallD-derived test already in the
+                    // tree: Fisher exact on (fwdAlt, revAlt) against a balanced
+                    // expectation.
+                    bool strandBiased = false;
+                    if(passing >= 2) {
+                        uint64_t altBest = 0; int altBase = -1;
+                        bool dominantTaken = false;
+                        for(int b = 0; b < 4; b++) {
+                            if(counts[b] == 0) continue;
+                            if(!dominantTaken && counts[b] == dominant) { dominantTaken = true; continue; }
+                            if(counts[b] > altBest) { altBest = counts[b]; altBase = b; }
+                        }
+                        if(altBase >= 0) {
+                            const int fa = int(strandCounts[altBase][0]);
+                            const int ra = int(strandCounts[altBase][1]);
+                            const int expected = (fa + ra) / 2;
+                            if(expected > 0) {
+                                const double p = kmFisherExactTwoTail(fa, ra, expected, expected);
+                                if(p < strandBiasPValue) {
+                                    strandBiased = true;
+                                    droppedStrandBias.fetch_add(1, std::memory_order_relaxed);
+                                }
+                            }
+                        }
+                    }
+
+                    if(passing >= 2 && !inHomopolymer && !inStr && !strandBiased) {
+                        sitesAfterFilters.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
 
@@ -549,6 +624,12 @@ void Assembler::detectCigarSnpSites(
         const uint64_t count = significanceHistogram[i].load();
         if(count) cout << "    " << i << ": " << count << endl;
     }
+    cout << "  context/strand filters: " << droppedHomopolymer.load()
+         << " in a homopolymer, " << droppedRepeat.load() << " in an STR, "
+         << droppedStrandBias.load() << " strand-biased (Fisher p < "
+         << strandBiasPValue << ")" << endl;
+    cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
+         << " of " << ownedSites.load() << endl;
     cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;
     for(size_t i = 0; i < alleleCountHistogram.size(); i++) {
         const uint64_t count = alleleCountHistogram[i].load();

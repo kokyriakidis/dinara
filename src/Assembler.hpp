@@ -360,6 +360,7 @@ public:
         double minDisagreeFraction,
         double maxDisagreeFraction,
         double hetErrorRate,
+        double strandBiasPValue,
         uint64_t threadCount);
 
     // New unified alignment flow with evidence storage.

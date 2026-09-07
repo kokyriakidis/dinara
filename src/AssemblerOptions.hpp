@@ -543,6 +543,12 @@ public:
     uint64_t snpSiteMinDisagree = 2;
     double snpSiteMinFraction = 0.0;
     double snpSiteMaxFraction = 1.0;
+    // Fisher exact p-value below which a site's minority allele is judged
+    // strand-biased and dropped. Same test and form as the longcallD-derived
+    // one already in the tree (kmFisherExactTwoTail on fwd/rev alt counts
+    // against a balanced expectation). A real variant is seen from both
+    // directions; one that is not is a strand-specific systematic error.
+    double snpSiteStrandBiasPValue = 0.01;
 
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,
