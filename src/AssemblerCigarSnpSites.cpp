@@ -61,6 +61,10 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <cstdlib>
 
 using namespace dinara;
 using namespace std;
@@ -118,6 +122,21 @@ void Assembler::detectCigarSnpSites(
     std::array<std::atomic<uint64_t>, 9> alleleCountHistogram{};
     for(auto& bucket: alleleCountHistogram) bucket.store(0);
 
+    // Optional parity dump.
+    std::unique_ptr<ofstream> dumpStream;
+    std::mutex dumpMutex;
+    if(const char* path = std::getenv("DINARA_SNP_DUMP")) {
+        dumpStream = std::make_unique<ofstream>(path);
+        cout << timestamp << "SNP-site detection: dumping candidates to "
+             << path << endl;
+    }
+
+    std::unique_ptr<ofstream> pairDumpStream;
+    std::atomic<uint64_t> pairDumpCount{0};
+    if(const char* path = std::getenv("DINARA_SNP_PAIR_DUMP")) {
+        pairDumpStream = std::make_unique<ofstream>(path);
+    }
+
     std::atomic<ReadId> nextReadId{0};
     auto worker = [&]() {
         vector<uint16_t> disagree;
@@ -160,6 +179,36 @@ void Assembler::detectCigarSnpSites(
                     if(to > from && to <= readLength) {
                         coverDelta[from]++;
                         coverDelta[to]--;
+                    }
+                }
+
+                // Per-record parity dump (DINARA_SNP_PAIR_DUMP): one line per
+                // mismatch, "qname tname strand queryPos", for a bounded sample
+                // of records. Comparing these against the same pair's line in
+                // hifiasm's own PAF isolates the walk from any difference in
+                // which overlaps each side has.
+                if(pairDumpStream && selfIsQuery &&
+                   pairDumpCount.fetch_add(1, std::memory_order_relaxed) < 200) {
+                    std::ostringstream buffer;
+                    const auto qn = reads->getReadName(ReadId(rec->readIdQ));
+                    const auto tn = reads->getReadName(ReadId(rec->readIdT));
+                    // Emit the record's whole token stream as a CIGAR string,
+                    // so it can be diffed against hifiasm's own PAF line.
+                    buffer.write(&*qn.begin(), std::streamsize(qn.size()));
+                    buffer << '\t';
+                    buffer.write(&*tn.begin(), std::streamsize(tn.size()));
+                    buffer << '\t' << (rec->isSameStrand ? '+' : '-')
+                           << '\t' << rec->qStart << '\t' << rec->qEnd
+                           << '\t' << rec->tStart << '\t' << rec->tEnd << '\t';
+                    static const char opChar[4] = {'=', 'X', 'I', 'D'};
+                    for(const CigarToken tk: hifiasmImportedCigarStore.tokensOf(*rec)) {
+                        buffer << tk.len() << opChar[tk.op() & 3];
+                    }
+                    buffer << '\n';
+                    const string text = buffer.str();
+                    if(!text.empty()) {
+                        std::lock_guard<std::mutex> lock(dumpMutex);
+                        (*pairDumpStream) << text;
                     }
                 }
 
@@ -244,6 +293,28 @@ void Assembler::detectCigarSnpSites(
                 if(owner == readId) ownedPositions.push_back(position);
             }
             ownedSites.fetch_add(ownedPositions.size(), std::memory_order_relaxed);
+
+            // Parity dump (DINARA_SNP_DUMP=<path>): one line per candidate,
+            // "readName position nDisagree nCovering", so the counts can be
+            // checked against an independent implementation over hifiasm's own
+            // PAF. This is the pre-ownership candidate set, which is what is
+            // comparable -- hifiasm deduplicates nothing, it corrects per read.
+            if(dumpStream) {
+                std::ostringstream buffer;
+                for(const uint32_t position: localCandidates) {
+                    int32_t cov = 0;
+                    for(uint32_t q = 0; q <= position; q++) cov += coverDelta[q];
+                    const auto name = reads->getReadName(readId);
+                    buffer.write(&*name.begin(), std::streamsize(name.size()));
+                    buffer << '\t' << position
+                           << '\t' << disagree[position] << '\t' << cov << '\n';
+                }
+                const string text = buffer.str();
+                if(!text.empty()) {
+                    std::lock_guard<std::mutex> lock(dumpMutex);
+                    (*dumpStream) << text;
+                }
+            }
 
             // PASS 2, for owned sites only: which base does each covering read
             // carry? The agreeing reads are one of the two allele arms, so they
