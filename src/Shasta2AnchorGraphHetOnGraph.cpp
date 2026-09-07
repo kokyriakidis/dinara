@@ -63,6 +63,7 @@
 // margin, always < anchorB's own position for every member read.
 
 #include "Shasta2AnchorGraph.hpp"
+#include "hetSignificance.hpp"
 
 #include "Base.hpp"
 #include "Reads.hpp"
@@ -141,26 +142,6 @@ int hetOnGraphMaxLen()
         return std::atoi(e);
     }();
     return cap;
-}
-
-// Significance level for the allele test below, matching myloasm's SNPmer
-// caller exactly (a conventional threshold, not exposed as a tunable).
-constexpr double hetSignificance = 0.05;
-
-// One-sided binomial test, myloasm-style (get_snpmers_inplace_sort's
-// minor-allele test): the probability of observing AT LEAST `successes` reads
-// carrying a candidate allele, if they arose purely from sequencing errors
-// misreading the run's DOMINANT allele at rate `errorRate`. A p-value at or
-// below hetSignificance means the count is unlikely to be pure noise -- a
-// real second haplotype, not a guess from a fixed count/fraction floor.
-// P(X >= k) = 1 - P(X <= k-1); computed via boost::math's complement idiom
-// rather than 1-cdf(k-1) for numerical stability at small p-values. Returns
-// 1.0 (never significant) for trials == 0 or successes == 0.
-double binomialTailPValue(uint64_t trials, uint64_t successes, double errorRate)
-{
-    if(trials == 0 || successes == 0) return 1.0;
-    const boost::math::binomial_distribution<double> dist(double(trials), errorRate);
-    return boost::math::cdf(boost::math::complement(dist, double(successes) - 1.0));
 }
 
 // Minimum number of convergent columns required between two candidate sites

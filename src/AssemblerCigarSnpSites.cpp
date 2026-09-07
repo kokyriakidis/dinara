@@ -54,6 +54,7 @@
 #include "performanceLog.hpp"
 #include "timestamp.hpp"
 #include "chrono.hpp"
+#include "hetSignificance.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -75,6 +76,7 @@ void Assembler::detectCigarSnpSites(
     uint64_t minDisagreeCount,
     double minDisagreeFraction,
     double maxDisagreeFraction,
+    double hetErrorRate,
     uint64_t threadCount)
 {
     if(hifiasmImportedCigarStore.empty()) {
@@ -155,7 +157,9 @@ void Assembler::detectCigarSnpSites(
     std::array<std::atomic<uint64_t>, 21> fractionHistogram{};
     for(auto& bucket: fractionHistogram) bucket.store(0);
     std::atomic<uint64_t> candidateSites{0}, positionsExamined{0};
-    std::atomic<uint64_t> ownedSites{0}, allelesTotal{0};
+    std::atomic<uint64_t> ownedSites{0}, allelesTotal{0}, significantSites{0};
+    std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
+    for(auto& bucket: significanceHistogram) bucket.store(0);
     std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
     std::atomic<uint64_t> mismatchColumnsChecked{0}, mismatchColumnsDiffer{0};
     std::array<std::atomic<uint64_t>, 9> alleleCountHistogram{};
@@ -455,15 +459,42 @@ void Assembler::detectCigarSnpSites(
                     }
                 }
 
-                // How many distinct bases does each site actually carry?
+                // How many distinct bases does each site actually carry, and
+                // does the site survive the significance test?
+                //
+                // The raw ">= 2 reads" count is a fixed floor and a poor one:
+                // it accepts two independent errors that happen to agree. The
+                // binomial test asks the right question instead -- given this
+                // many reads on the dominant allele and an assumed per-read
+                // error rate, how surprising is it that k reads carry the
+                // minority one? That is the same test the abPOA detector
+                // applies (now shared, see hetSignificance.hpp), so both
+                // detectors agree on what counts as a site.
                 for(const auto& counts: alleleCounts) {
-                    uint64_t distinct = 0, total = 0;
+                    uint64_t distinct = 0, total = 0, dominant = 0;
                     for(const uint16_t c: counts) {
                         total += c;
                         if(c >= 2) distinct++;   // a lone read is not an allele
+                        if(c > dominant) dominant = c;
                     }
                     allelesTotal.fetch_add(total, std::memory_order_relaxed);
                     alleleCountHistogram[std::min<size_t>(8, size_t(distinct))]
+                        .fetch_add(1, std::memory_order_relaxed);
+
+                    // The dominant allele is the implicit reference and is
+                    // never itself tested; every other allele must clear the
+                    // tail probability.
+                    uint64_t passing = 0;
+                    bool dominantSeen = false;
+                    for(const uint16_t c: counts) {
+                        if(c == 0) continue;
+                        if(!dominantSeen && c == dominant) { dominantSeen = true; ++passing; continue; }
+                        if(binomialTailPValue(dominant, c, hetErrorRate) <= hetSignificance) {
+                            ++passing;
+                        }
+                    }
+                    if(passing >= 2) significantSites.fetch_add(1, std::memory_order_relaxed);
+                    significanceHistogram[std::min<size_t>(4, size_t(passing))]
                         .fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -508,6 +539,15 @@ void Assembler::detectCigarSnpSites(
         cout << "  match-column self-check: " << agree << " / " << checked
              << " agree (" << (checked ? 100.0*double(agree)/double(checked) : 0.0)
              << "%) -- must be 100%, else the orientation handling is wrong" << endl;
+    }
+    cout << "  sites passing the binomial significance test (>= 2 alleles "
+            "significant at p <= " << hetSignificance << ", error rate "
+         << hetErrorRate << "): " << significantSites.load() << " of "
+         << ownedSites.load() << endl;
+    cout << "  significant alleles per owned site:" << endl;
+    for(size_t i = 0; i < significanceHistogram.size(); i++) {
+        const uint64_t count = significanceHistogram[i].load();
+        if(count) cout << "    " << i << ": " << count << endl;
     }
     cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;
     for(size_t i = 0; i < alleleCountHistogram.size(); i++) {
