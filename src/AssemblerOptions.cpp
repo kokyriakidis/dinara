@@ -551,11 +551,11 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Align.hifiasmIsOnt",
         value<bool>(&alignOptions.hifiasmIsOnt)->
-        default_value(false),
-        "Run hifiasm's overlapper with its ONT preset (--ont) instead of the "
-        "HiFi default: max overlap error rate 0.04 -> 0.07, alignment window "
-        "775 -> 375, chaining bandwidth 0.02 -> 0.05. Default false preserves "
-        "existing behaviour; see AssemblerOptions.hpp.")
+        default_value(true),
+        "Run hifiasm's overlapper with its ONT preset (--ont): max overlap "
+        "error rate 0.04 -> 0.07, alignment window 775 -> 375, chaining "
+        "bandwidth 0.02 -> 0.05. True by default; set false for HiFi input. "
+        "See AssemblerOptions.hpp for the measured effect.")
 
         ("Align.alignmentWindowLength",
         value<uint32_t>(&alignOptions.alignmentWindowLength)->

@@ -267,17 +267,30 @@ public:
     // the filtering cannot be taken separately.
     bool useHifiasmBaseAlignment = true;
 
-    // Run hifiasm's overlapper with its ONT preset (--ont) rather than the HiFi
-    // default. This was never set, so hifiOpt's zero-init left it 0 and the
-    // overlapper has been running in HiFi mode on ONT reads. It controls
-    // several things at once inside hifiasm:
+    // Run hifiasm's overlapper with its ONT preset (--ont). True by default.
+    //
+    // This was previously never set at all: hifiOpt is zero-initialised, so the
+    // overlapper ran hifiasm's HiFi preset on ONT reads. One flag controls
+    // several things inside hifiasm at once:
     //     max_ov_diff_ec   0.04 -> 0.07   (max overlap error rate)
     //     alignment window  775 -> 375    (WINDOW_HC -> WINDOW_OHC)
     //     chaining band    0.02 -> 0.05   (h_ec_lchain bw_thres)
     //     rl_cut / sc_cut  -1 / 1 -> ONT defaults, is_sc -> 1
-    // A 4% ceiling and a 0.02 band are tight for raw ONT divergence and drift,
-    // so this materially changes which overlaps survive.
-    bool hifiasmIsOnt = false;
+    // A 4% error ceiling and a 0.02 band are tight for raw ONT divergence and
+    // indel drift, so the HiFi preset was discarding real overlaps.
+    //
+    // Measured on the GIAB fixture: overlaps 59614 -> 68514, anchors
+    // 50630 -> 52550, het sites after filtering 425 -> 662, and the
+    // chain-consistency rejection rate -- our measure of marker-graph
+    // corruption -- FELL from 6.8% to 4.9%. More data and cleaner data at
+    // once, which is what you see when a ceiling was cutting signal rather
+    // than noise.
+    //
+    // Note Align.alignmentWindowLength defaults to 375 to match WINDOW_OHC;
+    // that default was only correct once this became true.
+    //
+    // Set false for HiFi input.
+    bool hifiasmIsOnt = true;
 
     // Windowed overlap acceptance, a port of hifiasm's align_hc_ed_post_extz +
     // pass_qovlp rule (see ProjectedAlignment::alignedWindowFraction). Unlike
