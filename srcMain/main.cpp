@@ -1773,6 +1773,7 @@ void dinara::main::assemble(
     hifiOpt.k_mer_length   = markerK;
     hifiOpt.mz_win         = markerK;
     hifiOpt.filter         = overlapReuseFilter;
+    hifiOpt.is_ont         = assemblerOptions.alignOptions.hifiasmIsOnt ? 1 : 0;
     hifiOpt.raw_candidates =
         assemblerOptions.alignOptions.useHifiasmBaseAlignment ? 0 : 1;
     performanceLog << timestamp

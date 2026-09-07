@@ -267,6 +267,18 @@ public:
     // the filtering cannot be taken separately.
     bool useHifiasmBaseAlignment = true;
 
+    // Run hifiasm's overlapper with its ONT preset (--ont) rather than the HiFi
+    // default. This was never set, so hifiOpt's zero-init left it 0 and the
+    // overlapper has been running in HiFi mode on ONT reads. It controls
+    // several things at once inside hifiasm:
+    //     max_ov_diff_ec   0.04 -> 0.07   (max overlap error rate)
+    //     alignment window  775 -> 375    (WINDOW_HC -> WINDOW_OHC)
+    //     chaining band    0.02 -> 0.05   (h_ec_lchain bw_thres)
+    //     rl_cut / sc_cut  -1 / 1 -> ONT defaults, is_sc -> 1
+    // A 4% ceiling and a 0.02 band are tight for raw ONT divergence and drift,
+    // so this materially changes which overlaps survive.
+    bool hifiasmIsOnt = false;
+
     // Windowed overlap acceptance, a port of hifiasm's align_hc_ed_post_extz +
     // pass_qovlp rule (see ProjectedAlignment::alignedWindowFraction). Unlike
     // maxErrorRate, which is a single average over the whole overlap, this is a

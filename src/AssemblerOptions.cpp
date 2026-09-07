@@ -549,6 +549,14 @@ void AssemblerOptions::addConfigurableOptions()
         "pre-alignment candidate set instead: faster and more permissive, but "
         "no CIGAR.")
 
+        ("Align.hifiasmIsOnt",
+        value<bool>(&alignOptions.hifiasmIsOnt)->
+        default_value(false),
+        "Run hifiasm's overlapper with its ONT preset (--ont) instead of the "
+        "HiFi default: max overlap error rate 0.04 -> 0.07, alignment window "
+        "775 -> 375, chaining bandwidth 0.02 -> 0.05. Default false preserves "
+        "existing behaviour; see AssemblerOptions.hpp.")
+
         ("Align.alignmentWindowLength",
         value<uint32_t>(&alignOptions.alignmentWindowLength)->
         default_value(375),
@@ -1588,6 +1596,8 @@ void AlignOptions::write(ostream& s) const
     s << "maxErrorRate = " << maxErrorRate << "\n";
     s << "computeBaseAlignmentCigar = " <<
         convertBoolToPythonString(computeBaseAlignmentCigar) << "\n";
+    s << "hifiasmIsOnt = " <<
+        convertBoolToPythonString(hifiasmIsOnt) << "\n";
     s << "useHifiasmBaseAlignment = " <<
         convertBoolToPythonString(useHifiasmBaseAlignment) << "\n";
     s << "alignmentWindowLength = " << alignmentWindowLength << "\n";
