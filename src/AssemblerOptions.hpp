@@ -549,6 +549,16 @@ public:
     // against a balanced expectation). A real variant is seen from both
     // directions; one that is not is a strand-specific systematic error.
     double snpSiteStrandBiasPValue = 0.01;
+    // hifiasm's biallelic-reduction gates (Correct.cpp, before
+    // InsertSNPVector). It does not split a multi-allelic site into several
+    // binary ones -- it picks the single strongest alternate and requires the
+    // site to be effectively biallelic, dropping it if two alternates tie, if
+    // reference+alternate do not account for snpSiteMinPurity of the pileup, or
+    // if the alternate is not snpSiteMinAltDominance of all the disagreement.
+    // Note hifiasm's own source marks both thresholds "Fix-attention: looks
+    // definitely wrong", so they are values to revisit, not gospel.
+    double snpSiteMinPurity = 0.95;
+    double snpSiteMinAltDominance = 0.70;
 
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,

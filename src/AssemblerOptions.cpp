@@ -1258,6 +1258,18 @@ void AssemblerOptions::addConfigurableOptions()
         "Fisher exact p-value below which a candidate site's minority allele "
         "is judged strand-biased and dropped.")
 
+        ("Assembly.mode3.snpSiteMinPurity",
+        value<double>(&assemblyOptions.mode3Options.snpSiteMinPurity)->
+        default_value(0.95),
+        "Reference plus chosen alternate must account for at least this "
+        "fraction of the reads at a candidate site (hifiasm's rule).")
+
+        ("Assembly.mode3.snpSiteMinAltDominance",
+        value<double>(&assemblyOptions.mode3Options.snpSiteMinAltDominance)->
+        default_value(0.70),
+        "The chosen alternate must be at least this fraction of all the "
+        "disagreeing reads at a candidate site (hifiasm's rule).")
+
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
         default_value(false),
@@ -1743,6 +1755,8 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinFraction = " << snpSiteMinFraction << "\n";
     s << "mode3.snpSiteMaxFraction = " << snpSiteMaxFraction << "\n";
     s << "mode3.snpSiteStrandBiasPValue = " << snpSiteStrandBiasPValue << "\n";
+    s << "mode3.snpSiteMinPurity = " << snpSiteMinPurity << "\n";
+    s << "mode3.snpSiteMinAltDominance = " << snpSiteMinAltDominance << "\n";
     s << "mode3.transcribeHetBubbles = " <<
         convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";

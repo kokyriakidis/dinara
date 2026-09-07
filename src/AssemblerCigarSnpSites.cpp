@@ -79,6 +79,8 @@ void Assembler::detectCigarSnpSites(
     double maxDisagreeFraction,
     double hetErrorRate,
     double strandBiasPValue,
+    double siteMinPurity,
+    double siteMinAltDominance,
     uint64_t threadCount)
 {
     if(hifiasmImportedCigarStore.empty()) {
@@ -162,6 +164,7 @@ void Assembler::detectCigarSnpSites(
     std::atomic<uint64_t> ownedSites{0}, allelesTotal{0}, significantSites{0};
     std::atomic<uint64_t> droppedHomopolymer{0}, droppedRepeat{0};
     std::atomic<uint64_t> droppedStrandBias{0}, sitesAfterFilters{0};
+    std::atomic<uint64_t> droppedTiedAlleles{0}, droppedImpure{0}, droppedNotDominant{0};
     std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
     for(auto& bucket: significanceHistogram) bucket.store(0);
     std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
@@ -539,6 +542,54 @@ void Assembler::detectCigarSnpSites(
                     significanceHistogram[std::min<size_t>(4, size_t(passing))]
                         .fetch_add(1, std::memory_order_relaxed);
 
+                    // Reduce the site to biallelic, or reject it -- hifiasm's
+                    // rule (Correct.cpp, the gates before InsertSNPVector). It
+                    // does not split a multi-allelic site into several binary
+                    // ones; it picks the single strongest alternate and demands
+                    // the site be effectively biallelic, dropping it otherwise.
+                    // The binomial test above says an allele is not noise; these
+                    // say the SITE is clean enough to phase on.
+                    uint64_t bestAlt = 0; int bestAltBase = -1; uint64_t ties = 0;
+                    {
+                        bool dominantTaken = false;
+                        for(int b = 0; b < 4; b++) {
+                            if(counts[b] == 0) continue;
+                            if(!dominantTaken && counts[b] == dominant) { dominantTaken = true; continue; }
+                            if(counts[b] > bestAlt) { bestAlt = counts[b]; bestAltBase = b; }
+                        }
+                        // Two alternates tied at the top: which one is the other
+                        // haplotype is ambiguous, so hifiasm drops the site.
+                        if(bestAltBase >= 0) {
+                            bool takenAgain = false;
+                            for(int b = 0; b < 4; b++) {
+                                if(counts[b] == 0) continue;
+                                if(!takenAgain && counts[b] == dominant) { takenAgain = true; continue; }
+                                if(b != bestAltBase && counts[b] == bestAlt) ties++;
+                            }
+                        }
+                    }
+                    bool biallelicClean = (bestAltBase >= 0) && (bestAlt >= 2) && (ties == 0);
+                    if(biallelicClean) {
+                        // Reference plus the chosen alternate must account for
+                        // essentially the whole pileup.
+                        if(double(dominant + bestAlt) / double(total > 0 ? total : 1)
+                           < siteMinPurity) {
+                            biallelicClean = false;
+                            droppedImpure.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            // And the chosen alternate must dominate the
+                            // disagreement, not merely lead a scattered field.
+                            const uint64_t disagreeing = (total > dominant) ? (total - dominant) : 0;
+                            if(disagreeing > 0 &&
+                               double(bestAlt) / double(disagreeing) < siteMinAltDominance) {
+                                biallelicClean = false;
+                                droppedNotDominant.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    } else if(ties > 0) {
+                        droppedTiedAlleles.fetch_add(1, std::memory_order_relaxed);
+                    }
+
                     // Strand bias, on the strongest minority allele. A real
                     // variant is seen from both directions; one that is not is
                     // the signature of a strand-specific systematic error.
@@ -568,7 +619,8 @@ void Assembler::detectCigarSnpSites(
                         }
                     }
 
-                    if(passing >= 2 && !inHomopolymer && !inStr && !strandBiased) {
+                    if(passing >= 2 && biallelicClean &&
+                       !inHomopolymer && !inStr && !strandBiased) {
                         sitesAfterFilters.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -628,6 +680,11 @@ void Assembler::detectCigarSnpSites(
          << " in a homopolymer, " << droppedRepeat.load() << " in an STR, "
          << droppedStrandBias.load() << " strand-biased (Fisher p < "
          << strandBiasPValue << ")" << endl;
+    cout << "  biallelic reduction (hifiasm's rule): "
+         << droppedTiedAlleles.load() << " with tied alternates, "
+         << droppedImpure.load() << " below " << siteMinPurity << " purity, "
+         << droppedNotDominant.load() << " alternate below "
+         << siteMinAltDominance << " of the disagreement" << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
          << " of " << ownedSites.load() << endl;
     cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;
