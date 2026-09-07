@@ -110,6 +110,44 @@ void Assembler::detectCigarSnpSites(
             ++usable;
         });
 
+    // DINARA_DUMP_IMPORTED_PAF: write the records exactly as imported, as a
+    // PAF with CIGARs. This pins the comparison input: the reads, the filter
+    // and the seeding are whatever THIS run used, so an independent
+    // implementation reading this file sees precisely what detection sees.
+    // Comparing against a separately-run hifiasm cannot do that -- its filter
+    // and read set differ, and it legitimately spells alignments differently.
+    //
+    // Ops are written in DINARA's convention: '=' match, 'X' mismatch,
+    // 'I' consumes the query, 'D' consumes the target. Column 1 is dinara's
+    // query (hifiasm's x), NOT the PAF role order hifiasm's own writer uses.
+    if(const char* pafPath = std::getenv("DINARA_DUMP_IMPORTED_PAF")) {
+        ofstream paf(pafPath);
+        static const char opChar[4] = {'=', 'X', 'I', 'D'};
+        uint64_t written = 0;
+        hifiasmImportedCigarStore.forEachRecord(
+            [&](const HifiasmImportedCigarStore::Record& rec) {
+                if(rec.cigarTokenCount == 0) return;
+                if(rec.readIdQ >= readCount || rec.readIdT >= readCount) return;
+                const auto qn = reads->getReadName(ReadId(rec.readIdQ));
+                const auto tn = reads->getReadName(ReadId(rec.readIdT));
+                paf.write(&*qn.begin(), std::streamsize(qn.size()));
+                paf << '\t' << reads->getRead(ReadId(rec.readIdQ)).baseCount
+                    << '\t' << rec.qStart << '\t' << rec.qEnd
+                    << '\t' << (rec.isSameStrand ? '+' : '-') << '\t';
+                paf.write(&*tn.begin(), std::streamsize(tn.size()));
+                paf << '\t' << reads->getRead(ReadId(rec.readIdT)).baseCount
+                    << '\t' << rec.tStart << '\t' << rec.tEnd
+                    << "\t0\t0\t255\tcg:Z:";
+                for(const CigarToken tk: hifiasmImportedCigarStore.tokensOf(rec)) {
+                    paf << tk.len() << opChar[tk.op() & 3];
+                }
+                paf << '\n';
+                ++written;
+            });
+        cout << timestamp << "SNP-site detection: wrote " << written
+             << " imported records to " << pafPath << endl;
+    }
+
     cout << timestamp << "SNP-site detection: " << usable << " usable records ("
          << skippedShort << " skipped, CIGAR shorter than its box; "
          << skippedNoCigar << " with no CIGAR)." << endl;
