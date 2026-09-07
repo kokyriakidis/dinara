@@ -120,6 +120,7 @@ void Assembler::detectCigarSnpSites(
     std::atomic<uint64_t> candidateSites{0}, positionsExamined{0};
     std::atomic<uint64_t> ownedSites{0}, allelesTotal{0};
     std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
+    std::atomic<uint64_t> mismatchColumnsChecked{0}, mismatchColumnsDiffer{0};
     std::array<std::atomic<uint64_t>, 9> alleleCountHistogram{};
     for(auto& bucket: alleleCountHistogram) bucket.store(0);
 
@@ -439,15 +440,26 @@ void Assembler::detectCigarSnpSites(
                                     alleleCounts[size_t(it - ownedPositions.begin())]
                                         [base.value]++;
                                 }
-                                // Self-check: at a MATCH column the two bases
-                                // must be identical. If the orientation handling
-                                // above is wrong this is where it shows.
+                                // Self-check against the reads themselves, which
+                                // needs no second hifiasm run and so cannot be
+                                // confounded by seeding differences. At a MATCH
+                                // column the two bases must be identical; at a
+                                // MISMATCH column they must differ. The first
+                                // catches bad orientation handling, the second
+                                // catches a mismatch we report that hifiasm's
+                                // CIGAR and the sequence do not support -- which
+                                // is exactly what "full parity for SNPs" means.
+                                const Base self = reads->getOrientedReadBase(
+                                    OrientedReadId(readId, 0), *it);
                                 if(op == CigarOpMatch) {
-                                    const Base self = reads->getOrientedReadBase(
-                                        OrientedReadId(readId, 0), *it);
                                     matchColumnsChecked.fetch_add(1, std::memory_order_relaxed);
                                     if(self.value == base.value) {
                                         matchColumnsAgree.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                } else {
+                                    mismatchColumnsChecked.fetch_add(1, std::memory_order_relaxed);
+                                    if(self.value != base.value) {
+                                        mismatchColumnsDiffer.fetch_add(1, std::memory_order_relaxed);
                                     }
                                 }
                             }
@@ -500,6 +512,13 @@ void Assembler::detectCigarSnpSites(
     {
         const uint64_t checked = matchColumnsChecked.load();
         const uint64_t agree = matchColumnsAgree.load();
+        const uint64_t mchecked = mismatchColumnsChecked.load();
+        const uint64_t mdiffer = mismatchColumnsDiffer.load();
+        cout << "  mismatch-column self-check: " << mdiffer << " / " << mchecked
+             << " really differ ("
+             << (mchecked ? 100.0*double(mdiffer)/double(mchecked) : 0.0)
+             << "%) -- must be 100%, else we report SNPs the sequence "
+                "does not support" << endl;
         cout << "  match-column self-check: " << agree << " / " << checked
              << " agree (" << (checked ? 100.0*double(agree)/double(checked) : 0.0)
              << "%) -- must be 100%, else the orientation handling is wrong" << endl;
