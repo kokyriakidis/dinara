@@ -170,7 +170,7 @@ void Assembler::detectCigarSnpSites(
     std::atomic<uint64_t> droppedHomopolymer{0}, droppedRepeat{0};
     std::atomic<uint64_t> droppedStrandBias{0}, sitesAfterFilters{0};
     std::atomic<uint64_t> droppedTiedAlleles{0}, droppedImpure{0}, droppedNotDominant{0};
-    std::atomic<uint64_t> droppedLowCoverage{0};
+    std::atomic<uint64_t> droppedLowCoverage{0}, droppedAdjacent{0};
     std::mutex sitesMutex;
     std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
     for(auto& bucket: significanceHistogram) bucket.store(0);
@@ -205,6 +205,7 @@ void Assembler::detectCigarSnpSites(
         // member list is what appendHetAnchorPair takes.
         vector<std::array<vector<pair<OrientedReadId, uint32_t>>, 4>> alleleMembers;
         vector<CigarSnpSite> localSitesOut;
+        vector<uint32_t> localSitePositions;
         // [base][strand]: strand 0 = partner aligned same-strand as the
         // owning read, 1 = reverse. A real variant should appear on both;
         // an allele seen only one way is the signature of a strand-specific
@@ -645,20 +646,28 @@ void Assembler::detectCigarSnpSites(
                         }
                     }
 
-                    // Coverage and VAF gate, hifiasm's sliding rule
-                    // (filter_one_snp_advance_nearby in Correct.h). The
-                    // required allele fraction depends on the minor allele's
-                    // raw COUNT: a well-supported minor allele needs only a
-                    // modest fraction, a thinly-supported one has to be much
-                    // closer to balanced, and either way the two alleles
-                    // together need a floor of reads.
+                    // Coverage and VAF gate. The shape is taken from
+                    // hifiasm's filter_one_snp_advance_nearby -- the required
+                    // allele fraction depends on the minor allele's raw COUNT,
+                    // so a well-supported minor allele needs only a modest
+                    // fraction while a thin one must be closer to balanced --
+                    // but this is a REINTERPRETATION, not a copy, on two
+                    // counts. That function is part of hifiasm's LEGACY
+                    // clustering path (reachable only from cluster_advance /
+                    // cluster_ul_advance, not from the live rphase_hc EC path),
+                    // and there it filters whole candidate haplotype VECTORS
+                    // inside a path DP, with occ_0/occ_1 being the read
+                    // partition induced by a set of SNPs. Here the same
+                    // arithmetic is applied to ONE site with that site's own
+                    // allele counts. Defensible on its own terms -- it lands
+                    // the site count in the range heterozygosity predicts --
+                    // but do not read it as parity with hifiasm.
                     //
-                    // This is not the fraction window removed from detection
-                    // earlier -- that gated the raw disagreement rate before
-                    // alleles were even partitioned, which discarded low-VAF
-                    // sites wholesale. This is the minor ALLELE's fraction,
-                    // measured after partitioning, which is the principled
-                    // place for it; hifiasm puts it here too.
+                    // Note this is not the fraction window removed from
+                    // detection earlier. That gated the raw disagreement rate
+                    // before alleles were partitioned, discarding low-VAF sites
+                    // wholesale. This is the minor ALLELE's fraction after
+                    // partitioning.
                     //
                     // A floor is needed regardless because the binomial test
                     // turns permissive exactly where it should not: at a
@@ -705,6 +714,7 @@ void Assembler::detectCigarSnpSites(
                                 site.alleles.push_back(alleleMembers[k][dominantBase]);
                                 site.alleles.push_back(alleleMembers[k][bestAltBase]);
                                 localSitesOut.push_back(std::move(site));
+                                localSitePositions.push_back(sitePosition);
                             }
                         }
                     }
@@ -712,11 +722,32 @@ void Assembler::detectCigarSnpSites(
             }
 
             if(sitesOut && !localSitesOut.empty()) {
-                std::lock_guard<std::mutex> lock(sitesMutex);
-                for(CigarSnpSite& site: localSitesOut) {
-                    sitesOut->push_back(std::move(site));
+                // Adjacent-site rejection, from the LIVE ONT path
+                // (generate_haplotypes_naive_HiFi's "filter snps" loop, which
+                // drops any site whose neighbour sits at site +/- 1). Two het
+                // sites at consecutive bases are almost always one misplaced
+                // indel spelled as two substitutions -- exactly the
+                // substitution-vs-indel spelling ambiguity the CIGAR
+                // comparison turned up -- rather than two independent
+                // variants. Positions here are all on this one read and were
+                // produced in ascending order, so neighbours are adjacent
+                // entries.
+                for(size_t k = 0; k < localSitePositions.size(); k++) {
+                    const bool prevAdjacent = (k > 0) &&
+                        (localSitePositions[k] == localSitePositions[k - 1] + 1);
+                    const bool nextAdjacent = (k + 1 < localSitePositions.size()) &&
+                        (localSitePositions[k] + 1 == localSitePositions[k + 1]);
+                    if(prevAdjacent || nextAdjacent) {
+                        droppedAdjacent.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    std::lock_guard<std::mutex> lock(sitesMutex);
+                    sitesOut->push_back(std::move(localSitesOut[k]));
                 }
                 localSitesOut.clear();
+                localSitePositions.clear();
+            } else if(sitesOut) {
+                localSitePositions.clear();
             }
 
             candidateSites.fetch_add(localSites, std::memory_order_relaxed);
@@ -782,6 +813,8 @@ void Assembler::detectCigarSnpSites(
          << ", VAF >= " << vafStrong << " when alt >= " << strongAltCount
          << " else >= " << vafWeak << "): "
          << droppedLowCoverage.load() << endl;
+    cout << "  adjacent to another site (+/- 1 bp, hifiasm's live ONT rule): "
+         << droppedAdjacent.load() << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
          << " of " << ownedSites.load() << endl;
     cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;
