@@ -81,10 +81,6 @@ void Assembler::detectCigarSnpSites(
     double strandBiasPValue,
     double siteMinPurity,
     double siteMinAltDominance,
-    uint64_t minSiteCoverage,
-    uint64_t strongAltCount,
-    double vafStrong,
-    double vafWeak,
     double alleleCoverageRate,
     uint64_t alleleCoverageFloor,
     uint64_t ploidy,
@@ -205,6 +201,13 @@ void Assembler::detectCigarSnpSites(
     std::atomic<uint64_t> droppedStrandBias{0}, sitesAfterFilters{0};
     std::atomic<uint64_t> droppedTiedAlleles{0}, droppedImpure{0}, droppedNotDominant{0};
     std::atomic<uint64_t> droppedLowCoverage{0}, droppedAdjacent{0};
+    // Indexed [binomialPass*2 + ccPass], so cell 1 = passed cc but not the
+    // binomial (= rejected by the binomial alone) and cell 2 = the reverse.
+    // Cross-check when reading these: cells 0+2 must sum to droppedLowCoverage
+    // (every cc rejection) and cells 0+1 to the binomial's own rejection count.
+    std::array<std::atomic<uint64_t>, 4> binomialVsCc{};
+    std::atomic<uint64_t> noAlternateSites{0};
+    for(auto& cell: binomialVsCc) cell.store(0);
     std::mutex sitesMutex;
     std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
     for(auto& bucket: significanceHistogram) bucket.store(0);
@@ -680,56 +683,63 @@ void Assembler::detectCigarSnpSites(
                         }
                     }
 
-                    // Coverage and VAF gate. The shape is taken from
-                    // hifiasm's filter_one_snp_advance_nearby -- the required
-                    // allele fraction depends on the minor allele's raw COUNT,
-                    // so a well-supported minor allele needs only a modest
-                    // fraction while a thin one must be closer to balanced --
-                    // but this is a REINTERPRETATION, not a copy, on two
-                    // counts. That function is part of hifiasm's LEGACY
-                    // clustering path (reachable only from cluster_advance /
-                    // cluster_ul_advance, not from the live rphase_hc EC path),
-                    // and there it filters whole candidate haplotype VECTORS
-                    // inside a path DP, with occ_0/occ_1 being the read
-                    // partition induced by a set of SNPs. Here the same
-                    // arithmetic is applied to ONE site with that site's own
-                    // allele counts. Defensible on its own terms -- it lands
-                    // the site count in the range heterozygosity predicts --
-                    // but do not read it as parity with hifiasm.
+                    // Absolute depth floor on the MAJOR allele: hifiasm's
+                    // cc, and nothing else.
                     //
-                    // Note this is not the fraction window removed from
-                    // detection earlier. That gated the raw disagreement rate
-                    // before alleles were partitioned, discarding low-VAF sites
-                    // wholesale. This is the minor ALLELE's fraction after
-                    // partitioning.
-                    //
-                    // A floor is needed regardless because the binomial test
-                    // turns permissive exactly where it should not: at a
+                    // The binomial test above and this floor interrogate
+                    // DIFFERENT alleles, which is why both are needed and why
+                    // neither subsumes the other. The binomial asks whether the
+                    // MINOR allele is too large to be a misread of the dominant
+                    // one -- a purely RELATIVE question, with no notion of
+                    // absolute depth. That is exactly where it fails: at a
                     // dominant count of 1, P(X >= 1) at the assumed error rate
-                    // IS that rate, so single-read alleles clear the bar
-                    // wherever coverage is thin. The abPOA detector is
-                    // insulated by minCommonForHet; this path was not.
-                    bool enoughCoverage = false;
+                    // IS that rate, so a 1-vs-1 site clears p <= 0.05 wherever
+                    // coverage is thin. cc asks the complementary question --
+                    // does the MAJOR allele carry the support a real haplotype
+                    // would, measured against this dataset's own het coverage
+                    // peak -- and so supplies precisely the depth the binomial
+                    // test cannot see.
+                    //
+                    // This replaces a pair of VAF thresholds previously applied
+                    // here, whose shape came from hifiasm's
+                    // filter_one_snp_advance_nearby. Those are gone deliberately:
+                    // that function is part of hifiasm's LEGACY clustering path
+                    // (reachable only from cluster_advance / cluster_ul_advance,
+                    // never from the live rphase_hc EC path), it filters whole
+                    // candidate haplotype VECTORS inside a path DP rather than
+                    // one site, and its constants were tuned against a
+                    // fraction-window prefilter this detector does not have. cc
+                    // is from the live path, is derived from the run's measured
+                    // coverage rather than fixed, and gates the quantity the
+                    // binomial test leaves ungated -- so layering the VAF
+                    // clauses on top of it only removed sites twice for the same
+                    // reason, with the weaker justification.
+                    bool enoughCoverage = false, ccPass = false;
                     if(bestAltBase >= 0) {
-                        const uint64_t pairTotal = dominant + bestAlt;
-                        const double vaf = (pairTotal > 0) ?
-                            (double(bestAlt) / double(pairTotal)) : 0.0;
-                        // hifiasm's cc: the MAJOR allele must carry the
-                        // support a real haplotype would.
-                        if(dominant >= minAlleleCoverage && pairTotal >= minSiteCoverage) {
-                            if(bestAlt >= strongAltCount) {
-                                enoughCoverage = (vaf >= vafStrong);
-                            } else {
-                                // hifiasm also requires the major allele to
-                                // clear MIN_COVERAGE_THRESHOLD (3) here, i.e.
-                                // occ_0 >= 4, so a thin minor allele is only
-                                // trusted against a solid major one.
-                                enoughCoverage = (vaf >= vafWeak) && (dominant >= 4);
-                            }
-                        }
+                        ccPass = (dominant >= minAlleleCoverage);
+                        enoughCoverage = ccPass;
                     }
                     if(!enoughCoverage) {
                         droppedLowCoverage.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    // How much do the binomial test and cc actually overlap?
+                    // They interrogate different alleles -- the binomial asks
+                    // whether the MINOR allele is too large to be error, cc
+                    // whether the MAJOR allele is large enough to be a
+                    // haplotype -- so they should reject largely different
+                    // sites. Counted here over every owned site, independent of
+                    // the other gates, purely to see that.
+                    // Restricted to sites that HAVE an alternate allele: a
+                    // site with none has no minor allele for either test to
+                    // interrogate, and counting it would score as a cc
+                    // rejection something neither test is really deciding.
+                    if(bestAltBase >= 0) {
+                        const bool binomialPass = (passing >= 2);
+                        const size_t cell = (binomialPass ? 2 : 0) + (ccPass ? 1 : 0);
+                        binomialVsCc[cell].fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        noAlternateSites.fetch_add(1, std::memory_order_relaxed);
                     }
 
                     if(passing >= 2 && biallelicClean && enoughCoverage &&
@@ -845,10 +855,16 @@ void Assembler::detectCigarSnpSites(
          << droppedImpure.load() << " below " << siteMinPurity << " purity, "
          << droppedNotDominant.load() << " alternate below "
          << siteMinAltDominance << " of the disagreement" << endl;
-    cout << "  below the coverage/VAF gate (pair total >= " << minSiteCoverage
-         << ", VAF >= " << vafStrong << " when alt >= " << strongAltCount
-         << " else >= " << vafWeak << "): "
-         << droppedLowCoverage.load() << endl;
+    cout << "  below the major-allele depth floor (cc = " << minAlleleCoverage
+         << "): " << droppedLowCoverage.load() << endl;
+    cout << "  binomial vs cc, over all owned sites (they gate different "
+            "alleles, so they should reject different sites):"
+         << "\n    rejected by both          : " << binomialVsCc[0].load()
+         << "\n    rejected by binomial only : " << binomialVsCc[1].load()
+         << "\n    rejected by cc only       : " << binomialVsCc[2].load()
+         << "\n    passed by both            : " << binomialVsCc[3].load()
+         << "\n    (excludes " << noAlternateSites.load()
+         << " owned sites with no alternate allele at all)" << endl;
     cout << "  adjacent to another site (+/- 1 bp, hifiasm's live ONT rule): "
          << droppedAdjacent.load() << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
