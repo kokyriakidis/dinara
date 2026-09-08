@@ -584,6 +584,14 @@ public:
     // definitely wrong", so they are values to revisit, not gospel.
     double snpSiteMinPurity = 0.95;
     double snpSiteMinAltDominance = 0.70;
+    // When two independent anchors land on the same base of one read, shasta2
+    // forbids keeping both (positionOffsetAB asserts strictly increasing
+    // positions), so one must lose. True keeps the het anchor, false the
+    // primary. True by default: preferring primary made het anchors lose EVERY
+    // collision they were in (11.1% of all het-anchor occurrences), while the
+    // primary that loses instead carries ~2x the coverage and pays
+    // proportionally far less.
+    bool journeyTiePreferHet = true;
     // Minimum minor-allele fraction for a het site. Measured against the
     // published HG002 mat-vs-pat het track: false positives cluster at VAF ~0.1
     // and real hets at 0.4-0.5, so 0.25 separates them cleanly (precision

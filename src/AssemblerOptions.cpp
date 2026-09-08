@@ -1296,6 +1296,12 @@ void AssemblerOptions::addConfigurableOptions()
         "Ploidy used to derive per-haplotype coverage from the homozygous peak "
         "when the heterozygous peak is unknown (hifiasm's polyploidy).")
 
+        ("Assembly.mode3.journeyTiePreferHet",
+        value<bool>(&assemblyOptions.mode3Options.journeyTiePreferHet)->
+        default_value(true),
+        "When two anchors land on the same base of one read, keep the het "
+        "anchor (true) or the primary (false). Only one can survive.")
+
         ("Assembly.mode3.snpSiteMinAlleleFraction",
         value<double>(&assemblyOptions.mode3Options.snpSiteMinAlleleFraction)->
         default_value(0.25),
@@ -1810,6 +1816,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinAltDominance = " << snpSiteMinAltDominance << "\n";
     s << "mode3.snpSiteAlleleCoverageRate = " << snpSiteAlleleCoverageRate << "\n";
     s << "mode3.snpSiteAlleleCoverageFloor = " << snpSiteAlleleCoverageFloor << "\n";
+    s << "mode3.journeyTiePreferHet = " << convertBoolToPythonString(journeyTiePreferHet) << "\n";
     s << "mode3.snpSiteMinAlleleFraction = " << snpSiteMinAlleleFraction << "\n";
     s << "mode3.snpSiteFilterHomopolymer = " << convertBoolToPythonString(snpSiteFilterHomopolymer) << "\n";
     s << "mode3.snpSiteFilterStr = " << convertBoolToPythonString(snpSiteFilterStr) << "\n";

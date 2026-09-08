@@ -2845,6 +2845,8 @@ void dinara::main::assemble(
         cout << timestamp << "Rebuilding journeys to include "
              << (shasta2Anchors->size() - newAnchorsBegin)
              << " new het anchors..." << endl;
+        shasta2Journeys->journeyTiePreferHet =
+            assemblerOptions.assemblyOptions.mode3Options.journeyTiePreferHet;
         shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
     }
     cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
@@ -2929,7 +2931,32 @@ void dinara::main::assemble(
         // So take the flag from the journeys object rather than repeating the
         // policy, which is what let them drift apart in the first place.
         const bool preferHet = shasta2Journeys->journeyTiePreferHet;
+
+        // Members still standing on each canonical anchor, decremented as drops
+        // are recorded. Used to keep tie resolution from ever emptying an
+        // anchor: an anchor whose LAST member is about to be dropped wins the
+        // tie outright, ahead of the het/primary preference.
+        //
+        // Without this the resolution can starve an anchor completely, and
+        // measurably did -- exactly 4 anchors on the 989-read fixture, whose
+        // whole membership is tied against some other anchor. The class
+        // preference only decided which kind got starved: preferring het
+        // emptied 4 primary anchors, preferring primary emptied 4 HET ones
+        // (426 -> 422 with members). An emptied anchor is exported as an empty
+        // record, because writeExternalAnchors must not skip anything or
+        // shasta2's sequential IDs stop matching dinara's -- so the anchor does
+        // not disappear, it becomes a hole in the graph that no read traverses.
+        std::unordered_map<Shasta2AnchorId, uint64_t> remaining;
+        for(Shasta2AnchorId id = 0; id < anchorCount; id += 2) {
+            remaining[id] = coverageOf(id);
+        }
+        auto wouldEmpty = [&](Shasta2AnchorId id) -> bool {
+            const auto it = remaining.find(id);
+            return it != remaining.end() && it->second <= 1;
+        };
         auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
+            const bool aLast = wouldEmpty(a), bLast = wouldEmpty(b);
+            if(aLast != bLast) return aLast;    // never empty an anchor
             const bool aHet = isHet(a), bHet = isHet(b);
             if(aHet != bHet) return preferHet ? aHet : !aHet;
             const uint64_t ca = coverageOf(a), cb = coverageOf(b);
@@ -2937,11 +2964,15 @@ void dinara::main::assemble(
             return a < b;                                   // lower id wins
         };
         // Record a dropped unit (canonicalId, readId), de-duplicated.
-        auto recordDrop = [&](Shasta2AnchorId canonicalId, ReadId readId) {
+        auto recordDrop = [&](Shasta2AnchorId canonicalId, ReadId readId) -> bool {
             auto& v = journeyTieDropMap[canonicalId];
             if(std::find(v.begin(), v.end(), readId) == v.end()) {
                 v.push_back(readId);
+                auto it = remaining.find(canonicalId);
+                if(it != remaining.end() && it->second > 0) --it->second;
+                return true;
             }
+            return false;
         };
         uint64_t tieGroups = 0, unitsDropped = 0, readsWithTie = 0;
         // Split the drops by class. With preferHet set, this must report ZERO
@@ -3014,6 +3045,11 @@ void dinara::main::assemble(
         cout << timestamp << "  tie groups by class: primary-vs-het="
              << tgPrimaryVsHet << " het-vs-het=" << tgHetVsHet
              << " primary-vs-primary=" << tgPrimaryVsPrimary << "." << endl;
+        uint64_t emptied = 0;
+        for(const auto& [id, n]: remaining) { static_cast<void>(id); if(n == 0) ++emptied; }
+        cout << timestamp << "  anchors emptied by tie resolution: " << emptied
+             << (emptied == 0 ? "  (none -- an anchor's last member always wins)" : "")
+             << endl;
         cout << timestamp << "  dropped units by class: het=" << unitsDroppedHet
              << " primary=" << unitsDroppedPrimary
              << (preferHet && unitsDroppedHet == 0 ?
