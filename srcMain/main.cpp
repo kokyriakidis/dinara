@@ -2909,11 +2909,29 @@ void dinara::main::assemble(
         auto coverageOf = [&](Shasta2AnchorId canonicalId) -> uint64_t {
             return (*shasta2Anchors)[canonicalId].size();
         };
-        // Prefer to KEEP: primary over het/hom, then higher coverage, then lower
-        // canonical id. Returns true if a should be kept over b.
+        // Prefer to KEEP: het/hom over primary (see below), then higher
+        // coverage, then lower canonical id. Returns true if a should be kept
+        // over b.
+        //
+        // This MUST use the same preference as the journey rebuild
+        // (Shasta2Journeys.cpp), and for a while it did not. Both resolve the
+        // same ties -- two anchors on one base of one read, which shasta2
+        // forbids -- but they resolve them on different artifacts: the rebuild
+        // drops a journey occurrence, this drops a member from the anchor that
+        // gets exported. When the rebuild switched to keeping het and this did
+        // not, the two disagreed on all 457 ties (914 here, since this walks
+        // both strands): the journeys and the anchor graph kept the het
+        // occurrence while the exported external anchors had that same het
+        // member stripped. The artifacts shasta2 loads then described different
+        // graphs, and the tie-break fix was silently undone on the only path
+        // that leaves this process.
+        //
+        // So take the flag from the journeys object rather than repeating the
+        // policy, which is what let them drift apart in the first place.
+        const bool preferHet = shasta2Journeys->journeyTiePreferHet;
         auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
             const bool aHet = isHet(a), bHet = isHet(b);
-            if(aHet != bHet) return !aHet;                 // primary wins
+            if(aHet != bHet) return preferHet ? aHet : !aHet;
             const uint64_t ca = coverageOf(a), cb = coverageOf(b);
             if(ca != cb) return ca > cb;                    // higher coverage wins
             return a < b;                                   // lower id wins
