@@ -418,8 +418,19 @@ void Assembler::detectCigarSnpSites(
             //
             // Two reads viewing the same locus agree on the owner because they
             // minimise over the same covering set. They can disagree only where
-            // their overlap sets differ, which costs an occasional duplicate,
-            // not a systematic failure.
+            // their overlap sets differ.
+            //
+            // That disagreement is NOT only a duplicate risk: it can silently
+            // DROP a site. Ownership is elected over the covering reads without
+            // asking whether the position is a candidate on the winner, so a
+            // read that did find the site yields to a lower ReadId that never
+            // did -- because that read's own overlap set leaves it with <= 1
+            // disagreeing partner there -- and then nobody runs pass 2 on it.
+            // Measured against the HG002 truth track on the 989-read fixture:
+            // 5 of 224 verifiable het SNVs (2.2% of recall) are lost exactly
+            // this way. Fixing it needs the owner elected among reads that hold
+            // the position as a candidate, which is not locally knowable here;
+            // it is a real defect, not a tuning choice.
             ownedPositions.clear();
             for(const uint32_t position: localCandidates) {
                 ReadId owner = readId;
