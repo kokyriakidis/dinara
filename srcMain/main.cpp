@@ -2618,6 +2618,9 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinCoverage,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteStrongAltCount,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteVafStrong,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteVafWeak,
             assemblerOptions.assemblyOptions.mode3Options.createSnpSiteAnchors ?
                 &snpSites : nullptr,
             threadCount);

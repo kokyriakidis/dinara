@@ -82,6 +82,9 @@ void Assembler::detectCigarSnpSites(
     double siteMinPurity,
     double siteMinAltDominance,
     uint64_t minSiteCoverage,
+    uint64_t strongAltCount,
+    double vafStrong,
+    double vafWeak,
     vector<CigarSnpSite>* sitesOut,
     uint64_t threadCount)
 {
@@ -642,13 +645,44 @@ void Assembler::detectCigarSnpSites(
                         }
                     }
 
-                    // Coverage floor. Without it the binomial test turns
-                    // permissive exactly where it should not: with a dominant
-                    // count of 1, P(X >= 1) at the assumed error rate is that
-                    // rate itself, so a single-read "allele" clears the bar
-                    // wherever coverage is tiny. The abPOA detector is
-                    // insulated by minCommonForHet; this path needs its own.
-                    const bool enoughCoverage = (total >= minSiteCoverage);
+                    // Coverage and VAF gate, hifiasm's sliding rule
+                    // (filter_one_snp_advance_nearby in Correct.h). The
+                    // required allele fraction depends on the minor allele's
+                    // raw COUNT: a well-supported minor allele needs only a
+                    // modest fraction, a thinly-supported one has to be much
+                    // closer to balanced, and either way the two alleles
+                    // together need a floor of reads.
+                    //
+                    // This is not the fraction window removed from detection
+                    // earlier -- that gated the raw disagreement rate before
+                    // alleles were even partitioned, which discarded low-VAF
+                    // sites wholesale. This is the minor ALLELE's fraction,
+                    // measured after partitioning, which is the principled
+                    // place for it; hifiasm puts it here too.
+                    //
+                    // A floor is needed regardless because the binomial test
+                    // turns permissive exactly where it should not: at a
+                    // dominant count of 1, P(X >= 1) at the assumed error rate
+                    // IS that rate, so single-read alleles clear the bar
+                    // wherever coverage is thin. The abPOA detector is
+                    // insulated by minCommonForHet; this path was not.
+                    bool enoughCoverage = false;
+                    if(bestAltBase >= 0) {
+                        const uint64_t pairTotal = dominant + bestAlt;
+                        const double vaf = (pairTotal > 0) ?
+                            (double(bestAlt) / double(pairTotal)) : 0.0;
+                        if(pairTotal >= minSiteCoverage) {
+                            if(bestAlt >= strongAltCount) {
+                                enoughCoverage = (vaf >= vafStrong);
+                            } else {
+                                // hifiasm also requires the major allele to
+                                // clear MIN_COVERAGE_THRESHOLD (3) here, i.e.
+                                // occ_0 >= 4, so a thin minor allele is only
+                                // trusted against a solid major one.
+                                enoughCoverage = (vaf >= vafWeak) && (dominant >= 4);
+                            }
+                        }
+                    }
                     if(!enoughCoverage) {
                         droppedLowCoverage.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -744,7 +778,9 @@ void Assembler::detectCigarSnpSites(
          << droppedImpure.load() << " below " << siteMinPurity << " purity, "
          << droppedNotDominant.load() << " alternate below "
          << siteMinAltDominance << " of the disagreement" << endl;
-    cout << "  below coverage floor (" << minSiteCoverage << "): "
+    cout << "  below the coverage/VAF gate (pair total >= " << minSiteCoverage
+         << ", VAF >= " << vafStrong << " when alt >= " << strongAltCount
+         << " else >= " << vafWeak << "): "
          << droppedLowCoverage.load() << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
          << " of " << ownedSites.load() << endl;

@@ -374,6 +374,9 @@ public:
         double siteMinPurity,
         double siteMinAltDominance,
         uint64_t minSiteCoverage,
+        uint64_t strongAltCount,
+        double vafStrong,
+        double vafWeak,
         // When non-null, receives every site that passed every filter, with
         // its per-allele membership. Detection alone leaves this empty.
         vector<CigarSnpSite>* sitesOut,

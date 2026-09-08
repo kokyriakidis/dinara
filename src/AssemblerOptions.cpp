@@ -1280,10 +1280,26 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.snpSiteMinCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinCoverage)->
-        default_value(12),
-        "Minimum total reads at a candidate SNP site. Matches the abPOA "
-        "detector's minCommonForHet; without it the binomial test accepts "
-        "single-read alleles wherever coverage is tiny.")
+        default_value(10),
+        "Minimum combined reads on the two alleles of a candidate SNP site "
+        "(hifiasm's total < 10 clause).")
+
+        ("Assembly.mode3.snpSiteStrongAltCount",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteStrongAltCount)->
+        default_value(5),
+        "Minor-allele read count at or above which the relaxed VAF threshold "
+        "applies (hifiasm's min >= 5).")
+
+        ("Assembly.mode3.snpSiteVafStrong",
+        value<double>(&assemblyOptions.mode3Options.snpSiteVafStrong)->
+        default_value(0.24),
+        "Minimum minor-allele fraction when its read count is strong.")
+
+        ("Assembly.mode3.snpSiteVafWeak",
+        value<double>(&assemblyOptions.mode3Options.snpSiteVafWeak)->
+        default_value(0.35),
+        "Minimum minor-allele fraction when its read count is weak; hifiasm "
+        "also requires the major allele to have >= 4 reads in that case.")
 
         ("Assembly.mode3.createSnpSiteAnchors",
         value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
@@ -1782,6 +1798,9 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinPurity = " << snpSiteMinPurity << "\n";
     s << "mode3.snpSiteMinAltDominance = " << snpSiteMinAltDominance << "\n";
     s << "mode3.snpSiteMinCoverage = " << snpSiteMinCoverage << "\n";
+    s << "mode3.snpSiteStrongAltCount = " << snpSiteStrongAltCount << "\n";
+    s << "mode3.snpSiteVafStrong = " << snpSiteVafStrong << "\n";
+    s << "mode3.snpSiteVafWeak = " << snpSiteVafWeak << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
         convertBoolToPythonString(createSnpSiteAnchors) << "\n";
     s << "mode3.transcribeHetBubbles = " <<

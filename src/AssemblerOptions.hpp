@@ -584,12 +584,24 @@ public:
     // definitely wrong", so they are values to revisit, not gospel.
     double snpSiteMinPurity = 0.95;
     double snpSiteMinAltDominance = 0.70;
-    // Minimum total reads at a site. Without a floor the binomial test turns
-    // permissive exactly where it should not: with a dominant count of 1,
-    // P(X >= 1) at the assumed error rate is that rate itself, so a
-    // single-read "allele" clears the bar wherever coverage is tiny. The abPOA
-    // detector is insulated by minCommonForHet; this path needs its own.
-    uint64_t snpSiteMinCoverage = 12;
+    // hifiasm's sliding coverage/VAF rule (filter_one_snp_advance_nearby in
+    // Correct.h): the allele fraction a site must clear depends on the minor
+    // allele's raw COUNT. A well-supported minor allele needs only
+    // snpSiteVafStrong; a thinly-supported one has to reach snpSiteVafWeak and
+    // additionally sit against a major allele of >= 4 reads
+    // (MIN_COVERAGE_THRESHOLD + 1). Either way the two alleles together need
+    // snpSiteMinCoverage reads. hifiasm's own values are 10 / 5 / 0.24 / 0.35.
+    //
+    // Note hifiasm has a second, broken copy of the same idea in filter_snp,
+    // where `available` is overwritten by the fraction before being compared
+    // against 6 -- so its "or >= 6 reads" escape is dead code and the rule
+    // silently collapses to ">30%". Its own source marks the call site
+    // "Fix-attention:definitely wrong". The sliding version above is the one
+    // worth copying.
+    uint64_t snpSiteMinCoverage = 10;
+    uint64_t snpSiteStrongAltCount = 5;
+    double snpSiteVafStrong = 0.24;
+    double snpSiteVafWeak = 0.35;
     // Turn the surviving sites into het anchors: one per allele arm, then the
     // caller rebuilds journeys and the anchor graph from scratch. No surgery on
     // an existing graph. Off by default -- detection alone changes nothing.
