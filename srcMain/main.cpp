@@ -2654,27 +2654,29 @@ void dinara::main::assemble(
             // representative (most members over both arms), breaking ties on the
             // first member's ordinal for determinism, and drop the rest.
             {
+                // Sort keys are computed ONCE per site, not inside the
+                // comparator: both of them scan every member of a site, so
+                // evaluating them per comparison would rescan the members
+                // O(log n) times each for nothing.
                 vector<uint64_t> order(snpSites.size());
-                for(uint64_t i = 0; i < order.size(); i++) order[i] = i;
-                auto support = [&](uint64_t i) {
-                    uint64_t n = 0;
-                    for(const auto& a: snpSites[i].alleles) n += a.size();
-                    return n;
-                };
-                auto firstKey = [&](uint64_t i) {
-                    pair<uint64_t, uint32_t> best{~0ULL, 0};
+                vector<pair<uint64_t, pair<uint64_t, uint32_t>>> key(snpSites.size());
+                for(uint64_t i = 0; i < snpSites.size(); i++) {
+                    order[i] = i;
+                    uint64_t support = 0;
+                    pair<uint64_t, uint32_t> first{~0ULL, 0};
                     for(const auto& a: snpSites[i].alleles) {
+                        support += a.size();
                         for(const auto& m: a) {
                             const pair<uint64_t, uint32_t> k{m.first.getValue(), m.second};
-                            if(k < best) best = k;
+                            if(k < first) first = k;
                         }
                     }
-                    return best;
-                };
+                    key[i] = {support, first};
+                }
                 std::sort(order.begin(), order.end(), [&](uint64_t x, uint64_t y) {
-                    const uint64_t sx = support(x), sy = support(y);
-                    if(sx != sy) return sx > sy;
-                    return firstKey(x) < firstKey(y);
+                    if(key[x].first != key[y].first)
+                        return key[x].first > key[y].first;   // better supported first
+                    return key[x].second < key[y].second;     // then deterministic
                 });
                 std::unordered_map<uint64_t, uint64_t> claim;   // occurrence -> site
                 vector<bool> dropped(snpSites.size(), false);

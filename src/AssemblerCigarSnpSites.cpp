@@ -301,6 +301,8 @@ void Assembler::detectCigarSnpSites(
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
         vector<uint8_t> contextBuffer;
+        // Scratch for sanitizeArm below; reused across sites by this thread.
+        vector<pair<OrientedReadId, uint32_t>> armScratch, armClean;
         // Per owned position, the members carrying each base. Recorded rather
         // than only counted, because these ARE the anchor arms -- an allele's
         // member list is what appendHetAnchorPair takes.
@@ -317,28 +319,38 @@ void Assembler::detectCigarSnpSites(
         // gives no usable evidence about which haplotype it belongs to, so it
         // is dropped from the arm entirely rather than resolved arbitrarily;
         // plain duplicates collapse to one occurrence.
-        auto sanitizeArm = [](const vector<pair<OrientedReadId, uint32_t>>& in) {
-            vector<pair<OrientedReadId, uint32_t>> out;
-            out.reserve(in.size());
-            std::unordered_map<ReadId, uint64_t> firstIndex;
-            vector<bool> conflicted;
-            for(const auto& e: in) {
-                const ReadId readIdOfEntry = e.first.getReadId();
-                auto it = firstIndex.find(readIdOfEntry);
-                if(it == firstIndex.end()) {
-                    firstIndex.emplace(readIdOfEntry, out.size());
-                    out.push_back(e);
-                    conflicted.push_back(false);
-                } else if(out[it->second].first != e.first) {
-                    conflicted[it->second] = true;      // both strands seen
+        //
+        // Done with a sort over two scratch buffers hoisted to the worker,
+        // matching how everything else in this loop reuses its storage: an arm
+        // holds ~20 members, so a per-call hash map would allocate more than it
+        // saves, and this runs per arm per site on every thread. OrientedReadId
+        // packs as (readId<<1)|strand, so one sort by value groups each read's
+        // entries AND puts its two strands adjacent within that group -- the
+        // conflict test is then just first-vs-last of each run.
+        auto sanitizeArm = [&](const vector<pair<OrientedReadId, uint32_t>>& in)
+            -> const vector<pair<OrientedReadId, uint32_t>>& {
+            armScratch.assign(in.begin(), in.end());
+            std::sort(armScratch.begin(), armScratch.end(),
+                [](const pair<OrientedReadId, uint32_t>& x,
+                   const pair<OrientedReadId, uint32_t>& y) {
+                    if(x.first.getValue() != y.first.getValue())
+                        return x.first.getValue() < y.first.getValue();
+                    return x.second < y.second;
+                });
+            armClean.clear();
+            size_t i = 0;
+            while(i < armScratch.size()) {
+                const ReadId r = armScratch[i].first.getReadId();
+                size_t j = i + 1;
+                while(j < armScratch.size() &&
+                      armScratch[j].first.getReadId() == r) j++;
+                if(armScratch[i].first.getStrand() ==
+                   armScratch[j - 1].first.getStrand()) {
+                    armClean.push_back(armScratch[i]);   // single strand: keep one
                 }
+                i = j;
             }
-            vector<pair<OrientedReadId, uint32_t>> clean;
-            clean.reserve(out.size());
-            for(uint64_t i = 0; i < out.size(); i++) {
-                if(!conflicted[i]) clean.push_back(out[i]);
-            }
-            return clean;
+            return armClean;
         };
 
         vector<CigarSnpSite> localSitesOut;
