@@ -2944,6 +2944,11 @@ void dinara::main::assemble(
             }
         };
         uint64_t tieGroups = 0, unitsDropped = 0, readsWithTie = 0;
+        // Split the drops by class. With preferHet set, this must report ZERO
+        // het units dropped -- that is the whole point of the preference, and
+        // stating it as a number keeps the guarantee checkable instead of
+        // inferred from a truncated sample of the [journey-tie] lines below.
+        uint64_t unitsDroppedHet = 0, unitsDroppedPrimary = 0;
         // Diagnostic: classify each tie group by the (het,primary) composition of
         // its members, to confirm het-vs-het collisions (the per-SNP-orientation
         // bug) are gone and the remaining ties are het-vs-primary.
@@ -2983,6 +2988,7 @@ void dinara::main::assemble(
                         if(cId == keeper) continue;
                         recordDrop(cId, readId);
                         ++unitsDropped;
+                        if(isHet(cId)) ++unitsDroppedHet; else ++unitsDroppedPrimary;
                     }
                     if(reported < maxReport) {
                         ++reported;
@@ -3008,6 +3014,10 @@ void dinara::main::assemble(
         cout << timestamp << "  tie groups by class: primary-vs-het="
              << tgPrimaryVsHet << " het-vs-het=" << tgHetVsHet
              << " primary-vs-primary=" << tgPrimaryVsPrimary << "." << endl;
+        cout << timestamp << "  dropped units by class: het=" << unitsDroppedHet
+             << " primary=" << unitsDroppedPrimary
+             << (preferHet && unitsDroppedHet == 0 ?
+                 "  (every het member survives the export)" : "") << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor
