@@ -441,6 +441,24 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
         return a < b;                                        // lower id wins
     };
     uint64_t tieGroups = 0, unitsDropped = 0;
+    // A het anchor dropped here never reaches the anchor graph for this read,
+    // which defeats the reason it was created -- so count the losers by kind
+    // and report the rate, because the tie-break makes the loss SYSTEMATIC
+    // rather than incidental: "primary over het/hom" means a het anchor loses
+    // every collision it is in. Measured on the 989-read fixture: 1154 of 1154
+    // dropped occurrences were het anchors and none were primary, costing 11.1%
+    // of all het-anchor occurrences (1154 lost against 9228 surviving), which
+    // dilutes each site's arms by roughly that fraction.
+    //
+    // It is forced, not a choice that can simply be reversed here: shasta2's
+    // LocalAssembly7::positionOffsetAB() asserts positionB > positionA
+    // STRICTLY, so two anchors at the same base in one read cannot be
+    // journey-adjacent at all. Keeping both is not available; only which one
+    // survives is. Inverting the priority would trade an 11% dilution of het
+    // arms for a much smaller proportional loss on primary anchors (they carry
+    // ~2x the coverage), but primary anchors are the graph backbone, so that
+    // swap needs its own verification run before it could be trusted.
+    uint64_t hetDropped = 0, primaryDropped = 0, hetOccurrences = 0;
 
     filteredJourneys.assign(orientedReadCount, {});
     for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
@@ -463,12 +481,19 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
                         if(keepAOverB(v[t].second, keeper)) keeper = v[t].second;
                     }
                     unitsDropped += (j - i - 1);
+                    for(size_t t = i; t < j; t++) {
+                        if(v[t].second == keeper) continue;
+                        if(isHetAnchor(v[t].second)) hetDropped++;
+                        else primaryDropped++;
+                    }
                     deduped.push_back({v[i].first, keeper});
                 }
                 i = j;
             }
             v.swap(deduped);
         }
+
+        for(const auto& [pos, aid] : v) { static_cast<void>(pos); if(isHetAnchor(aid)) hetOccurrences++; }
 
         std::vector<Shasta2AnchorId>& out = filteredJourneys[2 * readIdValue];
         std::vector<Shasta2AnchorId>& outRc = filteredJourneys[2 * readIdValue + 1];
@@ -488,6 +513,12 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
         cout << timestamp << "Journeys rebuild: resolved " << tieGroups
              << " same-position tie(s) across independent anchors, dropping "
              << unitsDropped << " occurrence(s) (one survivor kept each)." << endl;
+        cout << timestamp << "  of the dropped occurrences, " << hetDropped
+             << " were het anchors and " << primaryDropped << " primary; "
+             << hetOccurrences << " het occurrences survive in journeys ("
+             << (hetOccurrences + hetDropped == 0 ? 0.0 :
+                 100.0 * double(hetDropped) / double(hetOccurrences + hetDropped))
+             << "% of het occurrences lost to ties)." << endl;
     }
 
     // Pass C: rebuild the journeys VectorOfVectors in place from
