@@ -2723,11 +2723,37 @@ void dinara::main::assemble(
                          << dupUnclaimed << " are absent from the keeper "
                             "(the most merging could recover)." << endl;
                 }
-                if(duplicateSites > 0) {
-                    vector<Assembler::CigarSnpSite> kept;
-                    kept.reserve(snpSites.size() - duplicateSites);
+                // Rebuild in a DETERMINISTIC order, not in the order the
+                // detector happened to append.
+                //
+                // detectCigarSnpSites fills snpSites from parallel workers under
+                // a mutex, so its order depends on thread scheduling. That order
+                // becomes the het anchor ids, and anchor ids are the last
+                // tie-break both here and in the journey rebuild -- so two runs
+                // on identical input resolved ties differently and produced
+                // different graphs. Measured before this: two consecutive runs
+                // differed in 8 anchor-graph vertices and dropped different
+                // numbers of het units (32 vs 40).
+                //
+                // firstKey is the minimum (OrientedReadId, position) over the
+                // site's members, which is a property of the DATA rather than of
+                // the schedule, and is unique per site because two sites cannot
+                // share a member occurrence (that is exactly the duplicate test
+                // above).
+                {
+                    vector<uint64_t> keepOrder;
+                    keepOrder.reserve(snpSites.size() - duplicateSites);
                     for(uint64_t i = 0; i < snpSites.size(); i++) {
-                        if(!dropped[i]) kept.push_back(std::move(snpSites[i]));
+                        if(!dropped[i]) keepOrder.push_back(i);
+                    }
+                    std::sort(keepOrder.begin(), keepOrder.end(),
+                        [&](uint64_t x, uint64_t y) {
+                            return key[x].second < key[y].second;
+                        });
+                    vector<Assembler::CigarSnpSite> kept;
+                    kept.reserve(keepOrder.size());
+                    for(const uint64_t i: keepOrder) {
+                        kept.push_back(std::move(snpSites[i]));
                     }
                     snpSites.swap(kept);
                 }
@@ -2986,7 +3012,16 @@ void dinara::main::assemble(
         uint64_t tgPrimaryVsHet = 0, tgHetVsHet = 0, tgPrimaryVsPrimary = 0;
         const uint64_t maxReport = 20;
         uint64_t reported = 0;
-        for(auto& [oidValue, occ] : byRead) {
+        // Iterate reads in a deterministic order. byRead is an unordered_map,
+        // and `remaining` above mutates as ties are resolved, so which anchor
+        // wins a starvation tie depends on the order reads are visited --
+        // hash order, which is not stable. Sort the keys first.
+        vector<uint64_t> readOrder;
+        readOrder.reserve(byRead.size());
+        for(const auto& kv: byRead) readOrder.push_back(kv.first);
+        std::sort(readOrder.begin(), readOrder.end());
+        for(const uint64_t oidValue : readOrder) {
+            auto& occ = byRead[oidValue];
             std::sort(occ.begin(), occ.end());
             const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
             const ReadId readId = oid.getReadId();
@@ -3054,6 +3089,68 @@ void dinara::main::assemble(
              << " primary=" << unitsDroppedPrimary
              << (preferHet && unitsDroppedHet == 0 ?
                  "  (every het member survives the export)" : "") << endl;
+    }
+
+    // The drop map the export applies should be a FUNCTION OF THE JOURNEYS, not
+    // a second opinion about them. The journeys were already rebuilt with ties
+    // resolved; re-deriving that decision here on the anchor objects means two
+    // implementations of one policy, which is exactly how they came to disagree
+    // before (the rebuild kept het, the export kept primary, and the exported
+    // anchors contradicted the exported graph).
+    //
+    // So recompute it directly: a member (anchor, read) is exported iff that
+    // anchor actually occurs in that read's journey. Anything the rebuild
+    // dropped is dropped here by construction, and nothing else is. The
+    // independently-computed map is kept alongside only to report whether the
+    // two agree -- if they ever diverge, the derivation is authoritative and the
+    // difference is the bug.
+    {
+        std::unordered_set<uint64_t> inJourney;
+        const uint64_t orientedReadCount = shasta2Journeys->size();
+        for(uint64_t v = 0; v < orientedReadCount; v++) {
+            const OrientedReadId orientedReadId = OrientedReadId::fromValue(v);
+            for(const Shasta2AnchorId a : (*shasta2Journeys)[orientedReadId]) {
+                inJourney.insert((uint64_t(v) << 32) | uint64_t(a));
+            }
+        }
+        Shasta2Anchors::ExternalAnchorDropMap derived;
+        uint64_t derivedDrops = 0;
+        const uint64_t anchorCount2 = shasta2Anchors->size();
+        for(Shasta2AnchorId id = 0; id < anchorCount2; id += 2) {
+            for(const Shasta2AnchorMarkerInfo& mi : (*shasta2Anchors)[id]) {
+                const uint64_t v = mi.orientedReadId.getValue();
+                if(inJourney.count((v << 32) | uint64_t(id))) continue;
+                auto& vec = derived[id];
+                const ReadId r = mi.orientedReadId.getReadId();
+                if(std::find(vec.begin(), vec.end(), r) == vec.end()) {
+                    vec.push_back(r);
+                    ++derivedDrops;
+                }
+            }
+        }
+        uint64_t agree = 0, onlyDerived = 0, onlyComputed = 0;
+        for(const auto& [a, reads]: derived) {
+            for(const ReadId r: reads) {
+                const auto it = journeyTieDropMap.find(a);
+                const bool inComputed = (it != journeyTieDropMap.end()) &&
+                    (std::find(it->second.begin(), it->second.end(), r) != it->second.end());
+                if(inComputed) ++agree; else ++onlyDerived;
+            }
+        }
+        for(const auto& [a, reads]: journeyTieDropMap) {
+            for(const ReadId r: reads) {
+                const auto it = derived.find(a);
+                const bool inDerived = (it != derived.end()) &&
+                    (std::find(it->second.begin(), it->second.end(), r) != it->second.end());
+                if(!inDerived) ++onlyComputed;
+            }
+        }
+        cout << timestamp << "Export drop map derived from journeys: "
+             << derivedDrops << " member(s) not present in any journey." << endl;
+        cout << timestamp << "  vs the independently resolved map: agree=" << agree
+             << " derived-only=" << onlyDerived
+             << " resolved-only=" << onlyComputed << endl;
+        journeyTieDropMap.swap(derived);
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor

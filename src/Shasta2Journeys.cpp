@@ -448,10 +448,41 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     // coverage are untouched, so the graph is still verified consistent with
     // the journeys either way (DINARA_VERIFY_ANCHOR_GRAPH).
     const bool preferHetOnTie = journeyTiePreferHet;
+
+    // Occurrences still standing per anchor, so tie resolution can never strip
+    // an anchor of its LAST one. Without this an anchor can be evicted from
+    // every journey it appears in -- measured: exactly 4 low-coverage primary
+    // anchors on the 989-read fixture, whose every occurrence collides with a
+    // het anchor and therefore loses every tie under any class preference.
+    //
+    // Such an anchor is not merely diluted, it disappears: no journey contains
+    // it, so it gets no edges and the anchor graph has a vertex nothing
+    // traverses. Nothing upstream creates an empty anchor -- primary anchors
+    // clear minAnchorCoverage and het arms clear their own >= 2 floor -- so an
+    // anchor with no occurrences is manufactured here and nowhere else.
+    //
+    // The guard has to live at THIS layer rather than at the export. The export
+    // resolves the same ties again on the anchor objects, and guarding only
+    // there produced an anchor that had members in the exported anchor set but
+    // no occurrence in any journey, so the two exported artifacts disagreed.
+    vector<uint64_t> remainingOccurrences(anchorCount, 0);
+    for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
+        for(const auto& [position, anchorId] : strand0[readIdValue]) {
+            static_cast<void>(position);
+            remainingOccurrences[anchorId]++;
+        }
+    }
+    // Only anchors that HAD an occurrence can be evicted from all of them.
+    // Comparing against zero instead would count every anchor with no strand-0
+    // occurrence at all (RC anchors, which are mirrored rather than listed).
+    const vector<uint64_t> initialOccurrences = remainingOccurrences;
     auto isHetAnchor = [&](Shasta2AnchorId id) -> bool {
         return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
     };
     auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
+        const bool aLast = (remainingOccurrences[a] <= 1);
+        const bool bLast = (remainingOccurrences[b] <= 1);
+        if(aLast != bLast) return aLast;          // never evict an anchor entirely
         const bool aHet = isHetAnchor(a), bHet = isHetAnchor(b);
         if(aHet != bHet) return preferHetOnTie ? aHet : !aHet;
         const uint64_t ca = anchors[a].size(), cb = anchors[b].size();
@@ -503,6 +534,8 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
                         if(v[t].second == keeper) continue;
                         if(isHetAnchor(v[t].second)) hetDropped++;
                         else primaryDropped++;
+                        if(remainingOccurrences[v[t].second] > 0)
+                            remainingOccurrences[v[t].second]--;
                     }
                     deduped.push_back({v[i].first, keeper});
                 }
@@ -537,6 +570,13 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
              << (hetOccurrences + hetDropped == 0 ? 0.0 :
                  100.0 * double(hetDropped) / double(hetOccurrences + hetDropped))
              << "% of het occurrences lost to ties)." << endl;
+        uint64_t evicted = 0;
+        for(uint64_t a = 0; a < anchorCount; a++) {
+            if(initialOccurrences[a] > 0 && remainingOccurrences[a] == 0) ++evicted;
+        }
+        cout << timestamp << "  anchors evicted from every journey: " << evicted
+             << (evicted == 0 ? "  (none -- an anchor's last occurrence always wins)" : "")
+             << endl;
     }
 
     // Pass C: rebuild the journeys VectorOfVectors in place from
