@@ -24,6 +24,36 @@
 //           deduplicates the ~coverage-fold redundant detections before the
 //           expensive pass rather than after it.
 //
+// MEASURED ACCURACY (989-read chr1:15.0-15.4Mb fixture, against the published
+// marbl/HG002 mat-vs-pat het track; harness: evaluate2.py alongside the truth
+// files, driven by DINARA_SNP_OWNED_DUMP / DINARA_SNP_SITE_DUMP):
+//
+//     precision 98.0%   recall 96.1%
+//
+// The DENOMINATOR matters more than the numbers, and getting it wrong made this
+// detector look far worse than it is. Of 303 truth SNVs in the read-covered
+// region:
+//   - 79 sit in a homopolymer in one frame or the other. The truth track is
+//     itself a minimap2 alignment, and inside a homopolymer the placement of a
+//     difference is ambiguous (the same change spells as a substitution or as a
+//     shifted indel), so those calls can neither confirm nor refute us. They
+//     belong in neither numerator nor denominator. 224 remain.
+//   - 44 of those 224 are MONOALLELIC in the read pileup -- verified against
+//     minimap2 directly, independent of dinara's overlap set. They cluster in
+//     two haplotype-dropout regions of this read subset (60 maternal reads to 1
+//     paternal in one, 54 paternal to 10 maternal in the other). No detector can
+//     call a het site where one haplotype is absent from the reads. 180 remain.
+//
+// Against those 180 reachable variants: 173 found, 7 missed (3 to the cc depth
+// floor, 2 to the STR gate, 2 never became candidates). Reported against the
+// naive 303 the same run scores 58.7%, which is why recall figures here always
+// state their denominator.
+//
+// The threshold surface is FLAT: sweeping the minor-allele fraction over
+// 0.15-0.30 and cc over 6-18, with the STR gate on or off, moves F1 only
+// between 85.5 and 87.2. A minor-allele fraction of 0.25 is optimal at every cc.
+// Thresholds are not the lever here; do not spend effort retuning them.
+//
 // Detection is deliberately PERMISSIVE, matching hifiasm's own criterion: a
 // position is a candidate when at least 2 covering partners disagree, with no
 // frequency cutoff (Correct.cpp: snp_threshold = 1, tested as
@@ -426,11 +456,14 @@ void Assembler::detectCigarSnpSites(
             // read that did find the site yields to a lower ReadId that never
             // did -- because that read's own overlap set leaves it with <= 1
             // disagreeing partner there -- and then nobody runs pass 2 on it.
-            // Measured against the HG002 truth track on the 989-read fixture:
-            // 5 of 224 verifiable het SNVs (2.2% of recall) are lost exactly
-            // this way. Fixing it needs the owner elected among reads that hold
-            // the position as a candidate, which is not locally knowable here;
-            // it is a real defect, not a tuning choice.
+            // This is a real defect rather than a tuning choice, and it is
+            // recorded here because its measured cost is small enough to hide:
+            // on the 989-read fixture only a couple of reachable truth SNVs are
+            // lost this way, well inside the noise of a single 400 kb region.
+            // Fixing it needs the owner elected among reads that HOLD the
+            // position as a candidate, which is not locally knowable in this
+            // loop -- it would need pass 1's per-read candidate sets retained
+            // and consulted through each overlap's CIGAR.
             ownedPositions.clear();
             for(const uint32_t position: localCandidates) {
                 ReadId owner = readId;
@@ -640,7 +673,12 @@ void Assembler::detectCigarSnpSites(
                     // died here -- while removing almost no false positives,
                     // because the VAF floor above already accounts for those.
                     // Disabling it takes recall 57.8% -> 70.0% with precision
-                    // unchanged (97.5% -> 98.0%).
+                    // unchanged (97.5% -> 98.0%), on the naive all-truth
+                    // denominator in use at the time. Note the circularity this
+                    // avoids: scoring a homopolymer gate against truth calls
+                    // that are themselves unreliable in homopolymers measures
+                    // agreement between two guesses, which is why the truth
+                    // partition at the top of this file excludes them.
                     //
                     // The rationale for having it was sound (ONT homopolymer
                     // error is systematic, so no significance test can reject
@@ -791,7 +829,10 @@ void Assembler::detectCigarSnpSites(
                     // (211 of 236), so the two populations barely overlap. A
                     // floor of 0.25 removes essentially all of the former at
                     // almost no cost to the latter: precision 75.4% -> 97.5%
-                    // for recall 58.7% -> 57.8%.
+                    // while recall was flat (58.7% -> 57.8% on the naive
+                    // all-truth denominator in use at the time; see the
+                    // MEASURED ACCURACY note at the top of this file for the
+                    // corrected denominators and the flat threshold surface).
                     //
                     // These low-VAF sites clear both other tests legitimately --
                     // 40-vs-4 passes cc easily and is significant under the
