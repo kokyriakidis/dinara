@@ -584,6 +584,18 @@ public:
     // definitely wrong", so they are values to revisit, not gospel.
     double snpSiteMinPurity = 0.95;
     double snpSiteMinAltDominance = 0.70;
+    // Minimum minor-allele fraction for a het site. Measured against the
+    // published HG002 mat-vs-pat het track: false positives cluster at VAF ~0.1
+    // and real hets at 0.4-0.5, so 0.25 separates them cleanly (precision
+    // 75.4% -> 97.5% at a 0.9-point recall cost).
+    double snpSiteMinAlleleFraction = 0.25;
+    // Sequence-context gates. filterStr (repeat unit 2..6) helps; the
+    // homopolymer gate is measured to be net harmful -- it was the largest
+    // single cause of missed real variants (49 of 58 filter-rejected truth
+    // SNVs) while the VAF floor already removes the false positives it was
+    // meant to catch -- so it defaults OFF. See AssemblerCigarSnpSites.cpp.
+    bool snpSiteFilterHomopolymer = false;
+    bool snpSiteFilterStr = true;
     // hifiasm's `cc`, from the LIVE phasing path (gen_rphase_dp0_single_path):
     //     cc = ((het_cov > 0) ? het_cov : (hom_cov / ploidy));
     //     cc *= cut_rate;  if (cc < cut_bd) cc = cut_bd;

@@ -81,6 +81,9 @@ void Assembler::detectCigarSnpSites(
     double strandBiasPValue,
     double siteMinPurity,
     double siteMinAltDominance,
+    double minAlleleFraction,
+    bool filterHomopolymer,
+    bool filterStr,
     double alleleCoverageRate,
     uint64_t alleleCoverageFloor,
     uint64_t ploidy,
@@ -231,6 +234,36 @@ void Assembler::detectCigarSnpSites(
         pairDumpStream = std::make_unique<ofstream>(path);
     }
 
+    // DINARA_SNP_SITE_DUMP: one line per site that survived EVERY filter,
+    // "readName readPosition domAllele altAllele domCount altCount", with the
+    // position in the owner read's own forward coordinates. This is what a
+    // ground-truth comparison needs: the sites can be projected to reference
+    // coordinates through an independent read alignment and matched against the
+    // published HG002 mat-vs-pat het track. The candidate dumps above are the
+    // pre-filter set and cannot measure precision or recall.
+    // DINARA_SNP_OWNED_DUMP: one line per OWNED site (i.e. every site that
+    // reached the filter stack), with each filter's verdict as a separate
+    // column. Projected against ground truth this attributes a missed real
+    // variant to the specific filter that discarded it -- which the
+    // surviving-site dump cannot do, since a missed site simply is not in it.
+    std::unique_ptr<ofstream> ownedDumpFile;
+    ofstream* ownedDumpStream = nullptr;
+    std::mutex ownedDumpMutex;
+    if(const char* path = std::getenv("DINARA_SNP_OWNED_DUMP")) {
+        ownedDumpFile = std::make_unique<ofstream>(path);
+        (*ownedDumpFile) << "readName\tposition\tdomBase\taltBase\tdomCount"
+                            "\taltCount\tsiteTotal\tbinomialPass\tccPass"
+                            "\tbiallelicClean\thomopolymer\tstr\tstrandBias\n";
+        ownedDumpStream = ownedDumpFile.get();
+    }
+    std::unique_ptr<ofstream> siteDumpFile;
+    ofstream* siteDumpStream = nullptr;
+    std::mutex siteDumpMutex;
+    if(const char* path = std::getenv("DINARA_SNP_SITE_DUMP")) {
+        siteDumpFile = std::make_unique<ofstream>(path);
+        siteDumpStream = siteDumpFile.get();
+    }
+
     std::atomic<ReadId> nextReadId{0};
     auto worker = [&]() {
         vector<uint16_t> disagree;
@@ -243,6 +276,11 @@ void Assembler::detectCigarSnpSites(
         vector<std::array<vector<pair<OrientedReadId, uint32_t>>, 4>> alleleMembers;
         vector<CigarSnpSite> localSitesOut;
         vector<uint32_t> localSitePositions;
+        // Allele detail for DINARA_SNP_SITE_DUMP, index-parallel to
+        // localSitePositions so the adjacency loop can dump exactly the
+        // sites it keeps.
+        struct SiteDetail { uint8_t domBase, altBase; uint32_t domCount, altCount; };
+        vector<SiteDetail> localSiteDetail;
         // [base][strand]: strand 0 = partner aligned same-strand as the
         // owning read, 1 = reverse. A real variant should appear on both;
         // an allele seen only one way is the signature of a strand-specific
@@ -584,6 +622,25 @@ void Assembler::detectCigarSnpSites(
                         inStr = kmIsRepeatUnitRange(
                             contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 2, 6);
                     }
+                    // The homopolymer gate is measured to be NET HARMFUL and is
+                    // off by default. Against the HG002 truth track it was the
+                    // single largest cause of missed real variants -- 49 of the
+                    // 58 truth SNVs that reached the filters and were rejected
+                    // died here -- while removing almost no false positives,
+                    // because the VAF floor above already accounts for those.
+                    // Disabling it takes recall 57.8% -> 70.0% with precision
+                    // unchanged (97.5% -> 98.0%).
+                    //
+                    // The rationale for having it was sound (ONT homopolymer
+                    // error is systematic, so no significance test can reject
+                    // it) but incomplete: real heterozygous SNVs are common
+                    // immediately beside homopolymers, and a +/-16 bp context
+                    // window rejects those too. The STR gate (unit 2..6) stays
+                    // on: dropping it as well adds recall (-> 73.6%) but costs
+                    // precision (-> 94.4%), a bad trade when each surviving site
+                    // becomes an anchor.
+                    if(inHomopolymer && !filterHomopolymer) inHomopolymer = false;
+                    if(inStr && !filterStr) inStr = false;
                     if(inHomopolymer) droppedHomopolymer.fetch_add(1, std::memory_order_relaxed);
                     if(inStr)         droppedRepeat.fetch_add(1, std::memory_order_relaxed);
                     allelesTotal.fetch_add(total, std::memory_order_relaxed);
@@ -714,10 +771,31 @@ void Assembler::detectCigarSnpSites(
                     // binomial test leaves ungated -- so layering the VAF
                     // clauses on top of it only removed sites twice for the same
                     // reason, with the weaker justification.
-                    bool enoughCoverage = false, ccPass = false;
+                    // A minor-allele FRACTION floor sits beside cc. Unlike the
+                    // two-tier VAF rule this replaced, it is justified by
+                    // measurement rather than by hifiasm provenance: projected
+                    // against the published HG002 mat-vs-pat het track on the
+                    // 989-read fixture, the false positives pile up at a VAF
+                    // near 0.1 (48 of 58) while real het variants sit at 0.4-0.5
+                    // (211 of 236), so the two populations barely overlap. A
+                    // floor of 0.25 removes essentially all of the former at
+                    // almost no cost to the latter: precision 75.4% -> 97.5%
+                    // for recall 58.7% -> 57.8%.
+                    //
+                    // These low-VAF sites clear both other tests legitimately --
+                    // 40-vs-4 passes cc easily and is significant under the
+                    // binomial at an 0.025 error rate -- so neither the depth
+                    // floor nor the significance test can stand in for this one.
+                    // They are recurrent systematic error or paralog signal, and
+                    // only the allele BALANCE separates them from real hets.
+                    bool enoughCoverage = false, ccPass = false, vafPass = false;
                     if(bestAltBase >= 0) {
                         ccPass = (dominant >= minAlleleCoverage);
-                        enoughCoverage = ccPass;
+                        const uint64_t pairTotal = dominant + bestAlt;
+                        const double vaf = (pairTotal > 0) ?
+                            (double(bestAlt) / double(pairTotal)) : 0.0;
+                        vafPass = (vaf >= minAlleleFraction);
+                        enoughCoverage = ccPass && vafPass;
                     }
                     if(!enoughCoverage) {
                         droppedLowCoverage.fetch_add(1, std::memory_order_relaxed);
@@ -742,6 +820,30 @@ void Assembler::detectCigarSnpSites(
                         noAlternateSites.fetch_add(1, std::memory_order_relaxed);
                     }
 
+                    if(ownedDumpStream) {
+                        uint64_t siteTotal = 0;
+                        for(int b = 0; b < 4; b++) siteTotal += counts[b];
+                        int domB = -1;
+                        for(int b = 0; b < 4; b++) if(counts[b] == dominant) { domB = b; break; }
+                        const auto nm = reads->getReadName(readId);
+                        std::ostringstream line;
+                        line.write(&*nm.begin(), std::streamsize(nm.size()));
+                        line << '\t' << sitePosition
+                             << '\t' << (domB >= 0 ? Base::fromInteger(uint8_t(domB)).character() : '.')
+                             << '\t' << (bestAltBase >= 0 ? Base::fromInteger(uint8_t(bestAltBase)).character() : '.')
+                             << '\t' << dominant << '\t' << bestAlt << '\t' << siteTotal
+                             << '\t' << (passing >= 2 ? 1 : 0)
+                             << '\t' << (ccPass ? 1 : 0)
+                             << '\t' << (biallelicClean ? 1 : 0)
+                             << '\t' << (inHomopolymer ? 1 : 0)
+                             << '\t' << (inStr ? 1 : 0)
+                             << '\t' << (strandBiased ? 1 : 0)
+                             << '\n';
+                        const string text = line.str();
+                        std::lock_guard<std::mutex> lock(ownedDumpMutex);
+                        (*ownedDumpStream) << text;
+                    }
+
                     if(passing >= 2 && biallelicClean && enoughCoverage &&
                        !inHomopolymer && !inStr && !strandBiased) {
                         sitesAfterFilters.fetch_add(1, std::memory_order_relaxed);
@@ -761,6 +863,9 @@ void Assembler::detectCigarSnpSites(
                                 site.alleles.push_back(alleleMembers[k][bestAltBase]);
                                 localSitesOut.push_back(std::move(site));
                                 localSitePositions.push_back(sitePosition);
+                                localSiteDetail.push_back({uint8_t(dominantBase),
+                                    uint8_t(bestAltBase), uint32_t(dominant),
+                                    uint32_t(bestAlt)});
                             }
                         }
                     }
@@ -787,13 +892,28 @@ void Assembler::detectCigarSnpSites(
                         droppedAdjacent.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
+                    if(siteDumpStream) {
+                        const auto name = reads->getReadName(readId);
+                        const SiteDetail& d = localSiteDetail[k];
+                        std::ostringstream line;
+                        line.write(&*name.begin(), std::streamsize(name.size()));
+                        line << '\t' << localSitePositions[k]
+                             << '\t' << Base::fromInteger(d.domBase)
+                             << '\t' << Base::fromInteger(d.altBase)
+                             << '\t' << d.domCount << '\t' << d.altCount << '\n';
+                        const string text = line.str();
+                        std::lock_guard<std::mutex> lock(siteDumpMutex);
+                        (*siteDumpStream) << text;
+                    }
                     std::lock_guard<std::mutex> lock(sitesMutex);
                     sitesOut->push_back(std::move(localSitesOut[k]));
                 }
                 localSitesOut.clear();
                 localSitePositions.clear();
+                localSiteDetail.clear();
             } else if(sitesOut) {
                 localSitePositions.clear();
+                localSiteDetail.clear();
             }
 
             candidateSites.fetch_add(localSites, std::memory_order_relaxed);
@@ -856,6 +976,7 @@ void Assembler::detectCigarSnpSites(
          << droppedNotDominant.load() << " alternate below "
          << siteMinAltDominance << " of the disagreement" << endl;
     cout << "  below the major-allele depth floor (cc = " << minAlleleCoverage
+         << ") or the minor-allele fraction floor (" << minAlleleFraction
          << "): " << droppedLowCoverage.load() << endl;
     cout << "  binomial vs cc, over all owned sites (they gate different "
             "alleles, so they should reject different sites):"

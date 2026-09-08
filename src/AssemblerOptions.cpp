@@ -1296,6 +1296,22 @@ void AssemblerOptions::addConfigurableOptions()
         "Ploidy used to derive per-haplotype coverage from the homozygous peak "
         "when the heterozygous peak is unknown (hifiasm's polyploidy).")
 
+        ("Assembly.mode3.snpSiteMinAlleleFraction",
+        value<double>(&assemblyOptions.mode3Options.snpSiteMinAlleleFraction)->
+        default_value(0.25),
+        "Minimum minor-allele fraction for a het site. Ground-truth measured: "
+        "false positives cluster at ~0.1, real hets at 0.4-0.5.")
+
+        ("Assembly.mode3.snpSiteFilterHomopolymer",
+        bool_switch(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer),
+        "Reject het sites inside a homopolymer. Off by default: measured to cost "
+        "far more real variants than it removes false positives.")
+
+        ("Assembly.mode3.snpSiteFilterStr",
+        value<bool>(&assemblyOptions.mode3Options.snpSiteFilterStr)->
+        default_value(true),
+        "Reject het sites inside a short tandem repeat (unit length 2..6).")
+
         ("Assembly.mode3.createSnpSiteAnchors",
         value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
         default_value(false),
@@ -1794,6 +1810,9 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteMinAltDominance = " << snpSiteMinAltDominance << "\n";
     s << "mode3.snpSiteAlleleCoverageRate = " << snpSiteAlleleCoverageRate << "\n";
     s << "mode3.snpSiteAlleleCoverageFloor = " << snpSiteAlleleCoverageFloor << "\n";
+    s << "mode3.snpSiteMinAlleleFraction = " << snpSiteMinAlleleFraction << "\n";
+    s << "mode3.snpSiteFilterHomopolymer = " << convertBoolToPythonString(snpSiteFilterHomopolymer) << "\n";
+    s << "mode3.snpSiteFilterStr = " << convertBoolToPythonString(snpSiteFilterStr) << "\n";
     s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
         convertBoolToPythonString(createSnpSiteAnchors) << "\n";
