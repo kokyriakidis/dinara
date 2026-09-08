@@ -77,6 +77,17 @@ public:
     // retained from initial creation.
     void rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, uint64_t threadCount);
 
+    // Which anchor survives when two independent anchors land on the SAME base
+    // of the same read. Keeping both is impossible (shasta2 asserts strictly
+    // increasing positions), so one occurrence must be dropped from that
+    // read's journey. true = keep the het anchor, false = keep the primary.
+    // Defaults to true: preferring primary makes het anchors lose every
+    // collision they are in, measured at 11.1% of all het-anchor occurrences,
+    // whereas the primary that loses instead carries ~2x the coverage and so
+    // pays proportionally much less. See Shasta2Journeys.cpp for the
+    // measurement.
+    bool journeyTiePreferHet = true;
+
     // Return the Journey for an oriented read.
     Shasta2Journey operator[](OrientedReadId orientedReadId) const
     {

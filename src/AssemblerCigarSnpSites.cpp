@@ -92,6 +92,7 @@
 #include <cmath>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fstream>
 #include <memory>
@@ -304,6 +305,42 @@ void Assembler::detectCigarSnpSites(
         // than only counted, because these ARE the anchor arms -- an allele's
         // member list is what appendHetAnchorPair takes.
         vector<std::array<vector<pair<OrientedReadId, uint32_t>>, 4>> alleleMembers;
+        // An arm is collected by walking every overlap of the owner, one
+        // partner occurrence at a time, with no per-read bookkeeping -- so the
+        // same ReadId can be appended twice when it overlaps the owner more
+        // than once. Two same-orientation entries are a harmless duplicate,
+        // but two OPPOSITE-orientation entries put one ReadId on both strands
+        // of one anchor, which Shasta2Anchors rejects outright ("contains the
+        // same ReadId on both strands") and which would abort the export.
+        //
+        // A read that aligns to the owner in both orientations at one locus
+        // gives no usable evidence about which haplotype it belongs to, so it
+        // is dropped from the arm entirely rather than resolved arbitrarily;
+        // plain duplicates collapse to one occurrence.
+        auto sanitizeArm = [](const vector<pair<OrientedReadId, uint32_t>>& in) {
+            vector<pair<OrientedReadId, uint32_t>> out;
+            out.reserve(in.size());
+            std::unordered_map<ReadId, uint64_t> firstIndex;
+            vector<bool> conflicted;
+            for(const auto& e: in) {
+                const ReadId readIdOfEntry = e.first.getReadId();
+                auto it = firstIndex.find(readIdOfEntry);
+                if(it == firstIndex.end()) {
+                    firstIndex.emplace(readIdOfEntry, out.size());
+                    out.push_back(e);
+                    conflicted.push_back(false);
+                } else if(out[it->second].first != e.first) {
+                    conflicted[it->second] = true;      // both strands seen
+                }
+            }
+            vector<pair<OrientedReadId, uint32_t>> clean;
+            clean.reserve(out.size());
+            for(uint64_t i = 0; i < out.size(); i++) {
+                if(!conflicted[i]) clean.push_back(out[i]);
+            }
+            return clean;
+        };
+
         vector<CigarSnpSite> localSitesOut;
         vector<uint32_t> localSitePositions;
         // Allele detail for DINARA_SNP_SITE_DUMP, index-parallel to
@@ -930,8 +967,10 @@ void Assembler::detectCigarSnpSites(
                             }
                             if(dominantBase >= 0 && bestAltBase >= 0) {
                                 CigarSnpSite site;
-                                site.alleles.push_back(alleleMembers[k][dominantBase]);
-                                site.alleles.push_back(alleleMembers[k][bestAltBase]);
+                                site.alleles.push_back(
+                                    sanitizeArm(alleleMembers[k][dominantBase]));
+                                site.alleles.push_back(
+                                    sanitizeArm(alleleMembers[k][bestAltBase]));
                                 localSitesOut.push_back(std::move(site));
                                 localSitePositions.push_back(sitePosition);
                                 localSiteDetail.push_back({uint8_t(dominantBase),

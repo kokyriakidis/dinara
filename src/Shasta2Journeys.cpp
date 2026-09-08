@@ -424,18 +424,36 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     // also happens to touch this read at the same base (common once real
     // data has many overlapping anchor-graph edges) -- left unresolved, two
     // such anchors land journey-adjacent with a zero offset and
-    // Shasta2AnchorPair::assertNoNegativeOffsets aborts the whole run. Same
-    // tie-break priority as main.cpp's external-anchor-export tie
-    // resolution: primary over het/hom, then higher coverage (member
-    // count), then lower anchor id. The loser is dropped from just THIS
-    // read's journey -- it keeps its other members and its own coverage
-    // count untouched, exactly like the export-side drop map.
+    // Shasta2AnchorPair::assertNoNegativeOffsets aborts the whole run. The
+    // loser is dropped from just THIS read's journey -- it keeps its other
+    // members and its own coverage count untouched, exactly like the
+    // export-side drop map.
+    //
+    // WHICH one survives is the only freedom available (shasta2's
+    // LocalAssembly7::positionOffsetAB() asserts positionB > positionA
+    // strictly, so keeping both is not an option), and the choice is not
+    // symmetric. Preferring primary over het -- which is what this did, and
+    // what main.cpp's export-side resolution still does -- makes het anchors
+    // lose EVERY collision they are in, because a het anchor is by definition
+    // never the primary. Measured on the 989-read fixture: 1154 of 1154 dropped
+    // occurrences were het, none primary, costing 11.1% of all het-anchor
+    // occurrences and diluting every site's arms by about that much.
+    //
+    // Preferring het inverts a systematic loss into a diffuse one. The
+    // occurrence still has to be dropped, but it now lands on a primary anchor
+    // carrying roughly twice the coverage, where one lost occurrence is
+    // proportionally far cheaper -- and het anchors exist precisely to be
+    // traversed, so dropping them defeats the reason they were created. Note
+    // this changes journeys only: the primary anchor's own member count and
+    // coverage are untouched, so the graph is still verified consistent with
+    // the journeys either way (DINARA_VERIFY_ANCHOR_GRAPH).
+    const bool preferHetOnTie = journeyTiePreferHet;
     auto isHetAnchor = [&](Shasta2AnchorId id) -> bool {
         return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
     };
     auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
         const bool aHet = isHetAnchor(a), bHet = isHetAnchor(b);
-        if(aHet != bHet) return !aHet;                      // primary wins
+        if(aHet != bHet) return preferHetOnTie ? aHet : !aHet;
         const uint64_t ca = anchors[a].size(), cb = anchors[b].size();
         if(ca != cb) return ca > cb;                         // higher coverage wins
         return a < b;                                        // lower id wins
