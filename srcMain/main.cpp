@@ -2628,6 +2628,113 @@ void dinara::main::assemble(
             threadCount);
 
         if(assemblerOptions.assemblyOptions.mode3Options.createSnpSiteAnchors) {
+            // Collapse sites that are the SAME LOCUS detected twice.
+            //
+            // Ownership elects one owner per locus as the lowest ReadId among
+            // the covering reads, and two reads viewing one locus agree on that
+            // only when they minimise over the same covering set. Where their
+            // overlap sets differ they disagree and BOTH claim the locus -- the
+            // duplication the ownership comment in AssemblerCigarSnpSites.cpp
+            // predicts. Nothing downstream noticed, because a duplicate is not
+            // wrong per read: each detection is a valid view of a real variant.
+            //
+            // It becomes visible one stage later as a het-vs-het journey tie.
+            // Both detections turn into anchors, both arms contain the same read
+            // at the same base, and the journey rebuild has to drop one
+            // occurrence because shasta2 forbids two anchors at one position.
+            // That accounted for the entire residual het-anchor loss after the
+            // primary-vs-het tie-break was fixed (646 of 1103 dropped
+            // occurrences), so it is worth removing here rather than paying for
+            // it there.
+            //
+            // Two sites are the same locus exactly when they share a member
+            // OCCURRENCE -- the same (OrientedReadId, position) pair -- which
+            // needs no coordinate mapping to test: one read cannot carry two
+            // different alleles at one base. Keep the better-supported
+            // representative (most members over both arms), breaking ties on the
+            // first member's ordinal for determinism, and drop the rest.
+            {
+                vector<uint64_t> order(snpSites.size());
+                for(uint64_t i = 0; i < order.size(); i++) order[i] = i;
+                auto support = [&](uint64_t i) {
+                    uint64_t n = 0;
+                    for(const auto& a: snpSites[i].alleles) n += a.size();
+                    return n;
+                };
+                auto firstKey = [&](uint64_t i) {
+                    pair<uint64_t, uint32_t> best{~0ULL, 0};
+                    for(const auto& a: snpSites[i].alleles) {
+                        for(const auto& m: a) {
+                            const pair<uint64_t, uint32_t> k{m.first.getValue(), m.second};
+                            if(k < best) best = k;
+                        }
+                    }
+                    return best;
+                };
+                std::sort(order.begin(), order.end(), [&](uint64_t x, uint64_t y) {
+                    const uint64_t sx = support(x), sy = support(y);
+                    if(sx != sy) return sx > sy;
+                    return firstKey(x) < firstKey(y);
+                });
+                std::unordered_map<uint64_t, uint64_t> claim;   // occurrence -> site
+                vector<bool> dropped(snpSites.size(), false);
+                uint64_t duplicateSites = 0;
+                for(const uint64_t i: order) {
+                    bool clash = false;
+                    for(const auto& a: snpSites[i].alleles) {
+                        for(const auto& m: a) {
+                            const uint64_t key =
+                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
+                            if(claim.count(key)) { clash = true; break; }
+                        }
+                        if(clash) break;
+                    }
+                    if(clash) { dropped[i] = true; ++duplicateSites; continue; }
+                    for(const auto& a: snpSites[i].alleles) {
+                        for(const auto& m: a) {
+                            const uint64_t key =
+                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
+                            claim.emplace(key, i);
+                        }
+                    }
+                }
+                // Would MERGING the duplicate into its keeper be better than
+                // dropping it? Only if the duplicate holds member occurrences
+                // the keeper does not -- reads its owner's overlap set reached
+                // and the keeper's did not. Count them, because that is the
+                // entire value merging could add.
+                uint64_t dupOccurrences = 0, dupUnclaimed = 0;
+                for(uint64_t i = 0; i < snpSites.size(); i++) {
+                    if(!dropped[i]) continue;
+                    for(const auto& a: snpSites[i].alleles) {
+                        for(const auto& m: a) {
+                            ++dupOccurrences;
+                            const uint64_t key =
+                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
+                            if(claim.find(key) == claim.end()) ++dupUnclaimed;
+                        }
+                    }
+                }
+                if(duplicateSites > 0) {
+                    cout << timestamp << "  duplicate sites held "
+                         << dupOccurrences << " member occurrence(s), of which "
+                         << dupUnclaimed << " are absent from the keeper "
+                            "(the most merging could recover)." << endl;
+                }
+                if(duplicateSites > 0) {
+                    vector<Assembler::CigarSnpSite> kept;
+                    kept.reserve(snpSites.size() - duplicateSites);
+                    for(uint64_t i = 0; i < snpSites.size(); i++) {
+                        if(!dropped[i]) kept.push_back(std::move(snpSites[i]));
+                    }
+                    snpSites.swap(kept);
+                }
+                cout << timestamp << "CIGAR het sites: dropped "
+                     << duplicateSites << " duplicate detection(s) of a locus "
+                        "already claimed by a better-supported site, leaving "
+                     << snpSites.size() << "." << endl;
+            }
+
             uint64_t created = 0, skippedThin = 0;
             for(const Assembler::CigarSnpSite& site: snpSites) {
                 for(const auto& members: site.alleles) {
