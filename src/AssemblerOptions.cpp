@@ -1278,6 +1278,24 @@ void AssemblerOptions::addConfigurableOptions()
         "The chosen alternate must be at least this fraction of all the "
         "disagreeing reads at a candidate site (hifiasm's rule).")
 
+        ("Assembly.mode3.snpSiteAlleleCoverageRate",
+        value<double>(&assemblyOptions.mode3Options.snpSiteAlleleCoverageRate)->
+        default_value(0.7),
+        "Fraction of the het coverage peak a site's MAJOR allele must reach "
+        "(hifiasm's cut_rate for cc). Derived from the data, not fixed.")
+
+        ("Assembly.mode3.snpSiteAlleleCoverageFloor",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteAlleleCoverageFloor)->
+        default_value(6),
+        "Absolute floor for the major-allele support requirement, used when "
+        "the coverage-derived value falls below it (hifiasm's cut_bd).")
+
+        ("Assembly.mode3.snpSitePloidy",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSitePloidy)->
+        default_value(2),
+        "Ploidy used to derive per-haplotype coverage from the homozygous peak "
+        "when the heterozygous peak is unknown (hifiasm's polyploidy).")
+
         ("Assembly.mode3.snpSiteMinCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinCoverage)->
         default_value(10),
@@ -1801,6 +1819,9 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteStrongAltCount = " << snpSiteStrongAltCount << "\n";
     s << "mode3.snpSiteVafStrong = " << snpSiteVafStrong << "\n";
     s << "mode3.snpSiteVafWeak = " << snpSiteVafWeak << "\n";
+    s << "mode3.snpSiteAlleleCoverageRate = " << snpSiteAlleleCoverageRate << "\n";
+    s << "mode3.snpSiteAlleleCoverageFloor = " << snpSiteAlleleCoverageFloor << "\n";
+    s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
         convertBoolToPythonString(createSnpSiteAnchors) << "\n";
     s << "mode3.transcribeHetBubbles = " <<

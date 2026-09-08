@@ -602,6 +602,18 @@ public:
     uint64_t snpSiteStrongAltCount = 5;
     double snpSiteVafStrong = 0.24;
     double snpSiteVafWeak = 0.35;
+    // hifiasm's `cc`, from the LIVE phasing path (gen_rphase_dp0_single_path):
+    //     cc = ((het_cov > 0) ? het_cov : (hom_cov / ploidy));
+    //     cc *= cut_rate;  if (cc < cut_bd) cc = cut_bd;
+    // with cut_rate = 0.7 and cut_bd = 6 at hifiasm's call site. It gates the
+    // MAJOR allele's read count, so it asks whether a site's dominant allele
+    // carries the support a real haplotype would. Because each haplotype at a
+    // true het site gets about het_cov reads, this adapts to the dataset's own
+    // coverage instead of being a guessed constant -- on the GIAB fixture
+    // hifiasm's peaks are het 22 / hom 43, giving 0.7 x 22 = 15.
+    double snpSiteAlleleCoverageRate = 0.7;
+    uint64_t snpSiteAlleleCoverageFloor = 6;
+    uint64_t snpSitePloidy = 2;
     // Turn the surviving sites into het anchors: one per allele arm, then the
     // caller rebuilds journeys and the anchor graph from scratch. No surgery on
     // an existing graph. Off by default -- detection alone changes nothing.

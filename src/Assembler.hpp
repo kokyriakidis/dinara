@@ -377,6 +377,9 @@ public:
         uint64_t strongAltCount,
         double vafStrong,
         double vafWeak,
+        double alleleCoverageRate,
+        uint64_t alleleCoverageFloor,
+        uint64_t ploidy,
         // When non-null, receives every site that passed every filter, with
         // its per-allele membership. Detection alone leaves this empty.
         vector<CigarSnpSite>* sitesOut,

@@ -85,6 +85,9 @@ void Assembler::detectCigarSnpSites(
     uint64_t strongAltCount,
     double vafStrong,
     double vafWeak,
+    double alleleCoverageRate,
+    uint64_t alleleCoverageFloor,
+    uint64_t ploidy,
     vector<CigarSnpSite>* sitesOut,
     uint64_t threadCount)
 {
@@ -98,6 +101,37 @@ void Assembler::detectCigarSnpSites(
     if(threadCount == 0) threadCount = 1;
 
     const ReadId readCount = ReadId(reads->readCount());
+
+    // Dynamic minimum support for a het allele, derived from the dataset's own
+    // coverage statistics rather than fixed. This is hifiasm's `cc`, from the
+    // LIVE phasing path (gen_rphase_dp0_single_path, Correct.cpp:9435):
+    //
+    //     cc = ((het_cov > 0) ? het_cov : (hom_cov / n_hap));
+    //     cc *= cut_rate; if(cc < cut_bd) cc = cut_bd;
+    //
+    // with the caller passing asm_opt.het_cov, asm_opt.hom_cov,
+    // asm_opt.polyploidy, cut_rate = 0.7, cut_bd = 6. hifiasm gates on it
+    // twice, both times against occ_0 -- the MAJOR allele's count -- so it
+    // means "this site's dominant allele carries the read support a real
+    // haplotype would". At a true het site each haplotype gets about het_cov
+    // reads, so requiring 70% of that adapts to the data instead of guessing.
+    //
+    // dinara already has the same statistics: hifiasm's own filter reports its
+    // coverage peaks and they are kept in kmerDistributionInfo for the run.
+    const uint64_t coverageHet = assemblerInfo->kmerDistributionInfo.coverageHet;
+    const uint64_t coverageHom = assemblerInfo->kmerDistributionInfo.coverageHom;
+    uint64_t minAlleleCoverage = alleleCoverageFloor;
+    {
+        const uint64_t base = (coverageHet != invalid<uint64_t> && coverageHet > 0) ?
+            coverageHet :
+            ((coverageHom != invalid<uint64_t> && ploidy > 0) ? (coverageHom / ploidy) : 0);
+        const uint64_t scaled = uint64_t(double(base) * alleleCoverageRate);
+        if(scaled > minAlleleCoverage) minAlleleCoverage = scaled;
+        cout << timestamp << "SNP-site detection: minimum major-allele support "
+             << minAlleleCoverage << " (het coverage " << base << " x "
+             << alleleCoverageRate << ", floored at " << alleleCoverageFloor
+             << ")." << endl;
+    }
 
     // Index the store by read. It is keyed by (pairKey, strand) for per-pair
     // lookup, so "every overlap involving read r" needs building once here.
@@ -680,7 +714,9 @@ void Assembler::detectCigarSnpSites(
                         const uint64_t pairTotal = dominant + bestAlt;
                         const double vaf = (pairTotal > 0) ?
                             (double(bestAlt) / double(pairTotal)) : 0.0;
-                        if(pairTotal >= minSiteCoverage) {
+                        // hifiasm's cc: the MAJOR allele must carry the
+                        // support a real haplotype would.
+                        if(dominant >= minAlleleCoverage && pairTotal >= minSiteCoverage) {
                             if(bestAlt >= strongAltCount) {
                                 enoughCoverage = (vaf >= vafStrong);
                             } else {
