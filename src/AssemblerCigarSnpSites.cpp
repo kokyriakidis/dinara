@@ -450,20 +450,39 @@ void Assembler::detectCigarSnpSites(
             // minimise over the same covering set. They can disagree only where
             // their overlap sets differ.
             //
-            // That disagreement is NOT only a duplicate risk: it can silently
-            // DROP a site. Ownership is elected over the covering reads without
+            // That disagreement is NOT only a duplicate risk: it can DROP a
+            // locus. Ownership is elected over the covering reads without
             // asking whether the position is a candidate on the winner, so a
-            // read that did find the site yields to a lower ReadId that never
-            // did -- because that read's own overlap set leaves it with <= 1
-            // disagreeing partner there -- and then nobody runs pass 2 on it.
-            // This is a real defect rather than a tuning choice, and it is
-            // recorded here because its measured cost is small enough to hide:
-            // on the 989-read fixture only a couple of reachable truth SNVs are
-            // lost this way, well inside the noise of a single 400 kb region.
-            // Fixing it needs the owner elected among reads that HOLD the
-            // position as a candidate, which is not locally knowable in this
-            // loop -- it would need pass 1's per-read candidate sets retained
-            // and consulted through each overlap's CIGAR.
+            // read that did flag the site yields to a lower ReadId that never
+            // did, and then nobody runs pass 2 on it.
+            //
+            // Measured, that turns out to be load-bearing rather than broken,
+            // and the naive fix would be a regression. On the 989-read fixture
+            // 35905 distinct loci are flagged by at least one read but only
+            // 3711 are ever evaluated -- ownership silently discards 90% of
+            // them. Almost all of that is noise: 84.3% of the discarded loci
+            // were flagged by exactly ONE read, and of the plausible real hets
+            // among them there are five. Real variants are flagged
+            // redundantly -- 93.8% of truth het SNVs are flagged by 10 or more
+            // reads, 96.7% by at least five -- so the lowest-ReadId coverer is
+            // almost always one of the flaggers and the site is kept.
+            //
+            // So min-ReadId election is acting as an accidental REDUNDANCY
+            // filter, and it is the operative filter here: the ">= 2 disagreeing
+            // partners" rule admits ten times more loci than survive this step.
+            // Electing among candidate-holders instead -- the "correct" fix --
+            // would admit all 32194 discarded loci into pass 2, a 9.7x increase
+            // in evaluated loci that is almost entirely noise.
+            //
+            // The honest repair is therefore NOT to fix the election but to make
+            // the redundancy requirement explicit: require a locus to be flagged
+            // by >= N reads, which is what is really happening, then ownership
+            // becomes pure deduplication and can be elected among flaggers
+            // safely. Two things recommend it over the status quo -- the
+            // threshold becomes a stated, tunable decision instead of a
+            // side effect, and the result stops depending on ReadId ordering
+            // (ReadIds come from input order, so which marginal loci survive
+            // currently depends on the order the reads were read in).
             ownedPositions.clear();
             for(const uint32_t position: localCandidates) {
                 ReadId owner = readId;
