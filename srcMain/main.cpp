@@ -2883,213 +2883,15 @@ void dinara::main::assemble(
         minEdgeCoverage,
         threadCount);
 #endif // USE_JOURNEY_ANCHOR_GRAPH
-
-    // Global per-read journey tie resolution. shasta2 builds, for every oriented
-    // read, the ordered list of ALL anchors that read belongs to (sorted by the
-    // read's exported position) and asserts they are STRICTLY INCREASING; two
-    // anchors at the SAME exported position on one read triggers "Invalid
-    // Journey ...". dinara's own guards are all LOCAL (per intra-window edge, per
-    // exported edge, or het/hom-vs-primary only); none enforce this GLOBAL
-    // per-read constraint across all het/hom anchors, which the k=0 membership
-    // relaxation (pinnedPointCol drops the k=2 flank-adjacency guard) can now
-    // violate: two het/hom anchors in different windows can pin the same read at
-    // the same exported base position.
-    //
-    // Model. The exportable unit is (canonicalAnchorId, readId): shasta2 loads
-    // only the canonical (even) anchors and REGENERATES the RC of each, so one
-    // unit becomes TWO journey occurrences -- one on readId-0, one on readId-1.
-    // dinara's store already holds each RC twin as the odd anchor
-    // (appendHetAnchorPair), so iterating the FULL store (even + odd) reproduces
-    // exactly the occurrence set shasta2 sees. An occurrence's unit is
-    // (anchorId & ~1, orientedReadId.getReadId()); dropping that unit removes
-    // BOTH the direct and the RC-induced occurrence for the read.
-    //
-    // Resolution. For each oriented read, group occurrences by exported position;
-    // for every position with >1 unit keep one (primary over het/hom, then higher
-    // coverage, then lower canonical id) and record the rest in the drop map.
-    // Dropping only REMOVES occurrences, so a position group can only shrink
-    // (n -> <=1) and no new tie can appear; a single pass therefore leaves every
-    // (read, position) group with <=1 survivor regardless of mirror-strand
-    // interactions. writeExternalAnchors omits the dropped members.
+    // The export's drop map is DERIVED from the journeys (below), not resolved
+    // a second time here. An earlier version did resolve it independently --
+    // grouping each read's anchor occurrences by exported position and picking a
+    // keeper -- which meant two implementations of one policy. They disagreed:
+    // 446 drops agreed, 11 were derived-only and 27 resolved-only, and for a
+    // while they even used opposite tie-break preferences, so the exported
+    // anchors contradicted the exported graph. The journeys already carry the
+    // answer, so the export reads it rather than recomputing it.
     Shasta2Anchors::ExternalAnchorDropMap journeyTieDropMap;
-    {
-        const uint32_t exportShift = hetAnchorKHalf();
-        const Shasta2AnchorId hetFirst = shasta2Anchors->hetAnchorFirstId;
-        auto isHet = [&](Shasta2AnchorId canonicalId) -> bool {
-            return hetFirst != invalid<Shasta2AnchorId> && canonicalId >= hetFirst;
-        };
-        auto classOf = [&](Shasta2AnchorId canonicalId) -> const char* {
-            return isHet(canonicalId) ? "het/hom" : "primary";
-        };
-        // Per oriented read: (exportedPosition, canonicalAnchorId). The unit's
-        // readId is the read's own ReadId, identical for both strands.
-        std::unordered_map<uint64_t, vector<std::pair<uint32_t, Shasta2AnchorId>>> byRead;
-        const uint64_t anchorCount = shasta2Anchors->size();
-        for(Shasta2AnchorId id = 0; id < anchorCount; id++) {
-            const Shasta2AnchorId canonicalId = id & ~Shasta2AnchorId(1);
-            const Shasta2Anchor anchor = (*shasta2Anchors)[id];
-            for(const Shasta2AnchorMarkerInfo& mi : anchor) {
-                byRead[mi.orientedReadId.getValue()].push_back(
-                    {mi.position - exportShift, canonicalId});
-            }
-        }
-        // Coverage of a canonical anchor (member count), used to pick the keeper.
-        auto coverageOf = [&](Shasta2AnchorId canonicalId) -> uint64_t {
-            return (*shasta2Anchors)[canonicalId].size();
-        };
-        // Prefer to KEEP: het/hom over primary (see below), then higher
-        // coverage, then lower canonical id. Returns true if a should be kept
-        // over b.
-        //
-        // This MUST use the same preference as the journey rebuild
-        // (Shasta2Journeys.cpp), and for a while it did not. Both resolve the
-        // same ties -- two anchors on one base of one read, which shasta2
-        // forbids -- but they resolve them on different artifacts: the rebuild
-        // drops a journey occurrence, this drops a member from the anchor that
-        // gets exported. When the rebuild switched to keeping het and this did
-        // not, the two disagreed on all 457 ties (914 here, since this walks
-        // both strands): the journeys and the anchor graph kept the het
-        // occurrence while the exported external anchors had that same het
-        // member stripped. The artifacts shasta2 loads then described different
-        // graphs, and the tie-break fix was silently undone on the only path
-        // that leaves this process.
-        //
-        // So take the flag from the journeys object rather than repeating the
-        // policy, which is what let them drift apart in the first place.
-        const bool preferHet = shasta2Journeys->journeyTiePreferHet;
-
-        // Members still standing on each canonical anchor, decremented as drops
-        // are recorded. Used to keep tie resolution from ever emptying an
-        // anchor: an anchor whose LAST member is about to be dropped wins the
-        // tie outright, ahead of the het/primary preference.
-        //
-        // Without this the resolution can starve an anchor completely, and
-        // measurably did -- exactly 4 anchors on the 989-read fixture, whose
-        // whole membership is tied against some other anchor. The class
-        // preference only decided which kind got starved: preferring het
-        // emptied 4 primary anchors, preferring primary emptied 4 HET ones
-        // (426 -> 422 with members). An emptied anchor is exported as an empty
-        // record, because writeExternalAnchors must not skip anything or
-        // shasta2's sequential IDs stop matching dinara's -- so the anchor does
-        // not disappear, it becomes a hole in the graph that no read traverses.
-        std::unordered_map<Shasta2AnchorId, uint64_t> remaining;
-        for(Shasta2AnchorId id = 0; id < anchorCount; id += 2) {
-            remaining[id] = coverageOf(id);
-        }
-        auto wouldEmpty = [&](Shasta2AnchorId id) -> bool {
-            const auto it = remaining.find(id);
-            return it != remaining.end() && it->second <= 1;
-        };
-        auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
-            const bool aLast = wouldEmpty(a), bLast = wouldEmpty(b);
-            if(aLast != bLast) return aLast;    // never empty an anchor
-            const bool aHet = isHet(a), bHet = isHet(b);
-            if(aHet != bHet) return preferHet ? aHet : !aHet;
-            const uint64_t ca = coverageOf(a), cb = coverageOf(b);
-            if(ca != cb) return ca > cb;                    // higher coverage wins
-            return a < b;                                   // lower id wins
-        };
-        // Record a dropped unit (canonicalId, readId), de-duplicated.
-        auto recordDrop = [&](Shasta2AnchorId canonicalId, ReadId readId) -> bool {
-            auto& v = journeyTieDropMap[canonicalId];
-            if(std::find(v.begin(), v.end(), readId) == v.end()) {
-                v.push_back(readId);
-                auto it = remaining.find(canonicalId);
-                if(it != remaining.end() && it->second > 0) --it->second;
-                return true;
-            }
-            return false;
-        };
-        uint64_t tieGroups = 0, unitsDropped = 0, readsWithTie = 0;
-        // Split the drops by class. With preferHet set, this must report ZERO
-        // het units dropped -- that is the whole point of the preference, and
-        // stating it as a number keeps the guarantee checkable instead of
-        // inferred from a truncated sample of the [journey-tie] lines below.
-        uint64_t unitsDroppedHet = 0, unitsDroppedPrimary = 0;
-        // Diagnostic: classify each tie group by the (het,primary) composition of
-        // its members, to confirm het-vs-het collisions (the per-SNP-orientation
-        // bug) are gone and the remaining ties are het-vs-primary.
-        uint64_t tgPrimaryVsHet = 0, tgHetVsHet = 0, tgPrimaryVsPrimary = 0;
-        const uint64_t maxReport = 20;
-        uint64_t reported = 0;
-        // Iterate reads in a deterministic order. byRead is an unordered_map,
-        // and `remaining` above mutates as ties are resolved, so which anchor
-        // wins a starvation tie depends on the order reads are visited --
-        // hash order, which is not stable. Sort the keys first.
-        vector<uint64_t> readOrder;
-        readOrder.reserve(byRead.size());
-        for(const auto& kv: byRead) readOrder.push_back(kv.first);
-        std::sort(readOrder.begin(), readOrder.end());
-        for(const uint64_t oidValue : readOrder) {
-            auto& occ = byRead[oidValue];
-            std::sort(occ.begin(), occ.end());
-            const OrientedReadId oid = OrientedReadId::fromValue(ReadId(oidValue));
-            const ReadId readId = oid.getReadId();
-            bool readCounted = false;
-            for(size_t i = 0; i < occ.size(); ) {
-                // Advance over a run of equal positions [i, j).
-                size_t j = i + 1;
-                while(j < occ.size() && occ[j].first == occ[i].first) ++j;
-                if(j - i > 1) {
-                    ++tieGroups;
-                    if(!readCounted) { ++readsWithTie; readCounted = true; }
-                    // Classify the group's composition (diagnostic).
-                    {
-                        uint64_t hetN = 0, priN = 0;
-                        for(size_t t = i; t < j; t++) {
-                            if(isHet(occ[t].second)) ++hetN; else ++priN;
-                        }
-                        if(priN && hetN) ++tgPrimaryVsHet;
-                        else if(hetN >= 2) ++tgHetVsHet;
-                        else ++tgPrimaryVsPrimary;
-                    }
-                    // Choose the keeper among the tied canonical anchors.
-                    Shasta2AnchorId keeper = occ[i].second;
-                    for(size_t t = i + 1; t < j; t++) {
-                        if(keepAOverB(occ[t].second, keeper)) keeper = occ[t].second;
-                    }
-                    // Drop every tied unit except the keeper.
-                    for(size_t t = i; t < j; t++) {
-                        const Shasta2AnchorId cId = occ[t].second;
-                        if(cId == keeper) continue;
-                        recordDrop(cId, readId);
-                        ++unitsDropped;
-                        if(isHet(cId)) ++unitsDroppedHet; else ++unitsDroppedPrimary;
-                    }
-                    if(reported < maxReport) {
-                        ++reported;
-                        cout << "  [journey-tie] read " << oid
-                             << " pos " << occ[i].first << " keep anchor "
-                             << keeper << " (" << classOf(keeper) << "), drop";
-                        for(size_t t = i; t < j; t++) {
-                            if(occ[t].second == keeper) continue;
-                            cout << " " << occ[t].second
-                                 << " (" << classOf(occ[t].second) << ")";
-                        }
-                        cout << endl;
-                    }
-                }
-                i = j;
-            }
-        }
-        cout << timestamp << "Journey tie resolution: " << tieGroups
-             << " tied position group(s) on " << readsWithTie
-             << " read(s); dropping " << unitsDropped
-             << " unit(s) across " << journeyTieDropMap.size()
-             << " anchor(s) (--k " << hetAnchorK() << ")." << endl;
-        cout << timestamp << "  tie groups by class: primary-vs-het="
-             << tgPrimaryVsHet << " het-vs-het=" << tgHetVsHet
-             << " primary-vs-primary=" << tgPrimaryVsPrimary << "." << endl;
-        uint64_t emptied = 0;
-        for(const auto& [id, n]: remaining) { static_cast<void>(id); if(n == 0) ++emptied; }
-        cout << timestamp << "  anchors emptied by tie resolution: " << emptied
-             << (emptied == 0 ? "  (none -- an anchor's last member always wins)" : "")
-             << endl;
-        cout << timestamp << "  dropped units by class: het=" << unitsDroppedHet
-             << " primary=" << unitsDroppedPrimary
-             << (preferHet && unitsDroppedHet == 0 ?
-                 "  (every het member survives the export)" : "") << endl;
-    }
 
     // The drop map the export applies should be a FUNCTION OF THE JOURNEYS, not
     // a second opinion about them. The journeys were already rebuilt with ties
@@ -3128,28 +2930,9 @@ void dinara::main::assemble(
                 }
             }
         }
-        uint64_t agree = 0, onlyDerived = 0, onlyComputed = 0;
-        for(const auto& [a, reads]: derived) {
-            for(const ReadId r: reads) {
-                const auto it = journeyTieDropMap.find(a);
-                const bool inComputed = (it != journeyTieDropMap.end()) &&
-                    (std::find(it->second.begin(), it->second.end(), r) != it->second.end());
-                if(inComputed) ++agree; else ++onlyDerived;
-            }
-        }
-        for(const auto& [a, reads]: journeyTieDropMap) {
-            for(const ReadId r: reads) {
-                const auto it = derived.find(a);
-                const bool inDerived = (it != derived.end()) &&
-                    (std::find(it->second.begin(), it->second.end(), r) != it->second.end());
-                if(!inDerived) ++onlyComputed;
-            }
-        }
         cout << timestamp << "Export drop map derived from journeys: "
-             << derivedDrops << " member(s) not present in any journey." << endl;
-        cout << timestamp << "  vs the independently resolved map: agree=" << agree
-             << " derived-only=" << onlyDerived
-             << " resolved-only=" << onlyComputed << endl;
+             << derivedDrops << " member(s) absent from every journey "
+                "(these are exactly the occurrences the rebuild dropped)." << endl;
         journeyTieDropMap.swap(derived);
     }
 
