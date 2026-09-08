@@ -1278,6 +1278,20 @@ void AssemblerOptions::addConfigurableOptions()
         "The chosen alternate must be at least this fraction of all the "
         "disagreeing reads at a candidate site (hifiasm's rule).")
 
+        ("Assembly.mode3.snpSiteMinCoverage",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinCoverage)->
+        default_value(12),
+        "Minimum total reads at a candidate SNP site. Matches the abPOA "
+        "detector's minCommonForHet; without it the binomial test accepts "
+        "single-read alleles wherever coverage is tiny.")
+
+        ("Assembly.mode3.createSnpSiteAnchors",
+        value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
+        default_value(false),
+        "Create het anchors from the surviving CIGAR-detected SNP sites (one "
+        "per allele arm), then rebuild journeys and the anchor graph from "
+        "scratch. Requires Assembly.mode3.detectSnpSites.")
+
         ("Assembly.mode3.transcribeHetBubbles",
         value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
         default_value(false),
@@ -1767,6 +1781,9 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSiteStrandBiasPValue = " << snpSiteStrandBiasPValue << "\n";
     s << "mode3.snpSiteMinPurity = " << snpSiteMinPurity << "\n";
     s << "mode3.snpSiteMinAltDominance = " << snpSiteMinAltDominance << "\n";
+    s << "mode3.snpSiteMinCoverage = " << snpSiteMinCoverage << "\n";
+    s << "mode3.createSnpSiteAnchors = " <<
+        convertBoolToPythonString(createSnpSiteAnchors) << "\n";
     s << "mode3.transcribeHetBubbles = " <<
         convertBoolToPythonString(transcribeHetBubbles) << "\n";
     s << "mode3.minCommonForHet = " << minCommonForHet << "\n";

@@ -584,6 +584,16 @@ public:
     // definitely wrong", so they are values to revisit, not gospel.
     double snpSiteMinPurity = 0.95;
     double snpSiteMinAltDominance = 0.70;
+    // Minimum total reads at a site. Without a floor the binomial test turns
+    // permissive exactly where it should not: with a dominant count of 1,
+    // P(X >= 1) at the assumed error rate is that rate itself, so a
+    // single-read "allele" clears the bar wherever coverage is tiny. The abPOA
+    // detector is insulated by minCommonForHet; this path needs its own.
+    uint64_t snpSiteMinCoverage = 12;
+    // Turn the surviving sites into het anchors: one per allele arm, then the
+    // caller rebuilds journeys and the anchor graph from scratch. No surgery on
+    // an existing graph. Off by default -- detection alone changes nothing.
+    bool createSnpSiteAnchors = false;
 
     // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
     // anchor graph, append a het anchor per detected allele, rebuild journeys,

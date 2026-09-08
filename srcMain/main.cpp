@@ -1873,22 +1873,6 @@ void dinara::main::assemble(
         assemblerOptions.alignOptions,
         threadCount);
 
-    // Candidate SNP sites straight from the imported CIGARs. Off by default,
-    // and detection-only: it reports the disagreement-fraction distribution and
-    // creates nothing. Runs here because it needs only the CIGAR store (which
-    // lives for the rest of the run) and the reads.
-    if(assemblerOptions.assemblyOptions.mode3Options.detectSnpSites) {
-        assembler.detectCigarSnpSites(
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinDisagree,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinFraction,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMaxFraction,
-            assemblerOptions.assemblyOptions.mode3Options.hetErrorRate,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteStrandBiasPValue,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
-            threadCount);
-    }
-
     // Build a vector of ReadIds sorted by read length (longest first).
     const Reads& reads = assembler.getReads();
     const ReadId readCount = reads.readCount();
@@ -2611,6 +2595,50 @@ void dinara::main::assemble(
     // any other het/hom anchors some other pass might append for a purpose
     // that doesn't include internal graph participation.
     const Shasta2AnchorId newAnchorsBegin = shasta2Anchors->size();
+
+    // CIGAR-driven het anchors. This runs HERE, not next to the CIGAR import,
+    // because it needs shasta2Anchors to append to and shasta2Journeys to be
+    // rebuilt afterwards -- the imported CIGAR store lives for the whole run,
+    // so detection is free to happen late.
+    //
+    // Same contract as the abPOA detector: detect, append one anchor per
+    // allele arm, and let the caller rebuild journeys and then the anchor graph
+    // from scratch. No surgery on an existing graph -- once a new anchor is
+    // just another entry in each read's journey, the (independently verified)
+    // journey->graph builder produces the right topology on its own, and reads
+    // in neither arm take the direct flank-to-flank edge for free.
+    if(assemblerOptions.assemblyOptions.mode3Options.detectSnpSites) {
+        vector<Assembler::CigarSnpSite> snpSites;
+        assembler.detectCigarSnpSites(
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinDisagree,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinFraction,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMaxFraction,
+            assemblerOptions.assemblyOptions.mode3Options.hetErrorRate,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteStrandBiasPValue,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinCoverage,
+            assemblerOptions.assemblyOptions.mode3Options.createSnpSiteAnchors ?
+                &snpSites : nullptr,
+            threadCount);
+
+        if(assemblerOptions.assemblyOptions.mode3Options.createSnpSiteAnchors) {
+            uint64_t created = 0, skippedThin = 0;
+            for(const Assembler::CigarSnpSite& site: snpSites) {
+                for(const auto& members: site.alleles) {
+                    // appendHetAnchorPair's own floor: an arm needs at least
+                    // two members to be an anchor at all.
+                    if(members.size() < 2) { ++skippedThin; continue; }
+                    shasta2Anchors->appendHetAnchorPair(members);
+                    ++created;
+                }
+            }
+            cout << timestamp << "CIGAR het anchors: created " << created
+                 << " from " << snpSites.size() << " sites ("
+                 << skippedThin << " arms too thin)." << endl;
+        }
+    }
+
     const bool doTranscribeHetBubbles =
         assemblerOptions.assemblyOptions.mode3Options.transcribeHetBubbles;
     if(doTranscribeHetBubbles) {
@@ -2650,15 +2678,24 @@ void dinara::main::assemble(
              << endl;
         // detectionGraph goes out of scope here -- superseded by the graph
         // rebuilt from the updated journeys below.
-
-        cout << timestamp << "Rebuilding journeys to include new het anchors..." << endl;
-        shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
     } else {
         cout << timestamp << "Het-bubble transcription disabled "
              << "(Assembly.mode3.transcribeHetBubbles false): building the "
              << "anchor graph once from the journeys, no het anchors created."
              << endl;
-        static_cast<void>(newAnchorsBegin);
+    }
+
+    // Rebuild journeys if EITHER detector appended anchors -- the CIGAR-driven
+    // one above or transcribeHetBubbles. This is the step that makes a new
+    // anchor real: until a read's journey contains it, it is just an isolated
+    // vertex the graph builder never links, so the assembly graph comes out
+    // unchanged and the anchors do nothing. (That is exactly what happened when
+    // this rebuild was still nested inside the transcribeHetBubbles branch.)
+    if(shasta2Anchors->size() > newAnchorsBegin) {
+        cout << timestamp << "Rebuilding journeys to include "
+             << (shasta2Anchors->size() - newAnchorsBegin)
+             << " new het anchors..." << endl;
+        shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
     }
     cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
          << "(final pass, minEdgeCoverage=" << minEdgeCoverage << ")..." << endl;

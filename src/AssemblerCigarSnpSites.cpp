@@ -81,6 +81,8 @@ void Assembler::detectCigarSnpSites(
     double strandBiasPValue,
     double siteMinPurity,
     double siteMinAltDominance,
+    uint64_t minSiteCoverage,
+    vector<CigarSnpSite>* sitesOut,
     uint64_t threadCount)
 {
     if(hifiasmImportedCigarStore.empty()) {
@@ -165,6 +167,8 @@ void Assembler::detectCigarSnpSites(
     std::atomic<uint64_t> droppedHomopolymer{0}, droppedRepeat{0};
     std::atomic<uint64_t> droppedStrandBias{0}, sitesAfterFilters{0};
     std::atomic<uint64_t> droppedTiedAlleles{0}, droppedImpure{0}, droppedNotDominant{0};
+    std::atomic<uint64_t> droppedLowCoverage{0};
+    std::mutex sitesMutex;
     std::array<std::atomic<uint64_t>, 5> significanceHistogram{};
     for(auto& bucket: significanceHistogram) bucket.store(0);
     std::atomic<uint64_t> matchColumnsChecked{0}, matchColumnsAgree{0};
@@ -193,6 +197,11 @@ void Assembler::detectCigarSnpSites(
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
         vector<uint8_t> contextBuffer;
+        // Per owned position, the members carrying each base. Recorded rather
+        // than only counted, because these ARE the anchor arms -- an allele's
+        // member list is what appendHetAnchorPair takes.
+        vector<std::array<vector<pair<OrientedReadId, uint32_t>>, 4>> alleleMembers;
+        vector<CigarSnpSite> localSitesOut;
         // [base][strand]: strand 0 = partner aligned same-strand as the
         // owning read, 1 = reverse. A real variant should appear on both;
         // an allele seen only one way is the signature of a strand-specific
@@ -382,11 +391,20 @@ void Assembler::detectCigarSnpSites(
             // their partner offsets computed directly.
             if(!ownedPositions.empty()) {
                 alleleCounts.assign(ownedPositions.size(), {});
+                if(sitesOut) {
+                    alleleMembers.assign(ownedPositions.size(), {});
+                }
                 // Seed with this read's own base -- it is a member too.
                 for(size_t k = 0; k < ownedPositions.size(); k++) {
                     const Base self =
                         reads->getOrientedReadBase(OrientedReadId(readId, 0), ownedPositions[k]);
-                    if(self.value < 4) alleleCounts[k][self.value][0]++;
+                    if(self.value < 4) {
+                        alleleCounts[k][self.value][0]++;
+                        if(sitesOut) {
+                            alleleMembers[k][self.value].emplace_back(
+                                OrientedReadId(readId, 0), ownedPositions[k]);
+                        }
+                    }
                 }
 
                 for(const HifiasmImportedCigarStore::Record* rec: records) {
@@ -439,8 +457,13 @@ void Assembler::detectCigarSnpSites(
                                     base.value = uint8_t(3 - base.value);
                                 }
                                 if(base.value < 4) {
-                                    alleleCounts[size_t(it - ownedPositions.begin())]
-                                        [base.value][rec->isSameStrand ? 0 : 1]++;
+                                    const size_t slot = size_t(it - ownedPositions.begin());
+                                    alleleCounts[slot][base.value]
+                                        [rec->isSameStrand ? 0 : 1]++;
+                                    if(sitesOut) {
+                                        alleleMembers[slot][base.value].emplace_back(
+                                            partner, partnerPosition);
+                                    }
                                 }
                                 // Self-check against the reads themselves, which
                                 // needs no second hifiasm run and so cannot be
@@ -619,11 +642,47 @@ void Assembler::detectCigarSnpSites(
                         }
                     }
 
-                    if(passing >= 2 && biallelicClean &&
+                    // Coverage floor. Without it the binomial test turns
+                    // permissive exactly where it should not: with a dominant
+                    // count of 1, P(X >= 1) at the assumed error rate is that
+                    // rate itself, so a single-read "allele" clears the bar
+                    // wherever coverage is tiny. The abPOA detector is
+                    // insulated by minCommonForHet; this path needs its own.
+                    const bool enoughCoverage = (total >= minSiteCoverage);
+                    if(!enoughCoverage) {
+                        droppedLowCoverage.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    if(passing >= 2 && biallelicClean && enoughCoverage &&
                        !inHomopolymer && !inStr && !strandBiased) {
                         sitesAfterFilters.fetch_add(1, std::memory_order_relaxed);
+                        if(sitesOut) {
+                            // Two arms: the dominant allele and the chosen
+                            // alternate. Reads in neither get no new anchor and
+                            // simply take the direct flank-to-flank edge once
+                            // journeys are rebuilt -- the same contract the
+                            // abPOA detector relies on.
+                            int dominantBase = -1;
+                            for(int b = 0; b < 4; b++) {
+                                if(counts[b] == dominant) { dominantBase = b; break; }
+                            }
+                            if(dominantBase >= 0 && bestAltBase >= 0) {
+                                CigarSnpSite site;
+                                site.alleles.push_back(alleleMembers[k][dominantBase]);
+                                site.alleles.push_back(alleleMembers[k][bestAltBase]);
+                                localSitesOut.push_back(std::move(site));
+                            }
+                        }
                     }
                 }
+            }
+
+            if(sitesOut && !localSitesOut.empty()) {
+                std::lock_guard<std::mutex> lock(sitesMutex);
+                for(CigarSnpSite& site: localSitesOut) {
+                    sitesOut->push_back(std::move(site));
+                }
+                localSitesOut.clear();
             }
 
             candidateSites.fetch_add(localSites, std::memory_order_relaxed);
@@ -685,6 +744,8 @@ void Assembler::detectCigarSnpSites(
          << droppedImpure.load() << " below " << siteMinPurity << " purity, "
          << droppedNotDominant.load() << " alternate below "
          << siteMinAltDominance << " of the disagreement" << endl;
+    cout << "  below coverage floor (" << minSiteCoverage << "): "
+         << droppedLowCoverage.load() << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
          << " of " << ownedSites.load() << endl;
     cout << "  alleles per owned site (a base needs >= 2 reads to count):" << endl;

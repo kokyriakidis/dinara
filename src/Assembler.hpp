@@ -351,6 +351,16 @@ public:
         uint64_t threadCount
     );
 
+    // One het site detected from the CIGARs, in exactly the shape anchor
+    // creation needs: one member list per allele, each being the
+    // (OrientedReadId, position) vector Shasta2Anchors::appendHetAnchorPair
+    // takes. Positions are raw read positions in that oriented read's own
+    // frame, matching the convention the abPOA detector uses.
+    class CigarSnpSite {
+    public:
+        vector< vector< pair<OrientedReadId, uint32_t> > > alleles;
+    };
+
     // Candidate SNP-site detection straight from the imported hifiasm CIGARs.
     // Counts, per position of each read, how many overlapping partners disagree
     // there, and reports the distribution. Detection only: creates no anchors
@@ -363,6 +373,10 @@ public:
         double strandBiasPValue,
         double siteMinPurity,
         double siteMinAltDominance,
+        uint64_t minSiteCoverage,
+        // When non-null, receives every site that passed every filter, with
+        // its per-allele membership. Detection alone leaves this empty.
+        vector<CigarSnpSite>* sitesOut,
         uint64_t threadCount);
 
     // New unified alignment flow with evidence storage.
