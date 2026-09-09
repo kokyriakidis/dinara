@@ -2861,6 +2861,48 @@ void dinara::main::assemble(
                         if(bucket[i]) cout << " " << (i * 10) << "%:" << bucket[i];
                     cout << endl;
                 }
+                // Is the SITE already separated by existing anchors?
+                //
+                // A het anchor exists to split reads that are currently in the
+                // same anchor. If allele A's reads and allele B's reads already
+                // sit in DIFFERENT existing anchors at this position, the marker
+                // graph has separated them (their k=50 k-mers differ at the SNP
+                // base) and there is nothing left to do. Classify each site by
+                // where its two arms land, which is a question about conflation
+                // and needs no fraction.
+                {
+                    uint64_t conflated = 0, separated = 0, partlyAnchored = 0, unanchored = 0;
+                    for(const Assembler::CigarSnpSite& site: snpSites) {
+                        if(site.alleles.size() != 2) continue;
+                        std::array<std::set<Shasta2AnchorId>, 2> land;
+                        std::array<uint64_t, 2> free{0, 0};
+                        for(size_t k = 0; k < 2; k++) {
+                            for(const auto& m: site.alleles[k]) {
+                                const auto it = occupant.find(
+                                    (uint64_t(m.first.getValue()) << 32) |
+                                    uint64_t(m.second + hetKHalf2));
+                                if(it == occupant.end()) ++free[k];
+                                else land[k].insert(it->second);
+                            }
+                        }
+                        const bool aAnchored = !land[0].empty();
+                        const bool bAnchored = !land[1].empty();
+                        if(!aAnchored && !bAnchored) { ++unanchored; continue; }
+                        if(aAnchored && bAnchored) {
+                            std::vector<Shasta2AnchorId> both;
+                            std::set_intersection(land[0].begin(), land[0].end(),
+                                land[1].begin(), land[1].end(), std::back_inserter(both));
+                            if(both.empty()) ++separated; else ++conflated;
+                        } else {
+                            ++partlyAnchored;
+                        }
+                    }
+                    cout << timestamp << "  sites by existing-anchor separation: "
+                         << unanchored << " neither arm anchored (het anchors do the work), "
+                         << separated << " arms in DIFFERENT anchors (already separated), "
+                         << conflated << " arms share an anchor (still conflated), "
+                         << partlyAnchored << " only one arm anchored." << endl;
+                }
                 cout << timestamp << "CIGAR het arms vs existing anchors: "
                      << armsRedundant << " arm(s) are mostly accounted for by ONE "
                         "existing anchor (redundant), " << armsPartial
@@ -2883,28 +2925,37 @@ void dinara::main::assemble(
                 // existing-anchor vs new-het-anchor rather than two rival
                 // copies. Reusing an anchor is strictly better than duplicating
                 // one.
-                uint64_t armsDropped = 0;
+                // A member at an OCCUPIED position needs no het anchor: the
+                // anchor already there isolates its allele, necessarily and not
+                // just usually. A marker anchor groups reads sharing a k=50
+                // k-mer centred on that position, and that k-mer spans the SNP
+                // base -- so reads carrying different alleles were never in it.
+                // Measured over every site: 0 have both arms landing in a shared
+                // anchor, which is what that argument predicts.
+                //
+                // So build each arm from its FREE members only. Nothing is lost
+                // by the removal -- the dropped members keep their existing
+                // anchor, which separates them from the other allele exactly as
+                // a het anchor would -- and no fraction is involved. Whether
+                // what remains is still worth an anchor is then decided by the
+                // arm floor that already exists (>= 2 members), not by a new
+                // threshold.
+                uint64_t membersAlreadyAnchored = 0;
                 for(Assembler::CigarSnpSite& site: snpSites) {
                     for(auto& members: site.alleles) {
-                        if(members.empty()) continue;
-                        std::unordered_map<Shasta2AnchorId, uint64_t> hits;
-                        for(const auto& m: members) {
-                            const auto it = occupant.find(
-                                (uint64_t(m.first.getValue()) << 32) |
-                                uint64_t(m.second + hetKHalf2));
-                            if(it != occupant.end()) hits[it->second]++;
-                        }
-                        uint64_t best = 0;
-                        for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
-                        if(double(best) / double(members.size()) >= redundantArmFraction) {
-                            members.clear();
-                            ++armsDropped;
-                        }
+                        const size_t before = members.size();
+                        members.erase(std::remove_if(members.begin(), members.end(),
+                            [&](const pair<OrientedReadId, uint32_t>& m) {
+                                return occupant.count(
+                                    (uint64_t(m.first.getValue()) << 32) |
+                                    uint64_t(m.second + hetKHalf2)) != 0;
+                            }), members.end());
+                        membersAlreadyAnchored += before - members.size();
                     }
                 }
-                cout << timestamp << "  dropped " << armsDropped
-                     << " redundant arm(s); the allele stays represented by the "
-                        "anchor that already held it." << endl;
+                cout << timestamp << "  " << membersAlreadyAnchored
+                     << " arm member(s) already sit in an anchor that isolates "
+                        "their allele; het anchors are built from the rest." << endl;
             }
 
             uint64_t created = 0, skippedThin = 0;
