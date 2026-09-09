@@ -176,204 +176,11 @@ void Shasta2Journeys::threadFunction4(uint64_t /* threadId */)
 
 
 
-// Per-read journey filtering: keep the longest chain of anchors where every
-// consecutive pair has >= minCommonForBackbone common reads (forward flow),
-// with a bounded look-back of maxSkipForBackbone. Each read is handled
-// independently; the surviving anchor ids are written to filteredJourneys.
-void Shasta2Journeys::filterThreadFunction(uint64_t /* threadId */)
-{
-    const Shasta2Anchors& anchors = *anchorsPointer;
-    const uint64_t minCommon = filterMinCommon;
-    const uint64_t maxSkip = std::max<uint64_t>(filterMaxSkip, 1);
-
-    uint64_t begin, end;
-    while(getNextBatch(begin, end)) {
-        for(uint64_t oidValue = begin; oidValue != end; oidValue++) {
-            // Strand symmetry: the journey of oriented read (R,1) must be the
-            // exact reverse complement of (R,0) -- journey(R,1)[k] ==
-            // journey(R,0)[n-1-k] ^ 1. The DP tie-breaking is not mirror-
-            // symmetric, so filtering the two strands independently would
-            // diverge and break the coverage(a) == coverage(a^1) invariant that
-            // downstream stages assert. Filter only strand 0 (even oidValue)
-            // and mirror the result into strand 1 (oidValue ^ 1).
-            if((oidValue & 1ULL) != 0ULL) continue;   // strand 1 done below.
-
-            const auto journey = journeys[oidValue];
-            const uint32_t n = uint32_t(journey.size());
-            std::vector<Shasta2AnchorId>& out = filteredJourneys[oidValue];
-            std::vector<Shasta2AnchorId>& outRc = filteredJourneys[oidValue ^ 1ULL];
-            out.clear();
-            outRc.clear();
-
-            // Emit both strands: strand 0 = fwd, strand 1 = reversed + RC.
-            auto emitMirror = [&]() {
-                outRc.resize(out.size());
-                for(size_t k = 0; k < out.size(); k++) {
-                    outRc[k] = out[out.size() - 1 - k] ^ 1ULL;
-                }
-            };
-
-            if(n == 0) { continue; }
-            if(n == 1) { out.push_back(journey[0]); emitMirror(); continue; }
-
-            // DP over the journey: dp[i] = length of the longest chain ending at
-            // position i; prev[i] = predecessor position (-1 if the chain starts
-            // at i). A pair (j, i) is chainable when countCommon(journey[j],
-            // journey[i]) >= minCommon, considering only j in [i-maxSkip, i-1].
-            std::vector<uint32_t> dp(n, 1);
-            std::vector<int32_t> prev(n, -1);
-            uint32_t bestEnd = 0;
-
-            for(uint32_t i = 1; i < n; i++) {
-                const Shasta2AnchorId anchorI = journey[i];
-                const uint32_t lookBack = uint32_t(std::min<uint64_t>(i, maxSkip));
-                for(uint32_t step = 1; step <= lookBack; step++) {
-                    const uint32_t j = i - step;
-                    if(dp[j] + 1 <= dp[i]) continue;  // cannot improve
-                    const Shasta2AnchorId anchorJ = journey[j];
-                    if(anchors.countCommon(anchorJ, anchorI) >= minCommon) {
-                        dp[i] = dp[j] + 1;
-                        prev[i] = int32_t(j);
-                    }
-                }
-                if(dp[i] > dp[bestEnd]) bestEnd = i;
-            }
-
-            // Reconstruct the best chain (positions), then map to anchor ids.
-            std::vector<uint32_t> chain;
-            for(int32_t idx = int32_t(bestEnd); idx >= 0; idx = prev[uint32_t(idx)]) {
-                chain.push_back(uint32_t(idx));
-            }
-            out.reserve(chain.size());
-            for(auto it = chain.rbegin(); it != chain.rend(); ++it) {
-                out.push_back(journey[*it]);
-            }
-            emitMirror();
-        }
-    }
-}
 
 
 
-void Shasta2Journeys::filterByAnchorChaining(
-    uint64_t minCommonForBackbone,
-    uint64_t maxSkipForBackbone,
-    uint64_t threadCount)
-{
-    performanceLog << timestamp << "Journey filtering (anchor chaining) begins." << endl;
 
-    // The Anchors pointer is retained only when this object was built via the
-    // initial-creation constructor. Filtering rewrites both the journeys and
-    // the per-anchor positionInJourney, so it needs mutable Anchors access.
-    DINARA_ASSERT(anchorsPointer);
-    DINARA_ASSERT(journeys.isOpen());
 
-    // With minCommonForBackbone == 0, filterThreadFunction's chainability test
-    // (countCommon(...) >= minCommon) is trivially true for any pair, for any
-    // input -- not just on the data we happened to test. Its DP always ends up
-    // picking the immediately preceding position (dp[i-1]+1 strictly beats any
-    // dp[j]+1 for j further back, since dp is non-decreasing), so the "longest
-    // chain" is always the full, untouched original journey. The whole call
-    // (per-read DP, a full drop+recreate+two-pass rebuild of the journeys
-    // VectorOfVectors, and an anchor-store-wide positionInJourney reconciliation
-    // pass) is therefore provably a no-op here, not just empirically one -- skip
-    // it rather than pay for a rewrite that changes nothing.
-    if(minCommonForBackbone == 0) {
-        cout << timestamp << "Journey filtering (anchor chaining): minCommonForBackbone=0, "
-                "filter is a no-op by construction -- skipping." << endl;
-        performanceLog << timestamp << "Journey filtering (anchor chaining) skipped "
-                "(minCommonForBackbone=0)." << endl;
-        return;
-    }
-
-    if(threadCount == 0) {
-        threadCount = std::thread::hardware_concurrency();
-    }
-
-    const uint64_t orientedReadCount = journeys.size();
-    const uint64_t orientedReadBatchCount = 1000;
-
-    // Pass A: compute the filtered chain for every oriented read in parallel.
-    filterMinCommon = minCommonForBackbone;
-    filterMaxSkip = maxSkipForBackbone;
-    filteredJourneys.assign(orientedReadCount, {});
-    setupLoadBalancing(orientedReadCount, orientedReadBatchCount);
-    runThreads(&Shasta2Journeys::filterThreadFunction, threadCount);
-
-    // Report how much the filter removed.
-    {
-        uint64_t anchorsBefore = 0, anchorsAfter = 0, collapsed = 0;
-        for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-            anchorsBefore += journeys[oidValue].size();
-            anchorsAfter += filteredJourneys[oidValue].size();
-            if(journeys[oidValue].size() >= 2 && filteredJourneys[oidValue].size() < 2) collapsed++;
-        }
-        cout << timestamp << "Journey filtering: anchors " << anchorsBefore
-            << " -> " << anchorsAfter << ", " << collapsed
-            << " journeys collapsed below 2 anchors (minCommon=" << minCommonForBackbone
-            << " maxSkip=" << maxSkipForBackbone << ")." << endl;
-    }
-
-    // Pass B: rebuild the journeys VectorOfVectors in place from
-    // filteredJourneys. The old content has already been captured into
-    // filteredJourneys (pass A), so the fixed-size mmap storage is dropped and
-    // recreated under the same name (two-pass count-then-store). The storage is
-    // not movable, so it is rebuilt in place rather than swapped.
-    journeys.remove();
-    journeys.createNew(largeDataName("Shasta2Journeys"), largeDataPageSize);
-    journeys.beginPass1(orientedReadCount);
-    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-        journeys.incrementCount(oidValue, filteredJourneys[oidValue].size());
-    }
-    journeys.beginPass2();
-    // Fill by direct index assignment, NOT store(): store() writes each vector
-    // back-to-front (it decrements the per-index count), which would reverse
-    // every journey and break the ordinal monotonicity window construction
-    // relies on. beginPass2 has already allocated the exact space.
-    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-        const auto journey = journeys[oidValue];
-        const std::vector<Shasta2AnchorId>& filtered = filteredJourneys[oidValue];
-        DINARA_ASSERT(journey.size() == filtered.size());
-        for(uint64_t i = 0; i < filtered.size(); i++) {
-            journey[i] = filtered[i];
-        }
-    }
-    // count was consumed by incrementCount but store() never ran, so skip the
-    // all-zero check (check=false); free the count vector (free=true).
-    journeys.endPass2(false, true);
-    filteredJourneys.clear();
-    filteredJourneys.shrink_to_fit();
-
-    // Pass C: reconcile positionInJourney for every anchor's marker infos. Reset
-    // all of this run's reads to invalid first, then set the surviving positions
-    // from the rebuilt journeys. Serial to keep the reset/set ordering simple;
-    // this is a single linear sweep over anchor marker infos plus the journeys.
-    Shasta2Anchors& anchors = *anchorsPointer;
-    for(uint64_t anchorId = 0; anchorId < anchors.anchorMarkerInfos.size(); anchorId++) {
-        for(Shasta2AnchorMarkerInfo& markerInfo : anchors.anchorMarkerInfos[anchorId]) {
-            markerInfo.positionInJourney = invalid<uint32_t>;
-        }
-    }
-    for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-        const OrientedReadId orientedReadId = OrientedReadId::fromValue(ReadId(oidValue));
-        const auto journey = journeys[oidValue];
-        for(uint64_t position = 0; position < journey.size(); position++) {
-            const Shasta2AnchorId anchorId = journey[position];
-            span<Shasta2AnchorMarkerInfo> markerInfos = anchors.anchorMarkerInfos[anchorId];
-            // Anchor members are stored sorted ascending by OrientedReadId (see
-            // Shasta2Anchors), so binary search instead of scanning the whole anchor.
-            const auto it = std::lower_bound(markerInfos.begin(), markerInfos.end(), orientedReadId,
-                [](const Shasta2AnchorMarkerInfo& info, OrientedReadId oid) {
-                    return info.orientedReadId < oid;
-                });
-            if(it != markerInfos.end() and it->orientedReadId == orientedReadId) {
-                it->positionInJourney = uint32_t(position);
-            }
-        }
-    }
-
-    performanceLog << timestamp << "Journey filtering (anchor chaining) ends." << endl;
-}
 
 
 
@@ -381,7 +188,7 @@ void Shasta2Journeys::filterByAnchorChaining(
 // anchor set, keyed by `position` instead of `ordinal` -- see the .hpp
 // comment for why. Strand 1 is never sorted independently: it is derived by
 // reversing strand 0's sorted list and flipping each anchor id, exactly like
-// filterThreadFunction's emitMirror, so the journey(R,1) ==
+// the RC mirror emitted below, so the journey(R,1) ==
 // reverse(journey(R,0)) invariant holds regardless of how same-position ties
 // on strand 0 happen to be broken (ascending anchorId here, arbitrary but
 // deterministic). Runs serially: the anchor count here is small (tens of
@@ -682,7 +489,7 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     }
 
     // Pass C: rebuild the journeys VectorOfVectors in place from
-    // filteredJourneys -- identical shape to filterByAnchorChaining's Pass B.
+    // filteredJourneys.
     journeys.remove();
     journeys.createNew(largeDataName("Shasta2Journeys"), largeDataPageSize);
     journeys.beginPass1(orientedReadCount);
@@ -703,8 +510,7 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     filteredJourneys.shrink_to_fit();
 
     // Pass D: reconcile positionInJourney for every anchor's marker infos
-    // (reset all to invalid, then set from the rebuilt journeys), identical
-    // shape to filterByAnchorChaining's Pass C.
+    // (reset all to invalid, then set from the rebuilt journeys).
     for(uint64_t anchorId = 0; anchorId < anchors.anchorMarkerInfos.size(); anchorId++) {
         for(Shasta2AnchorMarkerInfo& markerInfo : anchors.anchorMarkerInfos[anchorId]) {
             markerInfo.positionInJourney = invalid<uint32_t>;

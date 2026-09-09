@@ -1026,17 +1026,6 @@ void dinara::main::assemble(
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
 
-    // Filter each read's journey to its longest well-supported anchor chain
-    // (every consecutive pair sharing >= minCommonForBackbone reads, bounded
-    // look-back maxSkipForBackbone). Runs per read independently and rewrites
-    // the stored journeys + positionInJourney before any windowing decision, so
-    // every downstream stage sees the cleaned chains.
-    cout << timestamp << "Filtering journeys by anchor chaining..." << endl;
-    shasta2Journeys->filterByAnchorChaining(
-        assemblerOptions.assemblyOptions.mode3Options.minCommonForBackbone,
-        assemblerOptions.assemblyOptions.mode3Options.maxSkipForBackbone,
-        threadCount);
-
     // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
     // assembler.phaseOverlapsMSA(threadCount);
 
@@ -1057,9 +1046,8 @@ void dinara::main::assemble(
     // header for why detection only appends anchors and never touches a graph
     // directly.
     // The per-edge coverage threshold defaults to 0 (see
-    // Assembly.mode3.minJourneyEdgeCoverage). filterByAnchorChaining has
-    // already run (above), so the filtered journeys are the source of truth:
-    // every consecutive pair surviving in a filtered journey becomes an edge.
+    // Assembly.mode3.minJourneyEdgeCoverage), so every consecutive pair in a
+    // journey becomes an edge.
     const uint64_t minEdgeCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minJourneyEdgeCoverage;
     // Snapshot the anchor count before the detector appends anything,

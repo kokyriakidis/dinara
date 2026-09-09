@@ -1206,29 +1206,14 @@ void AssemblerOptions::addConfigurableOptions()
         "Edges whose anchor pair has fewer common reads are discarded. "
         "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
-        ("Assembly.mode3.minCommonForBackbone",
-        value<uint64_t>(&assemblyOptions.mode3Options.minCommonForBackbone)->
-        default_value(6),
-        "Minimum common reads between consecutive backbone anchors. "
-        "Backbone journeys are filtered to keep the longest subsequence "
-        "where every consecutive pair meets this threshold. "
-        "(Mode 3 assembly only).")
-
-        ("Assembly.mode3.maxSkipForBackbone",
-        value<uint64_t>(&assemblyOptions.mode3Options.maxSkipForBackbone)->
-        default_value(10),
-        "Maximum positions to look back when filtering backbone journeys "
-        "for well-supported consecutive anchor pairs. "
-        "(Mode 3 assembly only).")
-
         ("Assembly.mode3.minJourneyEdgeCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.minJourneyEdgeCoverage)->
         default_value(0),
         "Minimum per-edge coverage for the journey anchor graph: an edge "
         "between consecutive journey anchors is kept only if at least this "
         "many reads traverse the adjacency. Default 0 keeps every consecutive "
-        "pair (support is already validated by minCommonForBackbone). Values "
-        "> 0 can isolate well-supported anchors. (Mode 3 assembly only).")
+        "pair. Values > 0 can isolate well-supported anchors. "
+        "(Mode 3 assembly only).")
 
         ("Assembly.mode3.detectSnpSites",
         value<bool>(&assemblyOptions.mode3Options.detectSnpSites)->
@@ -1775,8 +1760,6 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.minAnchorCoverage = " << minAnchorCoverage << "\n";
     s << "mode3.maxAnchorCoverage = " << maxAnchorCoverage << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
-    s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
-    s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
     s << "mode3.detectSnpSites = " <<
         convertBoolToPythonString(detectSnpSites) << "\n";

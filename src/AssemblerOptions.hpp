@@ -521,20 +521,10 @@ public:
     // Edges whose anchor pair has fewer common reads are discarded.
     uint64_t minInterWindowEdgeCoverage;
 
-    // Minimum common reads between consecutive backbone anchors.
-    // Backbone journeys are filtered to keep the longest subsequence
-    // where every consecutive pair meets this threshold.
-    uint64_t minCommonForBackbone;
-
-    // Maximum number of positions to look back when filtering
-    // backbone journeys for well-supported consecutive pairs.
-    uint64_t maxSkipForBackbone;
-
     // Minimum per-edge coverage for the journey anchor graph: an edge between
     // consecutive journey anchors is kept only if at least this many reads
     // traverse the adjacency (posB == posA+1). Default 0 keeps every consecutive
-    // pair (recommended: filterByAnchorChaining already validates support via
-    // minCommonForBackbone). Values > 0 threshold adjacency coverage, which can
+    // pair. Values > 0 threshold adjacency coverage, which can
     // isolate well-supported anchors whose reads reach a neighbor through
     // intermediate anchors.
     uint64_t minJourneyEdgeCoverage;
