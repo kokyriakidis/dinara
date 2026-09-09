@@ -277,15 +277,36 @@ void Assembler::createMarkerGraphVertices(
     // as we will later remove "bad" vertices
     // (vertices with more than one marker on the same read).
     // This block is recursive and cannot be multithreaded.
+    // Number surviving sets in order of their SMALLEST MEMBER, not in order of
+    // the union-find representative.
+    //
+    // The representative is whichever member won the races in
+    // createMarkerGraphVerticesThreadFunction1, which unites in parallel over
+    // read-graph edges -- so it depends on thread interleaving. Numbering by it
+    // made vertex ids, and therefore every anchor id downstream, differ between
+    // runs on identical input: same counts, different contents per id. That
+    // defeats any byte-level comparison of two runs, and it silently changed
+    // which anchors won position ties, because anchor id is the last tie-break
+    // in the journey rebuild.
+    //
+    // A set's smallest member is a property of its MEMBERSHIP, so numbering by
+    // it is stable however the unions happened to interleave. Two passes and no
+    // extra memory: mark the survivors, then walk the markers in order and
+    // assign each set an id the first time one of its members is reached --
+    // which is, by construction, at its smallest member.
     performanceLog << timestamp << "Renumbering the disjoint sets." << endl;
-    MarkerGraph::VertexId newDisjointSetId = 0ULL;
+    const MarkerGraph::VertexId pendingVertexId = MarkerGraph::invalidVertexId - 1ULL;
     for(MarkerGraph::VertexId oldDisjointSetId=0;
         oldDisjointSetId<data.orientedMarkerCount; ++oldDisjointSetId) {
         auto& w = data.workArea[oldDisjointSetId];
         const MarkerGraph::VertexId markerCount = w;
-        if(markerCount<minCoverage || markerCount>maxCoverage) {
-            w = MarkerGraph::invalidVertexId;
-        } else {
+        w = (markerCount<minCoverage || markerCount>maxCoverage) ?
+            MarkerGraph::invalidVertexId : pendingVertexId;
+    }
+    MarkerGraph::VertexId newDisjointSetId = 0ULL;
+    for(uint64_t markerId=0; markerId<data.orientedMarkerCount; ++markerId) {
+        auto& w = data.workArea[data.disjointSetTable[markerId]];
+        if(w == pendingVertexId) {
             w = newDisjointSetId;
             ++newDisjointSetId;
         }
