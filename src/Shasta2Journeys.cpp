@@ -341,7 +341,10 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     vector<uint64_t> floorGroupSize, floorGroupHets;
     vector<uint64_t> overlapShared, overlapPrimary;
 
-    filteredJourneys.assign(orientedReadCount, {});
+    // Per-oriented-read journey being rebuilt. A local, not a member: the only
+    // reason it used to be a member was that filterByAnchorChaining shared it
+    // with its worker thread function, and both are gone.
+    std::vector<std::vector<Shasta2AnchorId>> rebuiltJourneys(orientedReadCount);
     for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
         auto& v = strand0[readIdValue];
         std::sort(v.begin(), v.end());
@@ -414,8 +417,8 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
 
         for(const auto& [pos, aid] : v) { static_cast<void>(pos); if(isHetAnchor(aid)) hetOccurrences++; }
 
-        std::vector<Shasta2AnchorId>& out = filteredJourneys[2 * readIdValue];
-        std::vector<Shasta2AnchorId>& outRc = filteredJourneys[2 * readIdValue + 1];
+        std::vector<Shasta2AnchorId>& out = rebuiltJourneys[2 * readIdValue];
+        std::vector<Shasta2AnchorId>& outRc = rebuiltJourneys[2 * readIdValue + 1];
         out.reserve(v.size());
         for(const auto& [position, anchorId] : v) {
             static_cast<void>(position);
@@ -488,26 +491,26 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
              << endl;
     }
 
-    // Pass C: rebuild the journeys VectorOfVectors in place from
-    // filteredJourneys.
+    // Pass C: rebuild the journeys VectorOfVectors in place.
     journeys.remove();
     journeys.createNew(largeDataName("Shasta2Journeys"), largeDataPageSize);
     journeys.beginPass1(orientedReadCount);
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
-        journeys.incrementCount(oidValue, filteredJourneys[oidValue].size());
+        journeys.incrementCount(oidValue, rebuiltJourneys[oidValue].size());
     }
     journeys.beginPass2();
     for(uint64_t oidValue = 0; oidValue < orientedReadCount; oidValue++) {
         const auto journey = journeys[oidValue];
-        const std::vector<Shasta2AnchorId>& filtered = filteredJourneys[oidValue];
-        DINARA_ASSERT(journey.size() == filtered.size());
-        for(uint64_t i = 0; i < filtered.size(); i++) {
-            journey[i] = filtered[i];
+        const std::vector<Shasta2AnchorId>& rebuilt = rebuiltJourneys[oidValue];
+        DINARA_ASSERT(journey.size() == rebuilt.size());
+        for(uint64_t i = 0; i < rebuilt.size(); i++) {
+            journey[i] = rebuilt[i];
         }
     }
     journeys.endPass2(false, true);
-    filteredJourneys.clear();
-    filteredJourneys.shrink_to_fit();
+    // Release before Pass D, which walks every anchor: this holds one entry per
+    // journey anchor and is dead from here on.
+    std::vector<std::vector<Shasta2AnchorId>>().swap(rebuiltJourneys);
 
     // Pass D: reconcile positionInJourney for every anchor's marker infos
     // (reset all to invalid, then set from the rebuilt journeys).

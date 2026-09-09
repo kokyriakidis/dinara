@@ -124,9 +124,5 @@ private:
     // Temporary storage of journeys with ordinals.
     MemoryMapped::VectorOfVectors<pair<uint64_t, uint32_t>, uint64_t> journeysWithOrdinals;
 
-    // Scratch for rebuildAfterNewAnchors. filteredJourneys[oidValue] holds the
-    // anchor ids for that oriented read; each entry is written by exactly one
-    // thread, so no locking is needed.
-    std::vector<std::vector<Shasta2AnchorId>> filteredJourneys;
 
 };
