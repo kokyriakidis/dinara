@@ -967,6 +967,19 @@ void dinara::main::assemble(
     // start/end for both reads. Vertices failing this check were created by
     // indirect transitive paths (A→B→C) where A and C have no direct
     // alignment support at that position — typically false merges in repeats.
+    //
+    // The filter drops the WHOLE vertex (and its reverse complement), not just
+    // the reads implicated in the inconsistent pair, and that is deliberate.
+    // Inconsistency is a property of a PAIR: when A and C disagree, nothing in
+    // the pair says which of the two is the intruder. More importantly, a
+    // flagged vertex is usually not an innocent majority plus one stray read --
+    // if the collapse fused two copies of a repeat it is some of each copy, with
+    // no correct side to keep. Trimming there would not recover a good anchor,
+    // it would manufacture a confidently wrong one, and everything downstream
+    // treats an anchor as trustworthy. Dropping the vertex forfeits an anchor;
+    // trimming it would forfeit the guarantee. Note also that a trim would have
+    // to be mirrored exactly onto the RC vertex, since
+    // findMarkerGraphReverseComplementVertices below requires equal membership.
     assembler.filterMarkerGraphVerticesByChainConsistency(threadCount);
 
     // Pair each marker graph vertex with its reverse complement vertex.
