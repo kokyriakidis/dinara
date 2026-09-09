@@ -7,9 +7,6 @@
 #include "Assembler.hpp"
 #include "AssemblerOptions.hpp"
 #include "buildId.hpp"
-#if DINARA_ENABLE_VARIANT_CLUSTERING
-#include "ClusterGraph.hpp"
-#endif
 #include "filesystem.hpp"
 #include "mode3-Anchor.hpp"
 

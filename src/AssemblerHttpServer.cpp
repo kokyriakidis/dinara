@@ -260,11 +260,6 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorGraph);
-#if DINARA_ENABLE_VARIANT_CLUSTERING
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreClusterGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantCluster);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreVariantClusters);
-#endif
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Anchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorPair);
@@ -589,11 +584,6 @@ void Assembler::writeNavigation(ostream& html) const
             {"Local read graph", "exploreShasta2LocalReadGraph"},
             });
 
-#if DINARA_ENABLE_VARIANT_CLUSTERING
-        writeNavigation(html, "Cluster graph", {
-            {"Explore cluster graph", "exploreClusterGraph"},
-            });
-#endif
 
         writeNavigation(html, "Assembly", {
             {"Local assembly", "exploreLocalAssembly"},
@@ -938,15 +928,6 @@ void Assembler::accessAllSoft()
         }
     }
 
-#if DINARA_ENABLE_VARIANT_CLUSTERING
-    // Variant clustering data (for ClusterGraph).
-    try {
-        accessVariantClusteringData();
-    } catch(const exception& e) {
-        cout << "Variant clustering data is not accessible." << endl;
-        // Don't set allDataAreAvailable = false since this is optional
-    }
-#endif
 
 
     if(!allDataAreAvailable) {

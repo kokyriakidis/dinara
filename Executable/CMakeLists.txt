@@ -37,17 +37,12 @@ add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 
 # Source files
 file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../srcMain/*.cpp ../src/ksw2/ksw2_extd2_sse.c)
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerVariantClustering\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/ClusterGraph\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerClusterGraph\\.cpp$")
 # Theseus disabled: these files use fork-only theseus APIs (align_from,
 # multi-segment constructor) that upstream theseus-lib does not provide.
 # Excluded from the build until theseus usage is reworked. Callers are stubbed.
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
 list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerDirectOverlapMSA\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusMarkerGraphMSA\\.cpp$")
 # AssemblerMultiSegmentMSA.cpp excluded: the per-window multi-segment MSA test
 # has been reimplemented on abPOA (AssemblerAbpoaMultiSegmentMSA.cpp), which is
 # faster and avoids the theseus fork's terminal-condition / quadratic-blowup

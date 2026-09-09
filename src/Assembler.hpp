@@ -60,7 +60,6 @@ namespace dinara {
     class Align6Options;
     class Align6;
     class AssemblerOptions;
-    class ClusterGraph;
     class ConsensusCaller;
     class Histogram2;
     class InducedAlignment;
@@ -2658,21 +2657,10 @@ public:
     // AnchorId is uint64_t (shasta2::AnchorId).
     std::vector<std::vector<uint64_t>> shasta2LinearJourneys;
 
-    void computeTheseusMarkerGraphMSAPrototype(
-        uint64_t maxAnchorPairs,
-        uint64_t maxReadsPerPair,
-        uint64_t threadCount);
     void computeTheseusTargetBackboneMSAPrototype(
         uint64_t maxReads,
         uint64_t threadCount);
 
-    // Build a single multi-segment Theseus MSA for one focal read using
-    // all its direct overlaps from alignmentTable. Evaluates feasibility
-    // of per-read MSA for het-site detection.
-    void testDirectOverlapMSA(
-        const shared_ptr<Shasta2Anchors>& shasta2Anchors,
-        const shared_ptr<Shasta2Journeys>& shasta2Journeys,
-        ReadId focalReadId = ReadId(0));
 
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
 
