@@ -476,13 +476,25 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     // Comparing against zero instead would count every anchor with no strand-0
     // occurrence at all (RC anchors, which are mirrored rather than listed).
     const vector<uint64_t> initialOccurrences = remainingOccurrences;
+    // Members left on each CANONICAL anchor once the drops recorded so far are
+    // applied. A tie drop removes one member from the canonical anchor (and its
+    // RC twin), so this is what the export will actually write.
+    vector<uint64_t> remainingMembers(anchorCount, 0);
+    for(uint64_t a = 0; a < anchorCount; a++) remainingMembers[a] = anchors[a].size();
     auto isHetAnchor = [&](Shasta2AnchorId id) -> bool {
         return hetFirst != invalid<Shasta2AnchorId> && id >= hetFirst;
     };
     auto keepAOverB = [&](Shasta2AnchorId a, Shasta2AnchorId b) -> bool {
-        const bool aLast = (remainingOccurrences[a] <= 1);
-        const bool bLast = (remainingOccurrences[b] <= 1);
-        if(aLast != bLast) return aLast;          // never evict an anchor entirely
+        // An anchor that cannot spare a member wins outright, ahead of any
+        // class preference: losing here would take it below the coverage floor
+        // it was selected under. Everything else is free to lose one.
+        const uint64_t canonA = a & ~Shasta2AnchorId(1);
+        const uint64_t canonB = b & ~Shasta2AnchorId(1);
+        const bool aLast = (remainingOccurrences[a] <= 1) ||
+                           (remainingMembers[canonA] <= minAnchorCoverage);
+        const bool bLast = (remainingOccurrences[b] <= 1) ||
+                           (remainingMembers[canonB] <= minAnchorCoverage);
+        if(aLast != bLast) return aLast;
         const bool aHet = isHetAnchor(a), bHet = isHetAnchor(b);
         if(aHet != bHet) return preferHetOnTie ? aHet : !aHet;
         const uint64_t ca = anchors[a].size(), cb = anchors[b].size();
@@ -540,8 +552,9 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
                         // The unit the export must omit. Canonical (even) id,
                         // because a drop removes both the direct and the
                         // RC-induced occurrence for this read.
-                        journeyTieDrops.push_back(
-                            {v[t].second & ~Shasta2AnchorId(1), ReadId(readIdValue)});
+                        const Shasta2AnchorId canon = v[t].second & ~Shasta2AnchorId(1);
+                        journeyTieDrops.push_back({canon, ReadId(readIdValue)});
+                        if(remainingMembers[canon] > 0) remainingMembers[canon]--;
                     }
                     deduped.push_back({v[i].first, keeper});
                 }

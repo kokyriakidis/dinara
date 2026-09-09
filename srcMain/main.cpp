@@ -2873,6 +2873,8 @@ void dinara::main::assemble(
              << " new het anchors..." << endl;
         shasta2Journeys->journeyTiePreferHet =
             assemblerOptions.assemblyOptions.mode3Options.journeyTiePreferHet;
+        shasta2Journeys->minAnchorCoverage =
+            assemblerOptions.assemblyOptions.mode3Options.minAnchorCoverage;
         shasta2Journeys->rebuildAfterNewAnchors(newAnchorsBegin, threadCount);
     }
     cout << timestamp << "Creating Shasta2AnchorGraph from journeys "

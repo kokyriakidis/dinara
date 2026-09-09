@@ -102,6 +102,12 @@ public:
     // rebuild actually did.
     vector< pair<Shasta2AnchorId, ReadId> > journeyTieDrops;
 
+    // No exported anchor may fall below this many members. Tie resolution
+    // removes members, so without the bound it can thin an anchor past the
+    // coverage floor the anchor was selected under -- and an anchor exported
+    // with one read is a spurious branch, not a weak one.
+    uint64_t minAnchorCoverage = 2;
+
     // Return the Journey for an oriented read.
     Shasta2Journey operator[](OrientedReadId orientedReadId) const
     {
