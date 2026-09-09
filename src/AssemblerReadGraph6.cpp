@@ -12,12 +12,11 @@ using namespace dinara;
 
 void Assembler::createReadGraphFromEcParityCisOverlaps()
 {
-    createReadGraphFromEcParityCisOverlaps(std::thread::hardware_concurrency(), /*rebuildDirectedReadGraph*/ false);
+    createReadGraphFromEcParityCisOverlaps(std::thread::hardware_concurrency());
 }
 
 void Assembler::createReadGraphFromEcParityCisOverlaps(
-    uint64_t /*threadCount*/,
-    bool rebuildDirectedReadGraph)
+    uint64_t /*threadCount*/)
 {
     cout << timestamp << "createReadGraphFromEcParityCisOverlaps begins." << endl;
     checkAlignmentDataAreOpen();
@@ -53,7 +52,7 @@ void Assembler::createReadGraphFromEcParityCisOverlaps(
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
 
-    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment));
 
     cout << timestamp << "createReadGraphFromEcParityCisOverlaps completed." << endl;
 }
@@ -61,13 +60,11 @@ void Assembler::createReadGraphFromEcParityCisOverlaps(
 void Assembler::createReadGraphFromPhasingCisOverlaps()
 {
     createReadGraphFromPhasingCisOverlaps(
-        std::thread::hardware_concurrency(),
-        /*rebuildDirectedReadGraph*/ false);
+        std::thread::hardware_concurrency());
 }
 
 void Assembler::createReadGraphFromPhasingCisOverlaps(
-    uint64_t /*threadCount*/,
-    bool rebuildDirectedReadGraph)
+    uint64_t /*threadCount*/)
 {
     cout << timestamp << "createReadGraphFromPhasingCisOverlaps begins." << endl;
     checkAlignmentDataAreOpen();
@@ -120,7 +117,7 @@ void Assembler::createReadGraphFromPhasingCisOverlaps(
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
 
-    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment));
 
     cout << timestamp << "createReadGraphFromPhasingCisOverlaps completed." << endl;
 }
@@ -128,13 +125,11 @@ void Assembler::createReadGraphFromPhasingCisOverlaps(
 void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites()
 {
     createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
-        std::thread::hardware_concurrency(),
-        /*rebuildDirectedReadGraph*/ false);
+        std::thread::hardware_concurrency());
 }
 
 void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
-    uint64_t /*threadCount*/,
-    bool rebuildDirectedReadGraph)
+    uint64_t /*threadCount*/)
 {
     cout << timestamp << "createReadGraphFromEcParityCisOverlapsCoveringInformativeSites begins." << endl;
     checkAlignmentDataAreOpen();
@@ -179,7 +174,7 @@ void Assembler::createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
 
-    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment), rebuildDirectedReadGraph);
+    rebuildReadGraphUsingSelectedAlignments(std::move(keepAlignment));
 
     cout << timestamp << "createReadGraphFromEcParityCisOverlapsCoveringInformativeSites completed." << endl;
 }
@@ -231,6 +226,6 @@ void Assembler::createReadGraphFromFilteredAlignments()
     for (uint64_t i = 0; i < alignmentCount; ++i) {
         keepAlignment[i] = (keepAlignmentByte[i] != 0);
     }
-    rebuildReadGraphUsingSelectedAlignments(keepAlignment, /*rebuildDirectedReadGraph*/true);
+    rebuildReadGraphUsingSelectedAlignments(keepAlignment);
     cout << timestamp << "createReadGraphFromFilteredAlignments completed." << endl;
 }

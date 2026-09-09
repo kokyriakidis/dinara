@@ -235,14 +235,12 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(alignSequencesInBaseRepresentation);
     DINARA_ADD_TO_FUNCTION_TABLE(assessAlignments);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedReadGraph);
 
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraph1);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphVertex);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphEdge);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphEdgePair);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerCoverage);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerGraphInducedAlignment);
     DINARA_ADD_TO_FUNCTION_TABLE(followReadInMarkerGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerConnectivity);
 
@@ -493,19 +491,9 @@ void Assembler::writeNavigation(ostream& html) const
     }
 
     if(readGraphIsAvailable) {
-        bool directedReadGraphIsAvailable = false;
-        try {
-            checkDirectedReadGraphIsOpen();
-            directedReadGraphIsAvailable = true;
-        } catch(...) {
-        }
-
         vector<pair<string, string>> items = {
             {"Read graph", "exploreReadGraph"},
         };
-        if(directedReadGraphIsAvailable) {
-            items.push_back({"Directed read graph", "exploreDirectedReadGraph"});
-        }
         writeNavigation(html, "Read graph", items);
     }
 
@@ -516,7 +504,6 @@ void Assembler::writeNavigation(ostream& html) const
             {"Marker graph vertices", "exploreMarkerGraphVertex"},
             {"Marker graph edges", "exploreMarkerGraphEdge"},
             {"Marker coverage", "exploreMarkerCoverage"},
-            {"Induced alignments", "exploreMarkerGraphInducedAlignment"},
             {"Follow a read in the marker graph", "followReadInMarkerGraph"},
             {"Marker connectivity", "exploreMarkerConnectivity"},
             });
@@ -813,13 +800,6 @@ void Assembler::accessAllSoft()
     } catch(const exception& e) {
         cout << "The read graph is not accessible." << endl;
         allDataAreAvailable = false;
-    }
-    // Directed read graph is optional.
-    try {
-        accessDirectedReadGraph();
-    } catch(const exception& e) {
-        cout << "The directed read graph is not accessible." << endl;
-        // Don't set allDataAreAvailable = false since this is optional.
     }
 
 

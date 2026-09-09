@@ -34,19 +34,6 @@ void Assembler::exploreReadGraph(
 
 
 
-void Assembler::exploreDirectedReadGraph(
-    const vector<string>& request,
-    ostream& html)
-{
-    if(readGraph.edges.isOpen && readGraph.connectivity.isOpen() &&
-        directedReadGraph.arcs.isOpen && directedReadGraph.outgoing.isOpen() && directedReadGraph.incoming.isOpen()) {
-        vector<string> request2 = request;
-        request2.push_back("useDirectedReadGraph=1");
-        exploreUndirectedReadGraph(request2, html);
-    } else {
-        html << "The directed read graph is not available." << endl;
-    }
-}
 
 
 bool Assembler::parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html){
@@ -129,15 +116,13 @@ void Assembler::addScaleSvgButtons(ostream& html, uint64_t sizePixels)
 
 
 
+
 void Assembler::exploreUndirectedReadGraph(
     const vector<string>& request,
     ostream& html) {
 
     using vertex_descriptor = LocalReadGraph::vertex_descriptor;
     using edge_descriptor = LocalReadGraph::edge_descriptor;
-
-    string useDirectedReadGraphString;
-    const bool useDirectedReadGraph = getParameterValue(request, "useDirectedReadGraph", useDirectedReadGraphString);
 
     // Get the parameters.
     vector<OrientedReadId> readIds;
@@ -186,15 +171,11 @@ void Assembler::exploreUndirectedReadGraph(
 
     // Write the form.
     string readGraphHeading;
-    if(useDirectedReadGraph) {
-        readGraphHeading = "<h3>Display a local subgraph of the directed read graph</h3>";
+    if (httpServerData.docsDirectory.empty()) {
+        readGraphHeading = "<h3>Display a local subgraph of the global alignment graph</h3>";
     } else {
-        if (httpServerData.docsDirectory.empty()) {
-            readGraphHeading = "<h3>Display a local subgraph of the global alignment graph</h3>";
-        } else {
-            readGraphHeading =
-                "<h3>Display a local subgraph of the <a href='docs/ComputationalMethods.html#ReadGraph'>read graph</a></h3>";
-        }
+        readGraphHeading =
+            "<h3>Display a local subgraph of the <a href='docs/ComputationalMethods.html#ReadGraph'>read graph</a></h3>";
     }
     html << readGraphHeading <<
          "<form>"
@@ -332,11 +313,7 @@ void Assembler::exploreUndirectedReadGraph(
 
     // Create the local read graph.
     LocalReadGraph graph;
-    const bool created = useDirectedReadGraph ?
-        createLocalDirectedReadGraph(readIds,
-            maxDistance,
-            allowChimericReads, allowCrossStrandEdges, allowInconsistentAlignmentEdges,
-            timeout, graph) :
+    const bool created =
         createLocalReadGraph(readIds,
             maxDistance,
             allowChimericReads, allowCrossStrandEdges, allowInconsistentAlignmentEdges,

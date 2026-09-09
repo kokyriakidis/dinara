@@ -60,7 +60,6 @@ namespace dinara {
     class AssemblerOptions;
     class ConsensusCaller;
     class Histogram2;
-    class InducedAlignment;
     class KmerChecker;
     class KmerCounter;
     class KmersOptions;
@@ -1432,7 +1431,6 @@ private:
 	public:
 	    ReadGraph readGraph;
 	    ReadGraph readGraphAllAlignments;
-	    DirectedReadGraph directedReadGraph;
     void createReadGraph(
         uint32_t maxAlignmentCount,
         bool preferAlignedFraction);
@@ -1456,8 +1454,6 @@ private:
     void accessReadGraph();
     void accessReadGraphReadWrite();
     void checkReadGraphIsOpen() const;
-    void accessDirectedReadGraph();
-    void checkDirectedReadGraphIsOpen() const;
     void removeReadGraphBridges(uint64_t maxDistance);
     void analyzeReadGraph();
     void readGraphClustering();
@@ -1493,19 +1489,19 @@ private:
     // performHifiasmECParity. This ignores all non-phasing deletion reasons.
     // An overlap is kept iff neither read marked it with DeleteReasonPhase.
     void createReadGraphFromEcParityCisOverlaps();
-    void createReadGraphFromEcParityCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
+    void createReadGraphFromEcParityCisOverlaps(uint64_t threadCount);
 
     // Read graph from phaseOverlaps labels (hifiasmEcMatchState).
     // Keeps overlaps where neither side is TRANS (state 2).
     // Unlabeled overlaps (state 0) are kept.
     void createReadGraphFromPhasingCisOverlaps();
-    void createReadGraphFromPhasingCisOverlaps(uint64_t threadCount, bool rebuildDirectedReadGraph);
+    void createReadGraphFromPhasingCisOverlaps(uint64_t threadCount);
 
     // Like createReadGraphFromEcParityCisOverlaps, but only keep cis overlaps that
     // cover at least one informative site (as recorded by AlignmentData::coversHetSite()
     // / informativeHetSiteCount{0,1} during performHifiasmECParity).
     void createReadGraphFromEcParityCisOverlapsCoveringInformativeSites();
-    void createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(uint64_t threadCount, bool rebuildDirectedReadGraph);
+    void createReadGraphFromEcParityCisOverlapsCoveringInformativeSites(uint64_t threadCount);
     
     // Canonical per-Read overlap storage  // Convert alignmentData to OverlapIndex
     
@@ -1516,7 +1512,7 @@ private:
 
 	    // Rebuild read graph (and optionally directed read graph) from a provided keep vector.
 	    // This removes the existing read graph data structures before recreating them.
-	    void rebuildReadGraphUsingSelectedAlignments(vector<bool> keepAlignment, bool rebuildDirectedReadGraph = false);
+	    void rebuildReadGraphUsingSelectedAlignments(vector<bool> keepAlignment);
 
     // Triangle and least square analysis of the read graph
     // to flag inconsistent alignments.
@@ -1587,7 +1583,6 @@ public:
 	    // Create the ReadGraph given a bool vector that specifies which
 	    // alignments should be used in the read graph.
 	    void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
-	    void createDirectedReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
     void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
 
 
@@ -1628,28 +1623,6 @@ private:
 	        double timeout,         // Or 0 for no timeout.
 	        LocalReadGraph&);
 
-        // Create a local subgraph of the directed read graph,
-        // starting at a given vertex and extending out to a specified
-        // distance (number of arcs).
-        // This is rendered as a LocalReadGraph and uses readGraph edge ids
-        // to preserve the same visualization/analysis pipeline as exploreReadGraph.
-        bool createLocalDirectedReadGraph(
-                OrientedReadId start,
-                uint32_t maxDistance,
-                bool allowChimericReads,
-                bool allowCrossStrandEdges,
-                bool allowInconsistentAlignmentEdges,
-                double timeout,
-                LocalReadGraph&);
-
-        bool createLocalDirectedReadGraph(
-            const vector<OrientedReadId>& starts,
-            uint32_t maxDistance,
-            bool allowChimericReads,
-            bool allowCrossStrandEdges,
-            bool allowInconsistentAlignmentEdges,
-            double timeout,
-            LocalReadGraph&);
 
 
 
@@ -2137,28 +2110,6 @@ private:
         MarkerConnectivityGraph&,
         MarkerConnectivityGraphVertexMap&) const;
 
-    // Compute an alignment between two oriented reads
-    // induced by the marker graph. See InducedAlignment.hpp for more
-    // information.
-    void computeInducedAlignment(
-        OrientedReadId,
-        OrientedReadId,
-        InducedAlignment&
-    );
-
-    // Compute induced alignments between an oriented read orientedReadId0
-    // and the oriented reads stored sorted in orientedReadIds1.
-    void computeInducedAlignments(
-        OrientedReadId orientedReadId0,
-        const vector<OrientedReadId>& orientedReadIds1,
-        vector<InducedAlignment>& inducedAlignments);
-
-    // Fill in compressed ordinals of an InducedAlignment.
-    void fillCompressedOrdinals(
-        OrientedReadId,
-        OrientedReadId,
-        InducedAlignment&);
-
     // Find the markers aligned to a given marker.
     // This is slow and cannot be used during assembly.
     void findAlignedMarkers(
@@ -2382,7 +2333,6 @@ public:
     void exploreAlignmentGraph(const vector<string>&, ostream&);
     void exploreReadGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);
-    void exploreDirectedReadGraph(const vector<string>&, ostream&);
     static bool parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html);
     static void addScaleSvgButtons(ostream&, uint64_t sizePixels);
     class HttpServerData {
@@ -2430,7 +2380,6 @@ public:
     void exploreMarkerGraphEdge(const vector<string>&, ostream&);
     void exploreMarkerGraphEdgePair(const vector<string>&, ostream&);
     void exploreMarkerCoverage(const vector<string>&, ostream&);
-    void exploreMarkerGraphInducedAlignment(const vector<string>&, ostream&);
     void followReadInMarkerGraph(const vector<string>&, ostream&);
     void exploreMarkerConnectivity(const vector<string>&, ostream&);
     void renderEditableAlignmentConfig(
