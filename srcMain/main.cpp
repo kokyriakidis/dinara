@@ -2795,6 +2795,16 @@ void dinara::main::assemble(
             // (read, stored position); if one anchor accounts for most of the
             // arm, the arm is redundant with it.
             {
+                // The share of an arm one existing anchor must account for
+                // before the arm counts as a clone of it. Placed in the empty
+                // gap of the measured distribution rather than picked: arms
+                // divide sharply into 404 with no overlap at all plus one at
+                // 10%, then nothing until a cluster at 70/80/90/100%. Anywhere
+                // in 0.2-0.7 selects exactly that cluster, so the precise value
+                // does not matter -- which is the property to want from a
+                // threshold. An earlier 0.8 sat INSIDE the cluster and missed
+                // the three arms at 70%.
+                constexpr double redundantArmFraction = 0.5;
                 std::unordered_map<uint64_t, Shasta2AnchorId> occupant;
                 const uint64_t existing = shasta2Anchors->size();
                 for(Shasta2AnchorId id = 0; id < existing; id++) {
@@ -2819,13 +2829,40 @@ void dinara::main::assemble(
                         uint64_t best = 0;
                         for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
                         const double frac = double(best) / double(members.size());
-                        if(frac >= 0.8) ++armsRedundant;
+                        if(frac >= redundantArmFraction) ++armsRedundant;
                         else if(best > 0) ++armsPartial;
                         else ++armsClear;
                     }
                 }
+                {
+                    // Is 0.8 a real boundary or an arbitrary cut on a slope?
+                    // Bucket every arm by the share one existing anchor accounts
+                    // for; a clean split means the threshold's exact value does
+                    // not matter.
+                    std::array<uint64_t, 11> bucket{};
+                    for(const Assembler::CigarSnpSite& site: snpSites) {
+                        for(const auto& members: site.alleles) {
+                            if(members.empty()) continue;
+                            std::unordered_map<Shasta2AnchorId, uint64_t> hits;
+                            for(const auto& m: members) {
+                                const auto it = occupant.find(
+                                    (uint64_t(m.first.getValue()) << 32) |
+                                    uint64_t(m.second + hetKHalf2));
+                                if(it != occupant.end()) hits[it->second]++;
+                            }
+                            uint64_t best = 0;
+                            for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
+                            bucket[std::min<size_t>(10,
+                                size_t(10.0 * double(best) / double(members.size())))]++;
+                        }
+                    }
+                    cout << timestamp << "  arm overlap with the single best existing anchor:";
+                    for(size_t i = 0; i < bucket.size(); i++)
+                        if(bucket[i]) cout << " " << (i * 10) << "%:" << bucket[i];
+                    cout << endl;
+                }
                 cout << timestamp << "CIGAR het arms vs existing anchors: "
-                     << armsRedundant << " arm(s) are >=80% accounted for by ONE "
+                     << armsRedundant << " arm(s) are mostly accounted for by ONE "
                         "existing anchor (redundant), " << armsPartial
                      << " partially overlap one, " << armsClear
                      << " touch no occupied position." << endl;
@@ -2859,7 +2896,7 @@ void dinara::main::assemble(
                         }
                         uint64_t best = 0;
                         for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
-                        if(double(best) / double(members.size()) >= 0.8) {
+                        if(double(best) / double(members.size()) >= redundantArmFraction) {
                             members.clear();
                             ++armsDropped;
                         }
