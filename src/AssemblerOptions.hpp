@@ -611,6 +611,21 @@ public:
     // an existing graph. Off by default -- detection alone changes nothing.
     bool createSnpSiteAnchors = false;
 
+    // EXPERIMENTAL: before building anchors, re-check each surviving site with
+    // an MSA over the interval between two anchors every member shares. The
+    // pairwise CIGARs can agree that two bases differ while disagreeing about
+    // whether they are the same locus; an MSA answers that in one frame. Off by
+    // default -- it can only remove sites, so it trades recall for precision
+    // and the trade has to be measured before it is trusted.
+    bool msaVerifySnpSites = false;
+    // How far to look on each side of the SNP for a bounding anchor shared by
+    // every member. Larger gives the MSA more context and a better chance of
+    // finding a shared pair, at the cost of a longer alignment.
+    uint64_t msaVerifyFlankBases = 150;
+    // Fraction of placed members whose SNP base must land in the same MSA
+    // column for the site to be kept.
+    double msaVerifyMinAgreement = 0.9;
+
 
     // Assumed per-read sequencing error rate used by the per-edge MSA het
     // detector's allele significance test: a one-sided binomial test asks

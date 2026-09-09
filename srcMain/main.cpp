@@ -6,6 +6,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "HetSitePreparation.hpp"
+#include "HetSiteMsaVerification.hpp"
 #include "platformDependent.hpp"
 #include "AssemblerOptions.hpp"
 #include "filesystem.hpp"
@@ -1098,6 +1099,38 @@ void dinara::main::assemble(
                      << duplicateSites << " duplicate detection(s) of a locus "
                         "already claimed by a better-supported site, leaving "
                      << snpSites.size() << "." << endl;
+
+                // EXPERIMENTAL MSA verification, before anything is built
+                // from these sites. See HetSiteMsaVerification.hpp: the CIGAR
+                // pass proves two bases DIFFER, this asks whether they are the
+                // same locus.
+                if(assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites) {
+                    vector<uint64_t> reasons;
+                    const uint64_t before = snpSites.size();
+                    const uint64_t rejected = msaVerifyHetSites(
+                        snpSites,
+                        assembler.getReads(),
+                        *shasta2Anchors,
+                        uint32_t(assemblerOptions.assemblyOptions.mode3Options.msaVerifyFlankBases),
+                        assemblerOptions.assemblyOptions.mode3Options.msaVerifyMinAgreement,
+                        threadCount,
+                        &reasons);
+                    cout << timestamp << "MSA verification (EXPERIMENTAL): "
+                         << (before - rejected) << " of " << before
+                         << " sites confirmed, " << rejected << " rejected."
+                         << endl;
+                    static const char* const reasonNames[] = {
+                        "confirmed", "no shared bracketing anchors",
+                        "too few members after extraction", "MSA failed",
+                        "members landed in different columns",
+                        "agreed column not biallelic"};
+                    for(uint64_t i = 0; i < reasons.size(); i++) {
+                        if(reasons[i] != 0) {
+                            cout << "    " << reasonNames[i] << ": "
+                                 << reasons[i] << endl;
+                        }
+                    }
+                }
 
                 const auto occupied = buildOccupiedPositions(*shasta2Anchors);
                 const uint64_t alreadyAnchored = dropAlreadyAnchoredArmMembers(

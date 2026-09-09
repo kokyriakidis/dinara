@@ -86,6 +86,7 @@ add_executable(test_integration
     test_msa_het_kernel.cpp
     test_cigar_snp_sites.cpp
     test_het_site_preparation.cpp
+    test_het_site_msa_verification.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )

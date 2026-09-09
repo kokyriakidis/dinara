@@ -1310,6 +1310,31 @@ void AssemblerOptions::addConfigurableOptions()
         "per allele arm), then rebuild journeys and the anchor graph from "
         "scratch. Requires Assembly.mode3.detectSnpSites.")
 
+        ("Assembly.mode3.msaVerifySnpSites",
+        value<bool>(&assemblyOptions.mode3Options.msaVerifySnpSites)->
+        default_value(false),
+        "EXPERIMENTAL. Re-check each surviving het site with an MSA over the "
+        "interval between two anchors every member read shares, and drop sites "
+        "whose members' SNP bases do not land in the same MSA column. The "
+        "pairwise CIGARs verify that two bases DIFFER, not that they are the "
+        "same locus; this checks the latter. Requires "
+        "Assembly.mode3.detectSnpSites.")
+
+        ("Assembly.mode3.msaVerifyFlankBases",
+        value<uint64_t>(&assemblyOptions.mode3Options.msaVerifyFlankBases)->
+        default_value(150),
+        "How far on each side of a het site to look for a bounding anchor "
+        "shared by every member read. Larger gives the MSA more context and a "
+        "better chance of finding a shared pair, at the cost of a longer "
+        "alignment. Used only with Assembly.mode3.msaVerifySnpSites.")
+
+        ("Assembly.mode3.msaVerifyMinAgreement",
+        value<double>(&assemblyOptions.mode3Options.msaVerifyMinAgreement)->
+        default_value(0.9, "0.9"),
+        "Fraction of placed member reads whose SNP base must land in the same "
+        "MSA column for a het site to survive verification. Used only with "
+        "Assembly.mode3.msaVerifySnpSites.")
+
         ("Assembly.mode3.hetErrorRate",
         value<double>(&assemblyOptions.mode3Options.hetErrorRate)->
         default_value(0.025, "0.025"),
@@ -1778,6 +1803,10 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
         convertBoolToPythonString(createSnpSiteAnchors) << "\n";
+    s << "mode3.msaVerifySnpSites = " <<
+        convertBoolToPythonString(msaVerifySnpSites) << "\n";
+    s << "mode3.msaVerifyFlankBases = " << msaVerifyFlankBases << "\n";
+    s << "mode3.msaVerifyMinAgreement = " << msaVerifyMinAgreement << "\n";
     s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
