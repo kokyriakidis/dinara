@@ -27,7 +27,6 @@
 #include "HifiasmImportedCigarStore.hpp"
 #include "dinaraTypes.hpp"
 #include "MarkerKmers.hpp"
-#include "mode3-Anchor.hpp"
 #include "PafImport.hpp"
 
 // hifiasm in-memory overlap bridge: provides the hifiasm_overlap_t type used by
@@ -77,7 +76,6 @@ namespace dinara {
     class MarkerConnectivityGraphVertexMap;
     class MarkerKmers;
     class Mode3AssemblyOptions;
-    class Mode3Assembler;
     class OrientedReadPair;
     class Reads;
     class ReferenceOverlapMap;
@@ -474,13 +472,6 @@ public:
     // Must be called after createMarkerGraphVertices and computeCandidateTable.
     void filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount);
 
-    // Create anchors from BRG-aware (self-RC) marker graph vertices.
-    // Handles self-RC vertices by extracting only strand-0 markers for the
-    // forward anchor and deriving the RC anchor by flipping.
-    shared_ptr<mode3::Anchors> createAnchorsFromBrgMarkerGraphVertices(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
 
     // Create and run Verkko-style directed anchor graph resolution.
     void runDirectedAnchorGraphResolution();
@@ -2639,8 +2630,6 @@ public:
 
 
     // Mode 3 assembly.
-    shared_ptr<Mode3Assembler> mode3Assembler;
-    void accessMode3Assembler();
 
     // Shasta2-style Anchors for Mode 3.
     std::shared_ptr<Shasta2Anchors> shasta2Anchors;
@@ -2687,54 +2676,6 @@ public:
 
 
 
-    // Global AnchorGraph (created for all anchors, not per-component).
-    shared_ptr<mode3::AnchorGraph> anchorGraph;
-
-    // Verkko-style directed anchor graph (built from BRG anchors).
-    shared_ptr<mode3::DirectedAnchorGraph> directedAnchorGraph;
-
-    // If the coverage range for primary marker graph edges is not
-    // specified, this uses the disjoint sets histogram to compute reasonable values.
-    pair<uint64_t, uint64_t> getPrimaryCoverageRange();
-
-    // Assemble sequence between two primary edges.
-    void fillMode3AssemblyPathStep(const vector<string>&, ostream&);
-
-    // Top level function for Mode 3 assembly.
-    void mode3Assembly(
-        uint64_t threadCount,
-        shared_ptr<mode3::Anchors>,
-        const Mode3AssemblyOptions&,
-        bool debug
-    );
-    // Same, but use existing Anchors. Python callable.
-    void mode3Reassembly(
-        uint64_t threadCount,
-        const Mode3AssemblyOptions&,
-        bool debug
-    );
-
-    // Alignment-free version of mode 3 assembly.
-    void alignmentFreeAssembly(
-        const Mode3AssemblyOptions&,
-        const vector<string>& anchorFileAbsolutePaths,
-        uint64_t threadCount);
-
-    // Http server functions related to Mode 3 assembly.
-    void exploreAnchor(const vector<string>&, ostream&);
-    void exploreAnchorPair(const vector<string>&, ostream&);
-    void exploreJourney(const vector<string>&, ostream&);
-    void exploreReadFollowing(const vector<string>&, ostream&);
-    void exploreLocalAssembly(const vector<string>&, ostream&);
-    void exploreLocalAnchorGraph(const vector<string>&, ostream&);
-    void exploreMode3AssemblyGraph(const vector<string>&, ostream&);
-    void exploreSegment(const vector<string>&, ostream&);
-    void exploreReadFollowingAssemblyGraph(const vector<string>&, ostream&);
-
-    // Http server function for the global AnchorGraph.
-    void exploreAnchorGraph(const vector<string>&, ostream&);
-
-    // Http server functions for the directed anchor graph (Verkko-style).
 
 
 public:

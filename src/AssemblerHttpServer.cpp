@@ -247,16 +247,8 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(followReadInMarkerGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreMarkerConnectivity);
 
-    DINARA_ADD_TO_FUNCTION_TABLE(fillMode3AssemblyPathStep);
 
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchor);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorPair);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreJourney);
 
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2Anchor);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2AnchorPair);
@@ -266,9 +258,6 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2LocalReadAnchorGraph);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreShasta2LocalReadGraph);
 
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreMode3AssemblyGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreSegment);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowingAssemblyGraph);
 }
 #undef DINARA_ADD_TO_FUNCTION_TABLE
 
@@ -550,15 +539,9 @@ void Assembler::writeNavigation(ostream& html) const
     {
 
         writeNavigation(html, "Anchors", {
-            {"Anchor", "exploreAnchor"},
-            {"Anchor pair", "exploreAnchorPair"},
-            {"Journey", "exploreJourney"},
-            {"Read following on anchors", "exploreReadFollowing"},
-            {"Local anchor graph", "exploreLocalAnchorGraph"},
             });
 
         writeNavigation(html, "Anchor Graph", {
-            {"Graph summary", "exploreAnchorGraph"},
             });
 
         writeNavigation(html, "Shasta2 Anchor Graph", {
@@ -577,10 +560,6 @@ void Assembler::writeNavigation(ostream& html) const
 
 
         writeNavigation(html, "Assembly", {
-            {"Local assembly", "exploreLocalAssembly"},
-            {"Local assembly graph", "exploreMode3AssemblyGraph"},
-            {"Segment", "exploreSegment"},
-            {"Read following on assembly graph", "exploreReadFollowingAssemblyGraph"},
             });
     }
 
@@ -911,12 +890,6 @@ void Assembler::accessAllSoft()
 
     // Data specific to assembly mode 3.
     {
-        try {
-            accessMode3Assembler();
-        } catch(const exception& e) {
-            cout << "The mode 3 assembler is not accessible." << endl;
-            allDataAreAvailable = false;
-        }
     }
 
 
