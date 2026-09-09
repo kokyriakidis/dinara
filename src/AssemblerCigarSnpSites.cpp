@@ -328,8 +328,8 @@ void Assembler::detectCigarSnpSites(
         vector<uint16_t> disagree;
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
-        // Spans of partners that outrank this read, merged per read.
-        vector<pair<uint32_t, uint32_t>> blockingIntervals;
+        // Spans of partners that outrank this read; refilled per read.
+        vector<pair<uint32_t, uint32_t>> blockingSpans;
         vector<uint8_t> contextBuffer;
         // Scratch for sanitizeArm below; reused across sites by this thread.
         vector<pair<OrientedReadId, uint32_t>> armScratch, armClean;
@@ -561,59 +561,41 @@ void Assembler::detectCigarSnpSites(
             // side effect, and the result stops depending on ReadId ordering
             // (ReadIds come from input order, so which marginal loci survive
             // currently depends on the order the reads were read in).
-            // The test is not "which read is the minimum" but the weaker
-            // "does any read smaller than this one cover the position" -- the
-            // actual minimum is never used. So only records whose partner has a
-            // smaller ReadId can matter; the rest cannot take ownership and need
-            // not be examined per candidate at all.
+            // Only a partner with a SMALLER ReadId can take ownership, and the
+            // actual minimum is never needed -- the question is just whether
+            // this read is it. So gather the spans that could outrank it once
+            // per read, and stop at the first one covering a candidate.
             //
-            // Those records' spans are merged into disjoint intervals once, and
-            // since localCandidates is produced by an ascending scan it is
-            // already sorted, so ownership falls out of a single linear sweep of
-            // two sorted sequences. That replaces a candidates x records probe
-            // whose cost grows as the PRODUCT of candidate density and coverage
-            // -- the two quantities that both grow with depth, so the naive form
-            // degrades quadratically exactly where the data gets deeper.
+            // Both halves matter and neither costs any subtlety: the filter
+            // removes about half the records, and the early exit is only
+            // possible because we no longer compute a minimum (the previous
+            // form had to visit every record to find one).
             //
-            //   before : O(C * R)
-            //   after  : O(R log R + C + R)
-            blockingIntervals.clear();
-            for(const HifiasmImportedCigarStore::Record* rec: records) {
+            // An earlier version merged these spans and swept them against the
+            // sorted candidates, which is asymptotically better again. It was
+            // removed: on this data it saved ~40 ms at E821 scale, and an
+            // in-place interval merge plus a two-pointer scan is materially
+            // harder to check by eye than the loop below, for a step whose
+            // correctness decides which sites exist at all. Bring it back if
+            // whole-genome runs make the probe show up in a profile -- there the
+            // arithmetic is minutes rather than milliseconds.
+            blockingSpans.clear();
+            for(const HifiasmImportedCigarStore::Record* rec: recordsOf(readId)) {
                 const bool selfIsQuery = (rec->readIdQ == readId);
                 const ReadId partner =
                     selfIsQuery ? ReadId(rec->readIdT) : ReadId(rec->readIdQ);
-                if(partner >= readId) continue;         // cannot own it
-                blockingIntervals.push_back({
+                if(partner >= readId) continue;
+                blockingSpans.push_back({
                     selfIsQuery ? rec->qStart : rec->tStart,
                     selfIsQuery ? rec->qEnd   : rec->tEnd});
             }
             ownedPositions.clear();
-            if(blockingIntervals.empty()) {
-                // Nothing can outrank this read: it owns every candidate.
-                ownedPositions = localCandidates;
-            } else {
-                std::sort(blockingIntervals.begin(), blockingIntervals.end());
-                // Merge in place into disjoint spans.
-                size_t w = 0;
-                for(size_t r = 1; r < blockingIntervals.size(); r++) {
-                    if(blockingIntervals[r].first <= blockingIntervals[w].second) {
-                        blockingIntervals[w].second = std::max(
-                            blockingIntervals[w].second, blockingIntervals[r].second);
-                    } else {
-                        blockingIntervals[++w] = blockingIntervals[r];
-                    }
+            for(const uint32_t position: localCandidates) {
+                bool blocked = false;
+                for(const auto& [from, to]: blockingSpans) {
+                    if(position >= from && position < to) { blocked = true; break; }
                 }
-                blockingIntervals.resize(w + 1);
-                // Linear sweep: both sequences ascend, so each advances once.
-                size_t iv = 0;
-                for(const uint32_t position: localCandidates) {
-                    while(iv < blockingIntervals.size() &&
-                          blockingIntervals[iv].second <= position) ++iv;
-                    if(iv == blockingIntervals.size() ||
-                       position < blockingIntervals[iv].first) {
-                        ownedPositions.push_back(position);
-                    }
-                }
+                if(!blocked) ownedPositions.push_back(position);
             }
             ownedSites.fetch_add(ownedPositions.size(), std::memory_order_relaxed);
 
