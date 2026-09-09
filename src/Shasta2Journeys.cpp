@@ -490,6 +490,7 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
         return a < b;                                        // lower id wins
     };
     uint64_t tieGroups = 0, unitsDropped = 0;
+    journeyTieDrops.clear();
     // A het anchor dropped here never reaches the anchor graph for this read,
     // which defeats the reason it was created -- so count the losers by kind
     // and report the rate, because the tie-break makes the loss SYSTEMATIC
@@ -536,6 +537,11 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
                         else primaryDropped++;
                         if(remainingOccurrences[v[t].second] > 0)
                             remainingOccurrences[v[t].second]--;
+                        // The unit the export must omit. Canonical (even) id,
+                        // because a drop removes both the direct and the
+                        // RC-induced occurrence for this read.
+                        journeyTieDrops.push_back(
+                            {v[t].second & ~Shasta2AnchorId(1), ReadId(readIdValue)});
                     }
                     deduped.push_back({v[i].first, keeper});
                 }

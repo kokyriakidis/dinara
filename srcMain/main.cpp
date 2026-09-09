@@ -2907,33 +2907,18 @@ void dinara::main::assemble(
     // two agree -- if they ever diverge, the derivation is authoritative and the
     // difference is the bug.
     {
-        std::unordered_set<uint64_t> inJourney;
-        const uint64_t orientedReadCount = shasta2Journeys->size();
-        for(uint64_t v = 0; v < orientedReadCount; v++) {
-            const OrientedReadId orientedReadId = OrientedReadId::fromValue(v);
-            for(const Shasta2AnchorId a : (*shasta2Journeys)[orientedReadId]) {
-                inJourney.insert((uint64_t(v) << 32) | uint64_t(a));
-            }
-        }
-        Shasta2Anchors::ExternalAnchorDropMap derived;
+        // Straight from the rebuild's own record of what it dropped.
         uint64_t derivedDrops = 0;
-        const uint64_t anchorCount2 = shasta2Anchors->size();
-        for(Shasta2AnchorId id = 0; id < anchorCount2; id += 2) {
-            for(const Shasta2AnchorMarkerInfo& mi : (*shasta2Anchors)[id]) {
-                const uint64_t v = mi.orientedReadId.getValue();
-                if(inJourney.count((v << 32) | uint64_t(id))) continue;
-                auto& vec = derived[id];
-                const ReadId r = mi.orientedReadId.getReadId();
-                if(std::find(vec.begin(), vec.end(), r) == vec.end()) {
-                    vec.push_back(r);
-                    ++derivedDrops;
-                }
+        for(const auto& [canonicalId, readId]: shasta2Journeys->journeyTieDrops) {
+            auto& vec = journeyTieDropMap[canonicalId];
+            if(std::find(vec.begin(), vec.end(), readId) == vec.end()) {
+                vec.push_back(readId);
+                ++derivedDrops;
             }
         }
-        cout << timestamp << "Export drop map derived from journeys: "
-             << derivedDrops << " member(s) absent from every journey "
-                "(these are exactly the occurrences the rebuild dropped)." << endl;
-        journeyTieDropMap.swap(derived);
+        cout << timestamp << "Export drop map taken from the journey rebuild: "
+             << derivedDrops << " member(s) removed when journeys were rebuilt."
+             << endl;
     }
 
     // Write external anchors. Deferred to here (after MSA het-anchor

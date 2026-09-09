@@ -88,6 +88,20 @@ public:
     // measurement.
     bool journeyTiePreferHet = true;
 
+    // The (canonical anchor, ReadId) units this rebuild removed from journeys.
+    //
+    // The external-anchor export must omit exactly these members, and it used to
+    // work that out for itself -- first by re-resolving the ties (a second
+    // implementation of the policy, which disagreed), then by rebuilding the
+    // whole journey membership as a ~1.1M-entry hash set and diffing every
+    // anchor member against it. Both are roundabout: the rebuild HAS this list
+    // at the moment it decides, and it is tiny (457 units on the 989-read
+    // fixture against 576k exported members). Recording it here makes the export
+    // O(drops) instead of O(journey entries + anchor members), and removes the
+    // last place where the export could infer something different from what the
+    // rebuild actually did.
+    vector< pair<Shasta2AnchorId, ReadId> > journeyTieDrops;
+
     // Return the Journey for an oriented read.
     Shasta2Journey operator[](OrientedReadId orientedReadId) const
     {
