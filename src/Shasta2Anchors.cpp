@@ -822,7 +822,6 @@ void Shasta2Anchors::analyzeAnchorPair(
         if(it1 == end1 || ((it0 != end0) && (it0->orientedReadId < it1->orientedReadId))) {
             ++onlyACheck;
             const OrientedReadId orientedReadId = it0->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
 
             const int64_t basePosition0 = int64_t(it0->position);
@@ -838,7 +837,6 @@ void Shasta2Anchors::analyzeAnchorPair(
         if(it0 == end0 || ((it1 != end1) && (it1->orientedReadId < it0->orientedReadId))) {
             ++onlyBCheck;
             const OrientedReadId orientedReadId = it1->orientedReadId;
-            const auto orientedReadMarkers = markers[orientedReadId.getValue()];
             const int64_t lengthInBases = int64_t(reads.getReadRawSequenceLength(orientedReadId.getReadId()));
 
             const int64_t basePosition1 = int64_t(it1->position);

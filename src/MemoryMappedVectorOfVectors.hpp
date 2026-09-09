@@ -99,7 +99,15 @@ public:
 
     size_t size() const
     {
-        return toc.size() - 1;
+        // The toc holds one more entry than there are vectors (the end offset
+        // of the last one), so the count is toc.size() - 1 -- EXCEPT when the
+        // object is not open, where toc.size() is 0 and the subtraction wraps
+        // to SIZE_MAX. Every `for(i = 0; i < size(); ++i)` loop over such an
+        // object then runs ~1.8e19 iterations indexing out of bounds on the
+        // first one. gcc sees it: -Waggressive-loop-optimizations reports
+        // "iteration 2305843009213693951 invokes undefined behavior" against
+        // KmerCounter::buildFrequencyLUT, which is exactly this loop shape.
+        return (toc.size() == 0) ? 0 : (toc.size() - 1);
     }
     size_t totalSize() const
     {

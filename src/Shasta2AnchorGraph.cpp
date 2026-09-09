@@ -712,7 +712,7 @@ uint64_t Shasta2AnchorGraph::removeHetArmTips(const Shasta2Anchors& anchors)
     // anchor keeps both strands consistent without a separate RC pass.
     uint64_t totalDisabled = 0;
     uint64_t armsRemoved = 0;
-    for(uint64_t pass = 0; ; ++pass) {
+    for(;;) {
         uint64_t disabledThisPass = 0;
         for(uint64_t a = hetFirst; a < anchorCount; ++a) {
             if(!isHetArmTip(a)) continue;

@@ -90,7 +90,6 @@ void Shasta2AnchorPair::get(
     vector< pair<Positions, Positions> >& positions) const
 {
 
-    const uint32_t kHalf = uint32_t(anchors.k / 2);
     positions.clear();
 
     const Shasta2Anchor anchorA = anchors[anchorIdA];
@@ -255,7 +254,6 @@ void Shasta2AnchorPair::get(
     vector< pair<Positions, Positions> >& positions,
     vector< vector<Base> >& sequences) const
 {
-    const uint32_t kHalf = uint32_t(anchors.k / 2);
     const Reads& reads = anchors.reads;
 
     get(anchors, positions);
