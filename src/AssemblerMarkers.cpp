@@ -23,6 +23,7 @@ using namespace dinara;
 // Standard library.
 #include "fstream.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
@@ -405,37 +406,101 @@ void Assembler::createMarkersFromNativeChain(
     }
 
     // Collect, per dinara ReadId, the forward-strand marker positions referenced
-    // by any chain anchor. Positions repeat heavily across overlaps; we append to
-    // a flat per-read vector and sort+unique once at the end (far cheaper than a
-    // per-read std::set given millions of anchors).
-    vector<vector<uint32_t>> readPositions(readCount);
-    for(uint64_t i = 0; i < overlapCount; i++) {
-        const hifiasm_overlap_t& o = overlaps[i];
-        if(o.chain_len == 0) continue;
-        if(o.q_id >= readCountFromHifiasm || o.t_id >= readCountFromHifiasm) continue;
-        const ReadId qReadId = hifiToDinara[o.q_id];
-        const ReadId tReadId = hifiToDinara[o.t_id];
-        if(qReadId == invalidReadId || tReadId == invalidReadId) continue;
-        const uint32_t qLen = uint32_t(reads->getRead(qReadId).baseCount);
-        const uint32_t tLen = uint32_t(reads->getRead(tReadId).baseCount);
-        const bool sameStrand = (o.is_same_strand != 0);
+    // by any chain anchor. Positions repeat heavily across overlaps; we gather
+    // them all and sort+unique once per read at the end (far cheaper than a
+    // per-read std::set given the anchor count -- 162M on a 6Mb fixture).
+    //
+    // Storage is a flat CSR (positionsBegin indexes into positionsData) rather
+    // than a vector per read. The exact per-read size is known after a counting
+    // pass, which removes both the reallocation churn of 162M push_backs and
+    // the slack a geometrically growing vector leaves behind.
+    //
+    // Both passes go through forEachChainAnchor so they cannot disagree about
+    // which anchors exist: a mismatch between what the counting pass reserves
+    // and what the fill pass writes would overflow one read's slice into the
+    // next. Positions land inside a read's slice in nondeterministic order,
+    // which does not matter -- the slice is sorted and deduplicated below, so
+    // the resulting marker set is identical run to run.
+    const auto forEachChainAnchor = [&](uint64_t overlapBegin, uint64_t overlapEnd,
+        auto&& emit)
+    {
+        for(uint64_t i = overlapBegin; i < overlapEnd; i++) {
+            const hifiasm_overlap_t& o = overlaps[i];
+            if(o.chain_len == 0) continue;
+            if(o.q_id >= readCountFromHifiasm || o.t_id >= readCountFromHifiasm) continue;
+            const ReadId qReadId = hifiToDinara[o.q_id];
+            const ReadId tReadId = hifiToDinara[o.t_id];
+            if(qReadId == invalidReadId || tReadId == invalidReadId) continue;
+            const uint32_t qLen = uint32_t(reads->getRead(qReadId).baseCount);
+            const uint32_t tLen = uint32_t(reads->getRead(tReadId).baseCount);
+            const bool sameStrand = (o.is_same_strand != 0);
 
-        const uint64_t* a = chain + o.chain_offset;
-        for(uint32_t j = 0; j < o.chain_len; j++) {
-            const uint32_t qPos = uint32_t(a[j] >> 32);
-            const uint32_t tPos = uint32_t(a[j] & 0xffffffffu);
-            // Query position is already forward on the query read.
-            if(qPos + k <= qLen) readPositions[qReadId].push_back(qPos);
-            // Target position is in alignment orientation: forward when the
-            // overlap is same-strand, else on the reverse complement.
-            if(sameStrand) {
-                if(tPos + k <= tLen) readPositions[tReadId].push_back(tPos);
-            } else {
-                if(tPos + k <= tLen) {
-                    readPositions[tReadId].push_back(tLen - tPos - k);
+            const uint64_t* a = chain + o.chain_offset;
+            for(uint32_t j = 0; j < o.chain_len; j++) {
+                const uint32_t qPos = uint32_t(a[j] >> 32);
+                const uint32_t tPos = uint32_t(a[j] & 0xffffffffu);
+                // Query position is already forward on the query read.
+                if(qPos + k <= qLen) emit(qReadId, qPos);
+                // Target position is in alignment orientation: forward when the
+                // overlap is same-strand, else on the reverse complement.
+                if(sameStrand) {
+                    if(tPos + k <= tLen) emit(tReadId, tPos);
+                } else {
+                    if(tPos + k <= tLen) emit(tReadId, tLen - tPos - k);
                 }
             }
         }
+    };
+
+    // Run a static partition of the overlaps on every thread. Static rather
+    // than load-balanced only because it needs no shared batch state; chain
+    // lengths average out over the tens of thousands of overlaps per thread.
+    const uint64_t overlapChunk = (overlapCount + threadCount - 1) / threadCount;
+    const auto runOverThreads = [&](auto&& body) {
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                body(t * overlapChunk,
+                     std::min(overlapCount, (t + 1) * overlapChunk));
+            });
+        }
+        for(std::thread& thread: threads) thread.join();
+    };
+
+    vector<uint64_t> positionsBegin(readCount + 1, 0);
+    vector<uint32_t> positionsData;
+    {
+        // Counting pass. One counter per read rather than per (thread, read):
+        // the atomic keeps this O(readCount) instead of O(threadCount *
+        // readCount), which matters once readCount is in the millions.
+        vector<std::atomic<uint64_t>> counts(readCount);
+        for(std::atomic<uint64_t>& c: counts) c.store(0, std::memory_order_relaxed);
+        runOverThreads([&](uint64_t begin, uint64_t end) {
+            forEachChainAnchor(begin, end, [&](ReadId readId, uint32_t) {
+                counts[readId].fetch_add(1, std::memory_order_relaxed);
+            });
+        });
+
+        uint64_t total = 0;
+        for(ReadId readId = 0; readId < ReadId(readCount); readId++) {
+            positionsBegin[readId] = total;
+            total += counts[readId].load(std::memory_order_relaxed);
+        }
+        positionsBegin[readCount] = total;
+        positionsData.resize(total);
+
+        // Fill pass: each anchor claims one slot in its read's slice.
+        vector<std::atomic<uint64_t>> cursor(readCount);
+        for(ReadId readId = 0; readId < ReadId(readCount); readId++) {
+            cursor[readId].store(positionsBegin[readId], std::memory_order_relaxed);
+        }
+        runOverThreads([&](uint64_t begin, uint64_t end) {
+            forEachChainAnchor(begin, end, [&](ReadId readId, uint32_t position) {
+                positionsData[cursor[readId].fetch_add(1, std::memory_order_relaxed)] =
+                    position;
+            });
+        });
     }
     (void)chainLen;
 
@@ -448,31 +513,53 @@ void Assembler::createMarkersFromNativeChain(
 
     markers->beginPass1(2 * readCount);
     markerKmerIds->beginPass1(2 * readCount);
-    for(ReadId readId = 0; readId < ReadId(readCount); ++readId) {
-        vector<uint32_t>& positions = readPositions[readId];
-        if(!positions.empty()) {
-            // Dedup + sort ascending (markers are stored in position order).
-            std::sort(positions.begin(), positions.end());
-            positions.erase(std::unique(positions.begin(), positions.end()),
-                            positions.end());
-            const LongBaseSequenceView read = reads->getRead(readId);
-            std::vector<std::pair<uint32_t, KmerId>>& staged =
-                findMarkersSimdMinimizersData.stagedMarkers[readId];
-            staged.reserve(positions.size());
-            Kmer kmer;
-            for(const uint32_t position : positions) {
-                extractKmer(read, uint64_t(position), uint64_t(k), kmer);
-                staged.push_back({position, KmerId(kmer.id(uint64_t(k)))});
-            }
+
+    // Reads are independent here, so this runs on every thread. Each thread
+    // owns a contiguous range of ReadIds, so the incrementCount calls (a plain
+    // count[index] += m) are writing indices 2*readId and 2*readId+1 that no
+    // other thread touches, and need no synchronisation of their own.
+    {
+        const uint64_t readChunk = (readCount + threadCount - 1) / threadCount;
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                const uint64_t readBegin = t * readChunk;
+                const uint64_t readEnd = std::min(readCount, (t + 1) * readChunk);
+                Kmer kmer;
+                for(ReadId readId = ReadId(readBegin); readId < ReadId(readEnd); ++readId) {
+                    uint32_t* const begin = positionsData.data() + positionsBegin[readId];
+                    uint32_t* const end = positionsData.data() + positionsBegin[readId + 1];
+                    if(begin != end) {
+                        // Dedup + sort ascending (markers are stored in position
+                        // order). This is also what makes the fill pass above
+                        // order-independent.
+                        std::sort(begin, end);
+                        uint32_t* const last = std::unique(begin, end);
+                        const LongBaseSequenceView read = reads->getRead(readId);
+                        std::vector<std::pair<uint32_t, KmerId>>& staged =
+                            findMarkersSimdMinimizersData.stagedMarkers[readId];
+                        staged.reserve(size_t(last - begin));
+                        for(uint32_t* p = begin; p != last; ++p) {
+                            extractKmer(read, uint64_t(*p), uint64_t(k), kmer);
+                            staged.push_back({*p, KmerId(kmer.id(uint64_t(k)))});
+                        }
+                    }
+                    const uint64_t count64 =
+                        findMarkersSimdMinimizersData.stagedMarkers[readId].size();
+                    markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+                    markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+                    markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
+                    markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+                }
+            });
         }
-        // Free this read's positions now that they are staged.
-        vector<uint32_t>().swap(positions);
-        const uint64_t count64 = findMarkersSimdMinimizersData.stagedMarkers[readId].size();
-        markers->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
-        markers->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
-        markerKmerIds->incrementCount(OrientedReadId(readId, 0).getValue(), count64);
-        markerKmerIds->incrementCount(OrientedReadId(readId, 1).getValue(), count64);
+        for(std::thread& thread: threads) thread.join();
     }
+
+    // The positions are staged now; release the CSR before the store pass.
+    vector<uint32_t>().swap(positionsData);
+    vector<uint64_t>().swap(positionsBegin);
 
     // Store markers on both strands (strand 1 mirrored) via the shared pass-2
     // routine, then finalize.
