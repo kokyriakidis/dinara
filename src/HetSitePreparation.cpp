@@ -84,8 +84,7 @@ uint64_t dinara::collapseDuplicateLoci(vector<Assembler::CigarSnpSite>& sites)
 
 uint64_t dinara::dropAlreadyAnchoredArmMembers(
     vector<Assembler::CigarSnpSite>& sites,
-    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied,
-    uint32_t hetKHalf)
+    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied)
 {
     uint64_t removed = 0;
     for(Assembler::CigarSnpSite& site: sites) {
@@ -95,7 +94,7 @@ uint64_t dinara::dropAlreadyAnchoredArmMembers(
                 [&](const pair<OrientedReadId, uint32_t>& m) {
                     return occupied.count(
                         (uint64_t(m.first.getValue()) << 32) |
-                        uint64_t(m.second + hetKHalf)) != 0;
+                        uint64_t(m.second)) != 0;
                 }), members.end());
             removed += before - members.size();
         }

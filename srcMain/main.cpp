@@ -5,7 +5,6 @@
 
 // Dinara.
 #include "Assembler.hpp"
-#include "HetAnchorK.hpp"
 #include "HetSitePreparation.hpp"
 #include "platformDependent.hpp"
 #include "AssemblerOptions.hpp"
@@ -1102,7 +1101,7 @@ void dinara::main::assemble(
 
                 const auto occupied = buildOccupiedPositions(*shasta2Anchors);
                 const uint64_t alreadyAnchored = dropAlreadyAnchoredArmMembers(
-                    snpSites, occupied, hetAnchorKHalf());
+                    snpSites, occupied);
                 cout << timestamp << "  " << alreadyAnchored
                      << " arm member(s) already sit in an anchor that isolates "
                         "their allele; het anchors are built from the rest." << endl;
@@ -1214,14 +1213,11 @@ void dinara::main::assemble(
     cout << timestamp << "Wrote " << exportedExternalAnchorCount
          << " external anchors for Shasta2. Use --external-anchors-name "
          << externalAnchorsName << endl;
-    // The export subtracts hetAnchorKHalf() uniformly from every stored midpoint
-    // (see writeExternalAnchors), so shasta2 must be loaded with the MATCHING
-    // --k: 2 by default, 0 for the experimental DINARA_HET_K=0 path. A mismatch
-    // shifts every anchor by one base. Report it so the caller passes the right
-    // value to the downstream shasta2 invocation.
-    cout << timestamp << "Shasta2 must load these external anchors with --k "
-         << hetAnchorK()
-         << (hetAnchorK() == 0 ? " (EXPERIMENTAL DINARA_HET_K=0)." : ".") << endl;
+    // Anchors are exported as bare position markers (no k/2 shift), so shasta2
+    // MUST load them with --k 0 or every anchor is displaced. Report it so the
+    // caller passes the right value to the downstream shasta2 invocation.
+    cout << timestamp
+         << "Shasta2 must load these external anchors with --k 0." << endl;
 
     // Verify and finalize the anchor graph (already built above for the
     // journey path), then export it.

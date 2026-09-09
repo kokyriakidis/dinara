@@ -57,15 +57,18 @@ uint64_t collapseDuplicateLoci(vector<Assembler::CigarSnpSite>& sites);
 // and building a het anchor over it would clone it and then compete with it for
 // a position shasta2 lets only one anchor hold.
 //
-// `occupied` maps (orientedReadId.getValue() << 32 | storedPosition) to nothing
-// -- only membership is used. Build it with buildOccupiedPositions().
+// `occupied` maps (orientedReadId.getValue() << 32 | position) to nothing --
+// only membership is used. Build it with buildOccupiedPositions().
 //
-// Positions in a site are RAW; anchors store rawPosition + hetKHalf, so the
-// caller passes the same hetKHalf the anchor store uses.
+// Site positions and stored anchor positions are in the SAME frame: a het
+// anchor is a zero-length marker whose stored position is the SNP base itself
+// (see Shasta2Anchors::appendHetAnchorPair), so no offset is applied here. This
+// used to take a hetKHalf argument for the old 2-base het marker; getting that
+// offset wrong matched nothing and removed the wrong members, so the frames are
+// now identical by construction rather than by a caller-supplied constant.
 uint64_t dropAlreadyAnchoredArmMembers(
     vector<Assembler::CigarSnpSite>& sites,
-    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied,
-    uint32_t hetKHalf);
+    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied);
 
 
 // (orientedRead, storedPosition) -> the anchor holding it, over every anchor

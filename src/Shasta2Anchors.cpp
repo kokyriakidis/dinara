@@ -1,5 +1,4 @@
 #include "Shasta2Anchors.hpp"
-#include "HetAnchorK.hpp"
 #include "Shasta2Journeys.hpp"
 #include "deduplicate.hpp"
 #include "findMarkerId.hpp"
@@ -532,26 +531,15 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
         // hom anchors alike. The recovered midpoint is the SAME in both modes;
         // only the exported raw number and the loader --k differ.
         //
-        // At k=2 the exported 2-base k-mer differs by anchor class but is always
-        // consistent across a given anchor's member reads:
-        //  - Het/hom anchors have 2 shared bases by construction.
-        //  - Primary anchors agree over the full k=50 window (verified above),
-        //    so the centered 2-base subset at [position-1, position] is
-        //    identical across all members too.
-        // At k=0 there is no k-mer at all -- each anchor is a bare position
-        // marker -- so no per-class k-mer consistency applies.
-        // Export shift is UNIFORM across every anchor class and equals the k/2
-        // that the shasta2 loader re-adds. shasta2 uses a single --k for the
-        // whole external anchor set, so the shift cannot differ between primary
-        // and het anchors without breaking their relative ordering. Default
-        // k=2 -> subtract 1 (shasta2 --k 2 re-adds 1); experimental k=0 ->
-        // subtract 0 (shasta2 --k 0 re-adds 0, positions land exactly on the
-        // stored midpoints, which for het anchors are the exact SNP bases).
-        // Primaries are k=2-clipped at k=2 and become point markers at their
-        // k=50 center at k=0; either way the stored-midpoint ordering used by
-        // the whole internal graph is preserved. The export k must match: see
-        // the writeExternalAnchors caller, which passes --k hetAnchorK().
-        const uint32_t exportShift = hetAnchorKHalf();
+        // No export shift: every anchor is exported as a bare position marker
+        // and shasta2 must load the set with --k 0, so the position it stores is
+        // exactly the position here. shasta2 uses ONE --k for the whole external
+        // anchor set, so the shift could never differ between primary and het
+        // anchors anyway without breaking their relative ordering -- and a het
+        // anchor has to be a zero-length marker (see appendHetAnchorPair), which
+        // forces --k 0 for everything. Primary anchors therefore export as point
+        // markers at their k=50 centre; the stored-position ordering the whole
+        // internal graph relies on is unchanged.
         for(const Shasta2AnchorMarkerInfo& markerInfo : anchor) {
             // Same drop filter as the validation loop above, so the exported
             // members exactly match the validated set.
@@ -559,7 +547,7 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
                 continue;
             }
             // External anchors store the raw position (first base of the k-mer).
-            const uint32_t rawPosition = markerInfo.position - exportShift;
+            const uint32_t rawPosition = markerInfo.position;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
             positionsByOrientedRead[markerInfo.orientedReadId.getValue()]
                 .push_back(rawPosition);
@@ -611,14 +599,17 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
 Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     const vector<std::pair<OrientedReadId, uint32_t>>& members)
 {
-    // Marker length of a het anchor. Default k=2: shasta2 re-derives [predBase,
-    // alleleBase] from rawPosition; only 2 bases are meaningful. Experimental
-    // k=0 (DINARA_HET_K=0): a zero-length position marker at the exact SNP base.
-    // See HetAnchorK.hpp. The RC mirror formula below (readLen - rawPosition -
-    // hetK, then + hetKHalf) keeps fwd+rc stored positions summing to readLen
-    // for both k, so no per-k special case is needed.
-    const uint32_t hetK = hetAnchorK();
-    const uint32_t hetKHalf = hetAnchorKHalf();
+    // A het anchor is a ZERO-LENGTH position marker at the exact SNP base: the
+    // member stores that base's position and there is no k-mer.
+    //
+    // It cannot be otherwise. A k-base marker forces the anchor to span k bases
+    // that every member must share, and only ONE base is shared by construction
+    // -- the allele. The previous k=2 marker spanned [alleleBase, nextBase], and
+    // nothing guarantees the arm agrees on nextBase. It also placed the anchor
+    // one base PAST the SNP: the caller passes the SNP position, storing
+    // position+1, and the export's -k/2 then cancelled to leave rawPosition ==
+    // snpPos, which the shasta2 loader re-shifted by +1. Zero length removes
+    // both problems, and the loader must be given --k 0 to match.
 
     // Safety net: a het/hom anchor must have at least 2 members. A coverage-1
     // anchor (a single read, or only the backbone) is a spurious branch in the
@@ -630,18 +621,16 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     DINARA_ASSERT(members.size() >= 2);
 
     // Record where het anchors begin so the export can bypass the k=50 k-mer
-    // consistency check for them AND use hetK/2 (not k/2) when recovering the
-    // raw position.
+    // consistency check for them.
     if(hetAnchorFirstId == invalid<Shasta2AnchorId>) {
         hetAnchorFirstId = size();
     }
 
-    // Build the canonical (forward) member list. Store the midpoint position
-    // using the het marker's own half-length (hetK/2 = 1), NOT the store's k/2.
-    // This keeps the het anchor's position properly ordered between its flanking
-    // backbone anchors in the anchor graph (a k/2=25 offset would push it past
-    // nearby anchors and create spurious backward edges). writeExternalAnchors
-    // recovers rawPosition via (position - hetK/2) for het anchors.
+    // Build the canonical (forward) member list. The stored position IS the SNP
+    // base position -- no midpoint offset, because the marker has no length.
+    // That also keeps the het anchor ordered between its flanking backbone
+    // anchors in the anchor graph (the store's own k/2 = 25 offset would push it
+    // past nearby anchors and create spurious backward edges).
     // ordinal/positionInJourney are not meaningful for a het anchor and are
     // left invalid.
     vector<Shasta2AnchorMarkerInfo> fwd;
@@ -649,17 +638,15 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
     for(const auto& [orientedReadId, rawPosition] : members) {
         Shasta2AnchorMarkerInfo info;
         info.orientedReadId = orientedReadId;
-        info.position = rawPosition + hetKHalf;
+        info.position = rawPosition;
         fwd.push_back(info);
     }
     std::sort(fwd.begin(), fwd.end());
 
-    // Build the reverse-complement member list: flip strand and mirror the raw
-    // position to the opposite strand's coordinate frame, then re-apply the
-    // store's midpoint convention. For a k-base marker at rawPosition on strand
-    // s, the RC raw position on strand s^1 is readLen - rawPosition - hetK. This
-    // is general in hetK: k=0 gives readLen - rawPosition (mirror of a boundary
-    // position), keeping fwd+rc stored midpoints summing to readLen for both k.
+    // Build the reverse-complement member list: flip strand and mirror the
+    // position into the opposite strand's coordinate frame. For a zero-length
+    // marker that is just readLen - position, which keeps the fwd and rc stored
+    // positions summing to readLen.
     vector<Shasta2AnchorMarkerInfo> rc;
     rc.reserve(members.size());
     for(const auto& [orientedReadId, rawPosition] : members) {
@@ -667,11 +654,9 @@ Shasta2AnchorId Shasta2Anchors::appendHetAnchorPair(
         rcOid.flipStrand();
         const uint64_t readLen =
             reads.getReadRawSequenceLength(orientedReadId.getReadId());
-        const uint32_t rcRaw =
-            uint32_t(readLen) - rawPosition - hetK;
         Shasta2AnchorMarkerInfo info;
         info.orientedReadId = rcOid;
-        info.position = rcRaw + hetKHalf;
+        info.position = uint32_t(readLen) - rawPosition;
         rc.push_back(info);
     }
     std::sort(rc.begin(), rc.end());
