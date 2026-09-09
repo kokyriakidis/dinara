@@ -945,19 +945,21 @@ void dinara::main::assemble(
         invalid<uint64_t>,                              // unused (minVertexCoverage != 0)
         threadCount);
 
-    // Repeat-kmer and low-complexity filtering now happens at the minimizer
-    // stage (applyKmerCountFilter with filterRepeatKmers / filterLowComplexity),
-    // so these marker-graph vertex filters are redundant -- the offending k-mers
-    // never seed a vertex. Left commented out; re-enable if the minimizer-stage
-    // filters are ever turned off.
+    // No composition-based (repeat / low-complexity) k-mer filter runs here, by
+    // design. Markers come from hifiasm's native chain anchors, so a k-mer only
+    // becomes a marker if it seeded a COLLINEAR chain: a tandem-repeat k-mer
+    // matching the wrong copy is off-diagonal and dies on the chain's gap
+    // penalties. hifiasm's own seed filter is purely occurrence-based
+    // (high_occ = hom_cov * (2 - HA_KMER_GOOD_RATIO)), which removes repetitive
+    // k-mers for being COMMON rather than for being repetitive -- so a
+    // short-period k-mer that is genuinely rare here can still pass. That
+    // residual is handled below by chain consistency, which is evidence-based
+    // and per-vertex, and acts after collapse where the damage would occur.
     //
-    // Remove vertices whose k-mer is a short-period tandem repeat (period 1-5,
-    // including homopolymers). Thresholds: {6, 4, 4, 4, 4}. Removes ~18.5%.
-    // assembler.filterMarkerGraphVerticesByRepeatKmers(threadCount);
-    //
-    // Remove vertices whose k-mer has low sequence complexity (distinct
-    // sub-k-mers of lengths 1, 2, 3). Thresholds: {4, 12, 24}. Removes ~4.5%.
-    // assembler.filterMarkerGraphVerticesByDistinctSubkmerCount(threadCount);
+    // Two composition filters used to sit here and were deleted: they cut
+    // ~18.5% + ~4.5% of vertices blind, which on a pipeline measured for het
+    // recall is an unquantified second homopolymer cut on top of the one the
+    // truth set already exposes.
 
     // Remove vertices where the transitive collapse grouped reads at k-mer
     // positions outside their direct chaining range. For each pair of reads

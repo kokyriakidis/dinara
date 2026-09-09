@@ -455,18 +455,6 @@ public:
         uint64_t threadCount
     );
 
-    // Filter marker graph vertices whose marker k-mer is a short-period exact repeat
-    // (including homopolymers). This removes vertices that tend to generate unreliable
-    // anchors and artifacts in repetitive regions.
-    // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
-    void filterMarkerGraphVerticesByRepeatKmers(uint64_t threadCount);
-
-    // Filter marker graph vertices whose marker k-mer has low sequence complexity,
-    // assessed by counting distinct sub-k-mers of lengths 1, 2, 3, ...
-    // Uses the same criterion as Shasta2's --min-anchor-distinct-subkmer-count option.
-    // Must be called after createMarkerGraphVertices and before reverse-complement vertices/edges.
-    void filterMarkerGraphVerticesByDistinctSubkmerCount(uint64_t threadCount);
-
     // Filter marker graph vertices where reads were grouped by transitive collapse
     // at k-mer positions outside their chaining range.
     // Must be called after createMarkerGraphVertices and computeCandidateTable.
@@ -2046,19 +2034,9 @@ private:
 
 public:
     // Prune existing markers based on KmerCounter frequencies.
-    // filterRepeatKmers: also drop markers whose k-mer is a short-period tandem
-    //   repeat (periods 1-6, thresholds {6,4,4,4,4,4}), the same predicate used
-    //   by filterMarkerGraphVerticesByRepeatKmers.
-    // filterLowComplexity: also drop markers whose k-mer is low-complexity by
-    //   distinct sub-k-mer count (lengths 1-3, thresholds {4,12,24}), the same
-    //   predicate used by filterMarkerGraphVerticesByDistinctSubkmerCount.
-    // Applying these at the minimizer stage removes repeat/low-complexity
-    // minimizers before marker-graph construction, so they never seed vertices.
     void applyKmerCountFilter(
         uint64_t minFreq, uint64_t maxFreq, uint64_t threadCount,
-        bool filterPalindromes = true,
-        bool filterRepeatKmers = false,
-        bool filterLowComplexity = false);
+        bool filterPalindromes = true);
 
     // Remove all markers from reads whose marker span covers less than
     // minSpanFraction of the read length. Span = lastMarkerPos + k - firstMarkerPos.
@@ -2083,8 +2061,6 @@ private:
         uint64_t minFreq;
         uint64_t maxFreq;
         bool filterPalindromes;
-        bool filterRepeatKmers;
-        bool filterLowComplexity;
         shared_ptr<MemoryMapped::VectorOfVectors<CompressedMarker, uint64_t>> oldMarkers;
         shared_ptr<MemoryMapped::VectorOfVectors<KmerId, uint64_t>> oldMarkerKmerIds;
         
