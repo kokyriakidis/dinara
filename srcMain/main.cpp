@@ -1119,15 +1119,11 @@ void dinara::main::assemble(
                          << (before - rejected) << " of " << before
                          << " sites confirmed, " << rejected << " rejected."
                          << endl;
-                    static const char* const reasonNames[] = {
-                        "confirmed", "no shared bracketing anchors",
-                        "too few members after extraction", "MSA failed",
-                        "members landed in different columns",
-                        "agreed column not biallelic"};
                     for(uint64_t i = 0; i < reasons.size(); i++) {
                         if(reasons[i] != 0) {
-                            cout << "    " << reasonNames[i] << ": "
-                                 << reasons[i] << endl;
+                            cout << "    "
+                                 << msaVerdictReasonName(MsaSiteVerdict::Reason(i))
+                                 << ": " << reasons[i] << endl;
                         }
                     }
                 }

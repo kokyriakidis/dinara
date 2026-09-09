@@ -1,11 +1,13 @@
 // Tests for the pure half of the experimental MSA het-site verification
 // (src/HetSiteMsaVerification.cpp).
 //
-// verifyColumnAgreement answers one question: mapped into a single MSA frame,
-// do all the member reads' SNP bases land in the SAME column? That is the
-// homology check the pairwise CIGAR pass cannot make, so the coordinate walk
-// -- offsets count NON-GAP entries, columns include gaps -- is the part worth
-// pinning down. These build the matrix by hand; no abPOA, no Assembler.
+// verifyColumnAgreement answers three questions the pairwise CIGAR pass cannot:
+// do the members' SNP bases land in the same COLUMN (homology), is that column
+// BIALLELIC (a real variant), and does its read split match the ARM split the
+// CIGAR pass assigned (usable for phasing). The coordinate walk -- offsets
+// count NON-GAP entries, columns include gaps -- and the arm bijection are
+// where this gets silently wrong, so both are pinned here on hand-built
+// matrices. No abPOA, no Assembler.
 
 #include "../external/catch2/catch.hpp"
 
@@ -18,7 +20,8 @@ using namespace dinara;
 namespace {
 
 constexpr uint8_t A = 0, C = 1, G = 2, T = 3;
-constexpr uint8_t gap = 5;   // abPOA's gap value for a 5-letter alphabet.
+constexpr uint8_t gap = 5;       // abPOA's gap value for a 5-letter alphabet.
+constexpr uint32_t minPlaced = 4;
 
 // Build a row-pointer view over hand-written rows, as abPOA hands them over.
 class Matrix {
@@ -35,6 +38,15 @@ public:
     int len() const { return rows.empty() ? 0 : int(rows[0].size()); }
 };
 
+MsaSiteVerdict run(const Matrix& m,
+    const std::vector<uint32_t>& offsets,
+    const std::vector<uint8_t>& arms,
+    double minAgreement = 0.9)
+{
+    return verifyColumnAgreement(
+        m.data(), m.nSeq(), m.len(), gap, offsets, arms, minAgreement, minPlaced);
+}
+
 } // namespace
 
 
@@ -42,17 +54,16 @@ public:
 TEST_CASE("MSA verification confirms a site whose members share one column",
           "[msahet]")
 {
-    // Four ungapped rows, SNP at offset 2 in every one. Two carry G, two T --
-    // a clean biallelic column.
+    // Four ungapped rows, SNP at offset 2 in every one. Two carry G, two T, and
+    // the arms agree with the bases -- a clean biallelic column.
     Matrix m({
         {A, C, G, T, A},
         {A, C, G, T, A},
         {A, C, T, T, A},
         {A, C, T, T, A},
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2}, {0, 0, 1, 1});
 
     CHECK(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::ok);
@@ -60,6 +71,8 @@ TEST_CASE("MSA verification confirms a site whose members share one column",
     CHECK(v.agreeing == 4);
     CHECK(v.total == 4);
     CHECK(v.allelesAtColumn == 2);
+    CHECK(v.partitionAgreeing == 4);
+    CHECK(v.partitionTotal == 4);
 }
 
 
@@ -76,9 +89,8 @@ TEST_CASE("MSA verification rejects a site whose members land in different colum
         {A, gap, C, T, A},
         {A, gap, C, T, A},
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2}, {0, 0, 1, 1});
 
     CHECK_FALSE(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::columnsDisagree);
@@ -100,9 +112,10 @@ TEST_CASE("MSA verification tolerates a minority landing elsewhere", "[msahet]")
         {A, gap, C, T, A},
     });
     const std::vector<uint32_t> offsets{2, 2, 2, 2, 2};
+    const std::vector<uint8_t> arms{0, 0, 1, 1, 1};
 
-    CHECK(verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.75).verified);
-    CHECK_FALSE(verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9).verified);
+    CHECK(run(m, offsets, arms, 0.75).verified);
+    CHECK_FALSE(run(m, offsets, arms, 0.9).verified);
 }
 
 
@@ -110,15 +123,16 @@ TEST_CASE("MSA verification rejects a column that is not biallelic", "[msahet]")
 {
     // Every member agrees on the column AND on the base. Under the MSA this is
     // not a het site at all -- the pairwise disagreement was misplacement.
+    // Measured on E821 this is the largest rejection class, and the one that
+    // was corrupting phasing.
     Matrix m({
         {A, C, G, T, A},
         {A, C, G, T, A},
         {A, C, G, T, A},
         {A, C, G, T, A},
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2}, {0, 0, 1, 1});
 
     CHECK_FALSE(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::notBiallelic);
@@ -138,13 +152,58 @@ TEST_CASE("MSA verification needs two reads supporting each allele", "[msahet]")
         {A, C, G, T, A},
         {A, C, T, T, A},
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2}, {0, 0, 0, 1});
 
     CHECK_FALSE(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::notBiallelic);
     CHECK(v.allelesAtColumn == 1);
+}
+
+
+TEST_CASE("MSA verification rejects a column that splits reads unlike the arms",
+          "[msahet]")
+{
+    // Biallelic, one column, every member placed -- and still useless. The MSA
+    // says {row0,row1} carry G and {row2,row3} carry T, while the CIGAR pass
+    // put row0 and row2 in one arm. Both partitions cannot be right, and
+    // phasing consumes the arms at face value, so this site is worse than none.
+    Matrix m({
+        {A, C, G, T, A},
+        {A, C, G, T, A},
+        {A, C, T, T, A},
+        {A, C, T, T, A},
+    });
+
+    const auto v = run(m, {2, 2, 2, 2}, {0, 1, 0, 1});
+
+    CHECK_FALSE(v.verified);
+    CHECK(v.reason == MsaSiteVerdict::Reason::partitionMismatch);
+    CHECK(v.allelesAtColumn == 2);        // it IS biallelic
+    CHECK(v.partitionAgreeing == 2);      // 2 of 4 either way round
+    CHECK(v.partitionTotal == 4);
+}
+
+
+TEST_CASE("MSA verification accepts a partition whose arm labels are swapped",
+          "[msahet]")
+{
+    // Arm 0 vs arm 1 is a label, not an identity: the detector's arm order
+    // carries no meaning. Only the SPLIT has to match, so the check scores both
+    // bijections and takes the better. Rejecting this would throw away half of
+    // all correct sites.
+    Matrix m({
+        {A, C, G, T, A},
+        {A, C, G, T, A},
+        {A, C, T, T, A},
+        {A, C, T, T, A},
+    });
+
+    const auto v = run(m, {2, 2, 2, 2}, {1, 1, 0, 0});
+
+    CHECK(v.verified);
+    CHECK(v.partitionAgreeing == 4);
+    CHECK(v.partitionTotal == 4);
 }
 
 
@@ -159,9 +218,8 @@ TEST_CASE("MSA verification counts offsets in non-gap entries, not columns",
         {gap, gap, A, C, T, T},
         {gap, gap, A, C, T, T},
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2};   // third base = G/T
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2}, {0, 0, 1, 1});   // third base = G/T
 
     CHECK(v.verified);
     CHECK(v.column == 4);        // not 2: two leading gap columns
@@ -183,9 +241,8 @@ TEST_CASE("MSA verification ignores a row whose sequence is too short", "[msahet
         {A, C, T, T, A},
         {A, gap, gap, gap, gap},   // one base only; offset 2 unreachable
     });
-    const std::vector<uint32_t> offsets{2, 2, 2, 2, 2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2, 2, 2, 2, 2}, {0, 0, 1, 1, 1});
 
     CHECK(v.total == 4);         // the short row did not place
     CHECK(v.agreeing == 4);
@@ -193,12 +250,30 @@ TEST_CASE("MSA verification ignores a row whose sequence is too short", "[msahet
 }
 
 
+TEST_CASE("MSA verification refuses too few placed rows", "[msahet]")
+{
+    // Two alleles need >= 2 rows each, so under four placed rows the biallelic
+    // and partition tests can only pass or fail for want of evidence. Three
+    // perfectly consistent rows are still not enough to conclude anything.
+    Matrix m({
+        {A, C, G, T, A},
+        {A, C, G, T, A},
+        {A, C, T, T, A},
+    });
+
+    const auto v = run(m, {2, 2, 2}, {0, 0, 1});
+
+    CHECK_FALSE(v.verified);
+    CHECK(v.reason == MsaSiteVerdict::Reason::tooFewMembers);
+    CHECK(v.total == 3);
+}
+
+
 TEST_CASE("MSA verification refuses fewer than two rows", "[msahet]")
 {
     Matrix m({{A, C, G, T, A}});
-    const std::vector<uint32_t> offsets{2};
 
-    const auto v = verifyColumnAgreement(m.data(), m.nSeq(), m.len(), gap, offsets, 0.9);
+    const auto v = run(m, {2}, {0});
 
     CHECK_FALSE(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::tooFewMembers);

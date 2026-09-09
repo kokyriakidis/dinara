@@ -1,20 +1,37 @@
 #include "HetSiteMsaVerification.hpp"
 
 #include "Reads.hpp"
-#include "timestamp.hpp"
 
 #include "abpoa/abpoa.h"
 
 #include <algorithm>
-#include <atomic>
-#include <iostream>
-#include <mutex>
+#include <array>
+#include <limits>
 #include <thread>
 #include <unordered_map>
 
 using namespace dinara;
-using std::cout;
-using std::endl;
+
+// Below this many placed rows the biallelic and partition tests have too little
+// to work with: two alleles need >= 2 rows each, so anything under 4 can only
+// ever fail or pass for want of evidence rather than on the evidence.
+static constexpr uint32_t defaultMinPlacedRows = 4;
+
+
+
+const char* dinara::msaVerdictReasonName(MsaSiteVerdict::Reason reason)
+{
+    switch(reason) {
+    case MsaSiteVerdict::Reason::ok:                return "confirmed";
+    case MsaSiteVerdict::Reason::noSharedAnchors:   return "no shared bracketing anchors";
+    case MsaSiteVerdict::Reason::tooFewMembers:     return "too few members placed";
+    case MsaSiteVerdict::Reason::msaFailed:         return "MSA failed";
+    case MsaSiteVerdict::Reason::columnsDisagree:   return "members landed in different columns";
+    case MsaSiteVerdict::Reason::notBiallelic:      return "agreed column not biallelic";
+    case MsaSiteVerdict::Reason::partitionMismatch: return "column splits reads differently than the arms";
+    }
+    return "unknown";
+}
 
 
 
@@ -28,18 +45,22 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
     int msaLen,
     int gapValue,
     const vector<uint32_t>& snpOffsetInRow,
-    double minAgreementFraction)
+    const vector<uint8_t>& armOfRow,
+    double minAgreementFraction,
+    uint32_t minPlacedRows)
 {
     MsaSiteVerdict verdict;
-    if(nSeq < 2 || msaLen <= 0 || int(snpOffsetInRow.size()) != nSeq) {
+    if(nSeq < 2 || msaLen <= 0 ||
+        int(snpOffsetInRow.size()) != nSeq || int(armOfRow.size()) != nSeq) {
         verdict.reason = MsaSiteVerdict::Reason::tooFewMembers;
         return verdict;
     }
 
-    // Walk each row, counting non-gap entries, to find the column holding that
+    // Walk each row, counting NON-GAP entries, to find the column holding that
     // row's SNP base. A row whose sequence is shorter than its recorded offset
-    // (possible if the interval was clipped) simply does not vote.
+    // (the interval clipped it) simply does not place, and does not vote.
     vector<int> columnOfRow(nSeq, -1);
+    uint32_t placed = 0;
     for(int row = 0; row < nSeq; row++) {
         uint32_t seen = 0;
         for(int c = 0; c < msaLen; c++) {
@@ -48,10 +69,17 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
             }
             if(seen == snpOffsetInRow[size_t(row)]) {
                 columnOfRow[size_t(row)] = c;
+                ++placed;
                 break;
             }
             ++seen;
         }
+    }
+    verdict.total = placed;
+
+    if(placed < minPlacedRows) {
+        verdict.reason = MsaSiteVerdict::Reason::tooFewMembers;
+        return verdict;
     }
 
     // Majority column among the rows that placed.
@@ -60,10 +88,6 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
         if(c >= 0) {
             ++votes[c];
         }
-    }
-    if(votes.empty()) {
-        verdict.reason = MsaSiteVerdict::Reason::msaFailed;
-        return verdict;
     }
     int bestColumn = -1;
     uint32_t bestVotes = 0;
@@ -75,43 +99,79 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
             bestColumn = c;
         }
     }
-
-    uint32_t placed = 0;
-    for(const int c : columnOfRow) {
-        if(c >= 0) {
-            ++placed;
-        }
-    }
-
     verdict.column = bestColumn;
     verdict.agreeing = bestVotes;
-    verdict.total = placed;
 
     if(double(bestVotes) < minAgreementFraction * double(placed)) {
         verdict.reason = MsaSiteVerdict::Reason::columnsDisagree;
         return verdict;
     }
 
-    // The agreed column must still look het: at least two distinct bases with
-    // at least 2 supporting rows. A column that collapses to one allele under
-    // the MSA is exactly the artifact this pass exists to catch.
-    uint32_t baseCount[4] = {0, 0, 0, 0};
+    // The agreed column must still look het. Only rows that PLACED vote here:
+    // a row whose SNP base sits elsewhere is not evidence about this column,
+    // and counting it was letting clipped rows tip the allele census.
+    std::array<uint32_t, 4> baseCount{0, 0, 0, 0};
     for(int row = 0; row < nSeq; row++) {
+        if(columnOfRow[size_t(row)] < 0) {
+            continue;
+        }
         const uint8_t v = msa[row][bestColumn];
         if(int(v) == gapValue || v >= 4) {
             continue;
         }
         ++baseCount[v];
     }
-    uint32_t alleles = 0;
-    for(const uint32_t n : baseCount) {
-        if(n >= 2) {
-            ++alleles;
+    // The two best-supported bases, each needing >= 2 rows.
+    int allele0 = -1, allele1 = -1;
+    for(int b = 0; b < 4; b++) {
+        if(baseCount[size_t(b)] < 2) {
+            continue;
+        }
+        if(allele0 < 0 || baseCount[size_t(b)] > baseCount[size_t(allele0)]) {
+            allele1 = allele0;
+            allele0 = b;
+        } else if(allele1 < 0 || baseCount[size_t(b)] > baseCount[size_t(allele1)]) {
+            allele1 = b;
         }
     }
-    verdict.allelesAtColumn = alleles;
-    if(alleles < 2) {
+    verdict.allelesAtColumn = uint32_t((allele0 >= 0 ? 1 : 0) + (allele1 >= 0 ? 1 : 0));
+    if(allele1 < 0) {
         verdict.reason = MsaSiteVerdict::Reason::notBiallelic;
+        return verdict;
+    }
+
+    // Does the column split the reads the same way the ARMS do? Both arms can
+    // be biallelic and still disagree about which reads carry which allele, and
+    // phasing consumes the partition, not the allele count. Score both possible
+    // arm->allele bijections and take the better one.
+    std::array<std::array<uint32_t, 2>, 2> table{};   // [arm][alleleIndex]
+    for(int row = 0; row < nSeq; row++) {
+        if(columnOfRow[size_t(row)] < 0) {
+            continue;
+        }
+        const uint8_t arm = armOfRow[size_t(row)];
+        if(arm > 1) {
+            continue;                       // only the two main arms vote
+        }
+        const uint8_t v = msa[row][bestColumn];
+        if(int(v) == allele0) {
+            ++table[arm][0];
+        } else if(int(v) == allele1) {
+            ++table[arm][1];
+        }
+    }
+    const uint32_t straight = table[0][0] + table[1][1];
+    const uint32_t swapped  = table[0][1] + table[1][0];
+    verdict.partitionAgreeing = std::max(straight, swapped);
+    verdict.partitionTotal =
+        table[0][0] + table[0][1] + table[1][0] + table[1][1];
+    if(verdict.partitionTotal < minPlacedRows) {
+        verdict.reason = MsaSiteVerdict::Reason::tooFewMembers;
+        return verdict;
+    }
+    if(double(verdict.partitionAgreeing) <
+        minAgreementFraction * double(verdict.partitionTotal)) {
+        verdict.reason = MsaSiteVerdict::Reason::partitionMismatch;
         return verdict;
     }
 
@@ -151,51 +211,43 @@ AnchorPositions buildAnchorPositions(
     return byOrientedRead;
 }
 
-// Anchor ids within [position - flank, position) on this oriented read.
-void anchorsBefore(
-    const vector<std::pair<uint32_t, Shasta2AnchorId>>& sorted,
-    uint32_t position, uint32_t flank,
-    vector<Shasta2AnchorId>& out)
-{
-    out.clear();
-    const uint32_t low = (position > flank) ? (position - flank) : 0u;
-    auto it = std::lower_bound(sorted.begin(), sorted.end(),
-        std::make_pair(low, Shasta2AnchorId(0)));
-    for(; it != sorted.end() && it->first < position; ++it) {
-        out.push_back(it->second);
-    }
-}
+// One candidate bounding anchor, accumulated across the members that carry it.
+class Candidate {
+public:
+    uint32_t votes = 0;
+    uint64_t distanceSum = 0;   // summed |anchor position - SNP position|
+};
 
-// Anchor ids within (position, position + flank] on this oriented read.
-void anchorsAfter(
-    const vector<std::pair<uint32_t, Shasta2AnchorId>>& sorted,
-    uint32_t position, uint32_t flank,
-    vector<Shasta2AnchorId>& out)
+// Rank candidates: most members first, then closest to the SNP (a tighter
+// interval is a cheaper alignment and gives ambiguity less room), then smallest
+// id so the choice never depends on hash order.
+Shasta2AnchorId pickBoundingAnchor(
+    const std::unordered_map<Shasta2AnchorId, Candidate>& candidates)
 {
-    out.clear();
-    auto it = std::upper_bound(sorted.begin(), sorted.end(),
-        std::make_pair(position, std::numeric_limits<Shasta2AnchorId>::max()));
-    for(; it != sorted.end() && it->first <= position + flank; ++it) {
-        out.push_back(it->second);
-    }
-}
-
-// Position of anchorId on this oriented read, or invalid if absent.
-bool positionOf(
-    const vector<std::pair<uint32_t, Shasta2AnchorId>>& sorted,
-    Shasta2AnchorId anchorId, uint32_t& positionOut)
-{
-    for(const auto& [position, id] : sorted) {
-        if(id == anchorId) {
-            positionOut = position;
-            return true;
+    Shasta2AnchorId best = 0;
+    const Candidate* bestCandidate = nullptr;
+    for(const auto& [id, candidate] : candidates) {
+        if(bestCandidate == nullptr) {
+            best = id; bestCandidate = &candidate; continue;
         }
+        if(candidate.votes != bestCandidate->votes) {
+            if(candidate.votes > bestCandidate->votes) { best = id; bestCandidate = &candidate; }
+            continue;
+        }
+        // Compare mean distance without dividing: a*d2 < b*d1 <=> d1/v1 < d2/v2.
+        const uint64_t lhs = candidate.distanceSum * uint64_t(bestCandidate->votes);
+        const uint64_t rhs = bestCandidate->distanceSum * uint64_t(candidate.votes);
+        if(lhs != rhs) {
+            if(lhs < rhs) { best = id; bestCandidate = &candidate; }
+            continue;
+        }
+        if(id < best) { best = id; bestCandidate = &candidate; }
     }
-    return false;
+    return best;
 }
 
-// Run abPOA over `sequences` (each already 0..3 encoded, oriented) and hand the
-// row-major MSA matrix to `consume`. Returns false if abPOA produced nothing.
+// Run abPOA over `sequences` (0..3 encoded, all in the same orientation) and
+// hand the row-major MSA matrix to `consume`. False if abPOA produced nothing.
 template<class Consume>
 bool runMsa(const vector<vector<uint8_t>>& sequences, Consume&& consume)
 {
@@ -263,8 +315,9 @@ uint64_t dinara::msaVerifyHetSites(
         buildAnchorPositions(anchors, orientedReadCount);
 
     vector<uint8_t> keep(sites.size(), 1);
-    const uint64_t reasonCount = 6;
-    vector<vector<uint64_t>> reasonsByThread(threadCount, vector<uint64_t>(reasonCount, 0));
+    const uint64_t reasonCount = MsaSiteVerdict::reasonCount;
+    vector<vector<uint64_t>> reasonsByThread(
+        threadCount, vector<uint64_t>(reasonCount, 0));
 
     const uint64_t chunk = (sites.size() + threadCount - 1) / threadCount;
     vector<std::thread> threads;
@@ -276,81 +329,95 @@ uint64_t dinara::msaVerifyHetSites(
             vector<uint64_t>& reasons = reasonsByThread[t];
 
             // Hoisted scratch: this loop runs tens of thousands of times.
-            vector<Shasta2AnchorId> before, after;
-            std::unordered_map<Shasta2AnchorId, uint32_t> leftVotes, rightVotes;
+            std::unordered_map<Shasta2AnchorId, Candidate> leftCandidates, rightCandidates;
+            // Per member, the positions of the candidate anchors on THAT read,
+            // so the extraction pass never rescans the read's anchor list.
+            vector<std::unordered_map<Shasta2AnchorId, uint32_t>> positionsByMember;
             vector<std::pair<OrientedReadId, uint32_t>> members;
+            vector<uint8_t> armOfMember;
             vector<vector<uint8_t>> sequences;
             vector<uint32_t> snpOffset;
+            vector<uint8_t> armOfRow;
 
             for(uint64_t siteIndex = begin; siteIndex < end; siteIndex++) {
                 const Assembler::CigarSnpSite& site = sites[siteIndex];
 
+                // Flatten the arms, remembering which arm each member came
+                // from: that assignment is what the partition check verifies.
                 members.clear();
-                for(const auto& allele : site.alleles) {
-                    for(const auto& m : allele) {
+                armOfMember.clear();
+                for(uint64_t arm = 0; arm < site.alleles.size(); arm++) {
+                    for(const auto& m : site.alleles[arm]) {
                         members.push_back(m);
+                        armOfMember.push_back(uint8_t(std::min<uint64_t>(arm, 255)));
                     }
                 }
-                if(members.size() < 2) {
+                if(members.size() < defaultMinPlacedRows) {
                     keep[siteIndex] = 0;
                     ++reasons[uint64_t(MsaSiteVerdict::Reason::tooFewMembers)];
                     continue;
                 }
 
-                // Anchors bracketing the SNP, chosen by QUORUM rather than
-                // by unanimity. Requiring every member to share both bounds
-                // sounds safer but is not: one read missing one anchor empties
-                // the intersection, and measured on E821 that rejected 4207 of
-                // 4542 sites for "no shared anchors" while only ONE site
-                // actually failed the homology test. That measures the
-                // requirement, not the data. So take the anchor each side that
-                // the most members carry; members lacking it simply do not
-                // participate, exactly like a read clipped by the interval.
-                leftVotes.clear();
-                rightVotes.clear();
+                // Candidate bounding anchors, gathered by QUORUM rather than by
+                // unanimity. Requiring every member to share both bounds sounds
+                // safer but is not: one read missing one anchor empties the
+                // intersection, and measured on E821 that rejected 4207 of 4542
+                // sites for "no shared anchors" while exactly ONE failed the
+                // homology test -- it measured the requirement, not the data.
+                // Members lacking the chosen bounds simply do not participate,
+                // exactly like a read clipped by the interval.
+                leftCandidates.clear();
+                rightCandidates.clear();
+                positionsByMember.assign(members.size(), {});
                 bool viable = true;
-                for(const auto& [orientedReadId, position] : members) {
+                for(uint64_t i = 0; i < members.size(); i++) {
+                    const auto& [orientedReadId, position] = members[i];
                     const uint64_t v = orientedReadId.getValue();
                     if(v >= orientedReadCount) { viable = false; break; }
                     const auto& sorted = anchorPositions[v];
-                    anchorsBefore(sorted, position, flankBases, before);
-                    anchorsAfter(sorted, position, flankBases, after);
-                    for(const Shasta2AnchorId id : before) ++leftVotes[id];
-                    for(const Shasta2AnchorId id : after) ++rightVotes[id];
+
+                    const uint32_t low = (position > flankBases) ? (position - flankBases) : 0u;
+                    auto it = std::lower_bound(sorted.begin(), sorted.end(),
+                        std::make_pair(low, Shasta2AnchorId(0)));
+                    for(; it != sorted.end() && it->first <= position + flankBases; ++it) {
+                        const uint32_t anchorPosition = it->first;
+                        const Shasta2AnchorId id = it->second;
+                        // Record the position on THIS read once, so extraction
+                        // below is a hash lookup instead of a linear rescan.
+                        positionsByMember[i].emplace(id, anchorPosition);
+                        if(anchorPosition < position) {
+                            Candidate& c = leftCandidates[id];
+                            ++c.votes;
+                            c.distanceSum += position - anchorPosition;
+                        } else if(anchorPosition > position) {
+                            Candidate& c = rightCandidates[id];
+                            ++c.votes;
+                            c.distanceSum += anchorPosition - position;
+                        }
+                    }
                 }
-                if(!viable || leftVotes.empty() || rightVotes.empty()) {
+                if(!viable || leftCandidates.empty() || rightCandidates.empty()) {
                     keep[siteIndex] = 0;
                     ++reasons[uint64_t(MsaSiteVerdict::Reason::noSharedAnchors)];
                     continue;
                 }
 
-                // Most-carried anchor on each side, ties broken on the smaller
-                // id so the choice does not depend on hash order.
-                const auto pickBest = [](
-                    const std::unordered_map<Shasta2AnchorId, uint32_t>& votes)
-                {
-                    Shasta2AnchorId best = 0;
-                    uint32_t bestVotes = 0;
-                    bool have = false;
-                    for(const auto& [id, n] : votes) {
-                        if(!have || n > bestVotes || (n == bestVotes && id < best)) {
-                            best = id; bestVotes = n; have = true;
-                        }
-                    }
-                    return best;
-                };
-                const Shasta2AnchorId leftAnchor = pickBest(leftVotes);
-                const Shasta2AnchorId rightAnchor = pickBest(rightVotes);
+                const Shasta2AnchorId leftAnchor = pickBoundingAnchor(leftCandidates);
+                const Shasta2AnchorId rightAnchor = pickBoundingAnchor(rightCandidates);
 
-                // Extract each member's substring between those anchors, and
-                // where its SNP base sits inside it.
+                // Extract each member's substring between those anchors, where
+                // its SNP base sits inside it, and which arm it belongs to.
                 sequences.clear();
                 snpOffset.clear();
-                for(const auto& [orientedReadId, position] : members) {
-                    const auto& sorted = anchorPositions[orientedReadId.getValue()];
-                    uint32_t leftPos = 0, rightPos = 0;
-                    if(!positionOf(sorted, leftAnchor, leftPos)) continue;
-                    if(!positionOf(sorted, rightAnchor, rightPos)) continue;
+                armOfRow.clear();
+                for(uint64_t i = 0; i < members.size(); i++) {
+                    const auto& [orientedReadId, position] = members[i];
+                    const auto& byId = positionsByMember[i];
+                    const auto leftIt = byId.find(leftAnchor);
+                    const auto rightIt = byId.find(rightAnchor);
+                    if(leftIt == byId.end() || rightIt == byId.end()) continue;
+                    const uint32_t leftPos = leftIt->second;
+                    const uint32_t rightPos = rightIt->second;
                     if(!(leftPos <= position && position < rightPos)) continue;
 
                     vector<uint8_t> seq;
@@ -360,9 +427,10 @@ uint64_t dinara::msaVerifyHetSites(
                             reads.getOrientedReadBase(orientedReadId, p).value));
                     }
                     snpOffset.push_back(position - leftPos);
+                    armOfRow.push_back(armOfMember[i]);
                     sequences.push_back(std::move(seq));
                 }
-                if(sequences.size() < 2) {
+                if(sequences.size() < defaultMinPlacedRows) {
                     keep[siteIndex] = 0;
                     ++reasons[uint64_t(MsaSiteVerdict::Reason::tooFewMembers)];
                     continue;
@@ -372,8 +440,8 @@ uint64_t dinara::msaVerifyHetSites(
                 const bool ran = runMsa(sequences,
                     [&](uint8_t** msa, int nSeq, int msaLen, int gapValue) {
                         verdict = verifyColumnAgreement(
-                            msa, nSeq, msaLen, gapValue, snpOffset,
-                            minAgreementFraction);
+                            msa, nSeq, msaLen, gapValue, snpOffset, armOfRow,
+                            minAgreementFraction, defaultMinPlacedRows);
                     });
                 if(!ran) {
                     keep[siteIndex] = 0;
