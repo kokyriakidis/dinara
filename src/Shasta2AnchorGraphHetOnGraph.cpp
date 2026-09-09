@@ -69,7 +69,7 @@
 #include "Reads.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
-#include "WindowIntervalPoa.hpp"   // IpoaAbHandle
+#include "AbpoaHandle.hpp"
 
 #include <boost/graph/iteration_macros.hpp>
 #include <boost/math/distributions/binomial.hpp>

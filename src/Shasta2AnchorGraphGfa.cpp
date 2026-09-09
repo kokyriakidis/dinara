@@ -11,8 +11,7 @@
 using namespace dinara;
 using namespace std;
 
-void Shasta2AnchorGraph::writeGfa(const string& fileName,
-                                  const vector<AnchorWindow>* anchorWindows) const
+void Shasta2AnchorGraph::writeGfa(const string& fileName) const
 {
     ofstream gfa(fileName);
     if(!gfa) {

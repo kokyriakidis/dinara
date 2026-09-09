@@ -2,9 +2,7 @@
 
 // Shasta2AnchorGraph.hpp
 
-#include "AnchorWindows.hpp"
 
-#include "DinaraDetangle.hpp"
 #include "Reads.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
@@ -167,24 +165,6 @@ public:
         uint64_t minEdgeCoverage,
         uint64_t threadCount);
 
-
-    // Construct from anchor windows: each window becomes a chain of its
-    // backbone anchors, and inter-window edges are discovered by walking
-    // read journeys.
-    // If bypassEdges is provided, additional edges are created to bypass
-    // detangled windows.
-    Shasta2AnchorGraph(
-        const Shasta2Anchors&,
-        const Shasta2Journeys&,
-        const vector<AnchorWindow>& anchorWindows,
-        uint64_t minInterWindowCoverage,
-        uint64_t minInterWindowEdgeCoverage,
-        uint64_t threadCount,
-        const Reads* reads = nullptr,
-        const vector<DetangleBypassEdge>* bypassEdges = nullptr,
-        const std::set<std::pair<uint32_t, uint32_t>>* detourWindowPairs = nullptr,
-        const vector<uint32_t>* anchorDovetailWindow = nullptr);
-
     // Default constructor (empty graph).
     Shasta2AnchorGraph() : MultithreadedObject<Shasta2AnchorGraph>(*this) {}
 
@@ -247,19 +227,6 @@ public:
     // Disable an edge and its RC mirror (dst^1 -> src^1).
     void disableEdge(edge_descriptor e);
 
-    // Find detour window pairs: (W, X) where window X enters W at
-    // backbone position i and exits at position j > i. These pairs
-    // are used during journey walks to suppress W→X→W transitions.
-    std::set<std::pair<uint32_t, uint32_t>> findDetourWindowPairs(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys) const;
-
-    // Trim dangling backbone ends beyond outermost inter-window edges.
-    // Returns the number of trimmed vertices.
-    uint64_t trimBackbones(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys);
-
     // Remove het/hom allele-arm tips: het/hom anchors (id >= hetAnchorFirstId)
     // that end up with active edges on only one side. The staging guarantees
     // every arm is hom-flanked on both sides, but addHetEdge can drop one of an
@@ -272,69 +239,12 @@ public:
     // disabled.
     uint64_t removeHetArmTips(const Shasta2Anchors& anchors);
 
-    // General anchor-graph tip remover (safety net). Iteratively disables edges
-    // incident to interior tip vertices -- vertices with active edges on only
-    // one side that are NOT legitimate boundaries. A het/hom anchor is always
-    // interior (must be two-sided), so any one-sided het/hom anchor is a tip. A
-    // backbone/primary anchor is exempt when it is a window backbone endpoint
-    // (first/last backbone anchor of its window; a real contig/telomere end) or
-    // has an inter-window edge (a real contig junction) or carries no window
-    // mapping. Interior backbone anchors that go one-sided are dangling stubs
-    // and are removed. Complements removeHetArmTips; run after it before export.
-    // Returns the number of edges disabled.
-    uint64_t removeAnchorGraphTips(
-        const Shasta2Anchors& anchors,
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys);
-
-    // Remove inter-window edges that land internally on a window's backbone
-    // (between the first and last inter-window connection points).
-    // For reads traversing internal connections, create bypass edges that
-    // skip the internal windows. Returns the number of edges removed.
-    uint64_t removeInternalConnections(
-        const Shasta2Anchors& anchors,
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys);
-
     // Remove edges between a window and its RC counterpart.
     uint64_t removeRcWindowConnections();
 
     // Window-level transitive reduction: if A→B→C exists and A→C also exists,
     // remove A→C (the direct edge is redundant).
     uint64_t windowTransitiveReduction();
-
-    // Dump detailed connection statistics for the largest window.
-    void writeWindowConnectionStats(
-        const Shasta2Anchors& anchors,
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys) const;
-
-    // Disable all edges of windows that have no active inter-window edges.
-    // Returns the number of isolated windows removed.
-    uint64_t removeIsolatedWindows(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys);
-
-    // Remove short tip chains from the window graph.
-    // A tip is a dead-end linear chain of windows (connected on only one side).
-    // Chains of length <= maxTipWindows are removed (all their edges disabled).
-    // This mirrors hifiasm's asg_arc_cut_tips: short tips are artifacts,
-    // long tips are legitimate subregion ends.
-    // Returns the number of windows removed.
-    uint64_t removeTipWindows(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys,
-        uint32_t maxTipWindows = 3);
-
-    // Pop superbubbles: find superbubbles in the active-edge subgraph,
-    // choose the best path through each (prefer the source window's
-    // backbone path), and disable edges on all other paths.
-    // maxSize limits the number of internal vertices per superbubble.
-    // Returns the number of superbubbles popped.
-    uint64_t popSuperbubbles(
-        const vector<AnchorWindow>& anchorWindows,
-        const Shasta2Journeys& journeys,
-        uint64_t maxSize = 100);
 
 private:
     bool transitiveReductionCanRemove(edge_descriptor, uint64_t transitiveReductionMaxDistance) const;
@@ -355,13 +265,9 @@ public:
     void load(const string& name);
 
     // Write the graph to GFA format.
-    // If anchorWindows is provided, each link line gets a tp:Z: tag
+    void writeGfa(const string& fileName) const;
 
-    // classifying it as "intra", "endpoint", or "internal".
-    void writeGfa(const string& fileName,
-                  const vector<AnchorWindow>* anchorWindows = nullptr) const;
-
-    // Write Bandage color CSV: each anchor colored by its window.
+    // Write Bandage color CSV.
     void writeCsv(const string& fileName) const;
 
     // Save binary data (dinara's own format).
