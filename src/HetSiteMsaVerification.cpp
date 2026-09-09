@@ -1,10 +1,15 @@
 #include "HetSiteMsaVerification.hpp"
 
 #include "Reads.hpp"
+#include "span.hpp"
+#include "performanceLog.hpp"
+#include "timestamp.hpp"
 
 #include "abpoa/abpoa.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <limits>
 #include <thread>
@@ -188,27 +193,112 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
 
 namespace {
 
-// (position, anchorId) per oriented read, ascending by position. Built once and
-// shared by every thread.
-using AnchorPositions = vector<vector<std::pair<uint32_t, Shasta2AnchorId>>>;
+// The anchor index: for each oriented read, its anchors as (position,
+// anchorId) ascending by position, stored as a flat CSR rather than a vector
+// per read.
+//
+// This is the expensive half of the pass and it does NOT scale with the number
+// of sites -- it walks every anchor member in the assembly (16M on a 6 Mb
+// fixture), so on a large genome it grows with the genome while the
+// verification itself grows only with the site count. Measured single-threaded
+// it was 0.52 s of a 1.12 s pass, so it runs on every thread: a counting pass
+// sizes each read's slice exactly, a fill pass scatters into it, and the
+// per-read sorts are independent.
+class AnchorIndex {
+public:
+    vector<uint64_t> begin_;                                  // size n+1
+    vector<std::pair<uint32_t, Shasta2AnchorId>> data_;
 
-AnchorPositions buildAnchorPositions(
-    const Shasta2Anchors& anchors, uint64_t orientedReadCount)
+    span<const std::pair<uint32_t, Shasta2AnchorId>> operator[](uint64_t v) const
+    {
+        return span<const std::pair<uint32_t, Shasta2AnchorId>>(
+            data_.data() + begin_[v], data_.data() + begin_[v + 1]);
+    }
+};
+
+AnchorIndex buildAnchorIndex(
+    const Shasta2Anchors& anchors, uint64_t orientedReadCount, uint64_t threadCount)
 {
-    AnchorPositions byOrientedRead(orientedReadCount);
+    AnchorIndex index;
+    index.begin_.assign(orientedReadCount + 1, 0);
     const uint64_t anchorCount = anchors.size();
-    for(Shasta2AnchorId id = 0; id < anchorCount; id++) {
-        for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
-            const uint64_t v = mi.orientedReadId.getValue();
-            if(v < orientedReadCount) {
-                byOrientedRead[v].push_back({mi.position, id});
-            }
+
+    const auto runOverAnchors = [&](auto&& body) {
+        const uint64_t chunk = (anchorCount + threadCount - 1) / threadCount;
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                body(t * chunk, std::min(anchorCount, (t + 1) * chunk));
+            });
         }
+        for(std::thread& thread : threads) thread.join();
+    };
+
+    // Counting pass. One relaxed atomic per oriented read: O(orientedReadCount)
+    // rather than O(threadCount * orientedReadCount), which matters once the
+    // read count is large.
+    {
+        vector<std::atomic<uint64_t>> counts(orientedReadCount);
+        for(std::atomic<uint64_t>& c : counts) c.store(0, std::memory_order_relaxed);
+        runOverAnchors([&](uint64_t begin, uint64_t end) {
+            for(Shasta2AnchorId id = begin; id < end; id++) {
+                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
+                    const uint64_t v = mi.orientedReadId.getValue();
+                    if(v < orientedReadCount) {
+                        counts[v].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        });
+        uint64_t total = 0;
+        for(uint64_t v = 0; v < orientedReadCount; v++) {
+            index.begin_[v] = total;
+            total += counts[v].load(std::memory_order_relaxed);
+        }
+        index.begin_[orientedReadCount] = total;
+        index.data_.resize(total);
     }
-    for(auto& v : byOrientedRead) {
-        std::sort(v.begin(), v.end());
+
+    // Fill pass. Entries land inside a read's slice in nondeterministic order,
+    // which does not matter: the slice is sorted immediately afterwards.
+    {
+        vector<std::atomic<uint64_t>> cursor(orientedReadCount);
+        for(uint64_t v = 0; v < orientedReadCount; v++) {
+            cursor[v].store(index.begin_[v], std::memory_order_relaxed);
+        }
+        runOverAnchors([&](uint64_t begin, uint64_t end) {
+            for(Shasta2AnchorId id = begin; id < end; id++) {
+                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
+                    const uint64_t v = mi.orientedReadId.getValue();
+                    if(v < orientedReadCount) {
+                        index.data_[cursor[v].fetch_add(1, std::memory_order_relaxed)] =
+                            {mi.position, id};
+                    }
+                }
+            }
+        });
     }
-    return byOrientedRead;
+
+    // Sort each read's slice; reads are independent.
+    {
+        const uint64_t chunk = (orientedReadCount + threadCount - 1) / threadCount;
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                const uint64_t begin = t * chunk;
+                const uint64_t end = std::min(orientedReadCount, (t + 1) * chunk);
+                for(uint64_t v = begin; v < end; v++) {
+                    std::sort(index.data_.data() + index.begin_[v],
+                              index.data_.data() + index.begin_[v + 1]);
+                }
+            });
+        }
+        for(std::thread& thread : threads) thread.join();
+    }
+
+    return index;
 }
 
 // One candidate bounding anchor, accumulated across the members that carry it.
@@ -246,46 +336,71 @@ Shasta2AnchorId pickBoundingAnchor(
     return best;
 }
 
-// Run abPOA over `sequences` (0..3 encoded, all in the same orientation) and
-// hand the row-major MSA matrix to `consume`. False if abPOA produced nothing.
-template<class Consume>
-bool runMsa(const vector<vector<uint8_t>>& sequences, Consume&& consume)
-{
-    const int nSeq = int(sequences.size());
-    if(nSeq < 2) {
-        return false;
+// One abPOA instance, reused across every site a thread handles.
+//
+// abpoa_init/abpoa_free allocate substantial structures, and doing that per
+// site meant four allocations per alignment for thousands of very short
+// alignments. abpoa_reset is exactly the supported way to reuse a graph, so
+// each thread keeps one of these for its whole batch.
+class MsaRunner {
+public:
+    MsaRunner()
+    {
+        ab = abpoa_init();
+        abpt = abpoa_init_para();
+        abpt->out_msa = 1;
+        abpt->out_cons = 0;
+        abpt->disable_seeding = 1;
+        abpoa_post_set_para(abpt);
     }
-
-    abpoa_t* ab = abpoa_init();
-    abpoa_para_t* abpt = abpoa_init_para();
-    abpt->out_msa = 1;
-    abpt->out_cons = 0;
-    abpt->disable_seeding = 1;
-    abpoa_post_set_para(abpt);
-
-    vector<int> lengths(nSeq);
-    vector<uint8_t*> seqs(nSeq);
-    // abPOA takes non-const pointers but does not modify the input; the copies
-    // live in `sequences`, which outlives this call.
-    for(int i = 0; i < nSeq; i++) {
-        lengths[size_t(i)] = int(sequences[size_t(i)].size());
-        seqs[size_t(i)] = const_cast<uint8_t*>(sequences[size_t(i)].data());
+    ~MsaRunner()
+    {
+        abpoa_free(ab);
+        abpoa_free_para(abpt);
     }
+    MsaRunner(const MsaRunner&) = delete;
+    MsaRunner& operator=(const MsaRunner&) = delete;
 
-    abpoa_msa(ab, abpt, nSeq, nullptr, lengths.data(), seqs.data(),
-        nullptr, nullptr);
+    // Align `sequences` and hand the row-major MSA matrix to `consume`.
+    // False if abPOA produced nothing usable.
+    template<class Consume>
+    bool run(const vector<vector<uint8_t>>& sequences, Consume&& consume)
+    {
+        const int nSeq = int(sequences.size());
+        if(nSeq < 2) {
+            return false;
+        }
 
-    bool ok = false;
-    abpoa_cons_t* abc = ab->abc;
-    if(abc != nullptr && abc->msa_len > 0 && abc->msa_base != nullptr) {
+        lengths.resize(size_t(nSeq));
+        seqs.resize(size_t(nSeq));
+        int maxLength = 0;
+        // abPOA takes non-const pointers but does not modify the input; the
+        // sequences outlive this call.
+        for(int i = 0; i < nSeq; i++) {
+            const int length = int(sequences[size_t(i)].size());
+            lengths[size_t(i)] = length;
+            seqs[size_t(i)] = const_cast<uint8_t*>(sequences[size_t(i)].data());
+            maxLength = std::max(maxLength, length);
+        }
+
+        abpoa_reset(ab, abpt, maxLength);
+        abpoa_msa(ab, abpt, nSeq, nullptr, lengths.data(), seqs.data(),
+            nullptr, nullptr);
+
+        const abpoa_cons_t* const abc = ab->abc;
+        if(abc == nullptr || abc->msa_len <= 0 || abc->msa_base == nullptr) {
+            return false;
+        }
         consume(abc->msa_base, nSeq, int(abc->msa_len), int(abpt->m));
-        ok = true;
+        return true;
     }
 
-    abpoa_free(ab);
-    abpoa_free_para(abpt);
-    return ok;
-}
+private:
+    abpoa_t* ab = nullptr;
+    abpoa_para_t* abpt = nullptr;
+    vector<int> lengths;
+    vector<uint8_t*> seqs;
+};
 
 } // namespace
 
@@ -310,9 +425,11 @@ uint64_t dinara::msaVerifyHetSites(
         threadCount = 1;
     }
 
+    const auto tBegin = std::chrono::steady_clock::now();
     const uint64_t orientedReadCount = 2 * reads.readCount();
-    const AnchorPositions anchorPositions =
-        buildAnchorPositions(anchors, orientedReadCount);
+    const AnchorIndex anchorIndex =
+        buildAnchorIndex(anchors, orientedReadCount, threadCount);
+    const auto tIndexed = std::chrono::steady_clock::now();
 
     vector<uint8_t> keep(sites.size(), 1);
     const uint64_t reasonCount = MsaSiteVerdict::reasonCount;
@@ -328,7 +445,9 @@ uint64_t dinara::msaVerifyHetSites(
             const uint64_t end = std::min<uint64_t>(sites.size(), (t + 1) * chunk);
             vector<uint64_t>& reasons = reasonsByThread[t];
 
-            // Hoisted scratch: this loop runs tens of thousands of times.
+            // One abPOA instance for this thread's whole batch, plus hoisted
+            // scratch: this loop runs tens of thousands of times.
+            MsaRunner msaRunner;
             std::unordered_map<Shasta2AnchorId, Candidate> leftCandidates, rightCandidates;
             // Per member, the positions of the candidate anchors on THAT read,
             // so the extraction pass never rescans the read's anchor list.
@@ -374,7 +493,7 @@ uint64_t dinara::msaVerifyHetSites(
                     const auto& [orientedReadId, position] = members[i];
                     const uint64_t v = orientedReadId.getValue();
                     if(v >= orientedReadCount) { viable = false; break; }
-                    const auto& sorted = anchorPositions[v];
+                    const auto sorted = anchorIndex[v];
 
                     const uint32_t low = (position > flankBases) ? (position - flankBases) : 0u;
                     auto it = std::lower_bound(sorted.begin(), sorted.end(),
@@ -437,7 +556,7 @@ uint64_t dinara::msaVerifyHetSites(
                 }
 
                 MsaSiteVerdict verdict;
-                const bool ran = runMsa(sequences,
+                const bool ran = msaRunner.run(sequences,
                     [&](uint8_t** msa, int nSeq, int msaLen, int gapValue) {
                         verdict = verifyColumnAgreement(
                             msa, nSeq, msaLen, gapValue, snpOffset, armOfRow,
@@ -458,6 +577,15 @@ uint64_t dinara::msaVerifyHetSites(
     for(std::thread& thread : threads) {
         thread.join();
     }
+
+    const auto tVerified = std::chrono::steady_clock::now();
+    const auto seconds = [](auto a, auto b) {
+        return 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+    performanceLog << timestamp << "MSA het verification: "
+        << seconds(tBegin, tIndexed) << " s building the anchor index, "
+        << seconds(tIndexed, tVerified) << " s verifying "
+        << sites.size() << " sites." << endl;
 
     vector<uint64_t> reasons(reasonCount, 0);
     for(const auto& r : reasonsByThread) {
