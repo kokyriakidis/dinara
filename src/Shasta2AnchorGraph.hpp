@@ -196,6 +196,20 @@ public:
     // disabled.
     uint64_t removeHetArmTips(const Shasta2Anchors& anchors);
 
+    // Self-check: recompute the journey-consecutive (anchorA, anchorB) tally by
+    // walking the journeys directly -- bypassing findChildren and
+    // Shasta2AnchorPair, i.e. everything the construction path uses -- and
+    // cross-check it against every edge of this graph. Reports coverage
+    // mismatches, edges with no independent support, and adjacencies that meet
+    // minEdgeCoverage but have no edge.
+    //
+    // Does nothing unless DINARA_VERIFY_ANCHOR_GRAPH is set to something other
+    // than "0": the walk is O(journey anchors) plus a hash entry per distinct
+    // adjacency, which is not worth paying on every run.
+    void verifyAgainstJourneys(
+        const Shasta2Journeys& journeys,
+        uint64_t minEdgeCoverage) const;
+
     // Remove edges between a window and its RC counterpart.
     uint64_t removeRcWindowConnections();
 

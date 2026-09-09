@@ -31,12 +31,14 @@ string anchorIdToString(Shasta2AnchorId anchorId)
 
 // Standard library.
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include "fstream.hpp"
 #include <limits>
 #include <map>
 #include <queue>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include "tuple.hpp"
 
@@ -650,6 +652,86 @@ uint64_t Shasta2AnchorGraph::removeRcWindowConnections()
     cout << "removeRcWindowConnections: removed " << removedCount
          << " edges between RC window pairs." << endl;
     return removedCount;
+}
+
+
+
+void Shasta2AnchorGraph::verifyAgainstJourneys(
+    const Shasta2Journeys& journeys,
+    uint64_t minEdgeCoverage) const
+{
+    const char* const env = std::getenv("DINARA_VERIFY_ANCHOR_GRAPH");
+    if((env == nullptr) or (env[0] == '0')) {
+        return;
+    }
+
+    cout << timestamp << "Verifying anchor graph construction "
+            "against an independent journey walk..." << endl;
+
+    // Tally every journey-consecutive (anchorA, anchorB) pair by walking the
+    // journeys directly. This deliberately uses none of the machinery the
+    // construction path uses, so a shared bug cannot hide from the check.
+    std::unordered_map<uint64_t, uint64_t> independentTally;
+    const uint64_t orientedReadCount = journeys.size();
+    for(uint64_t v = 0; v < orientedReadCount; v++) {
+        const OrientedReadId orientedReadId = OrientedReadId::fromValue(v);
+        const auto journey = journeys[orientedReadId];
+        for(uint64_t i = 0; i + 1 < journey.size(); i++) {
+            const uint64_t a = uint64_t(journey[i]);
+            const uint64_t b = uint64_t(journey[i + 1]);
+            independentTally[(a << 32) | b]++;
+        }
+    }
+
+    // Every edge in the graph must match the tally.
+    uint64_t edgesChecked = 0, edgesMismatched = 0, edgesUnsupported = 0;
+    const auto edgeRange = boost::edges(*this);
+    for(auto it = edgeRange.first; it != edgeRange.second; ++it) {
+        const auto& edge = (*this)[*it];
+        const uint64_t a = edge.anchorIdA;
+        const uint64_t b = edge.anchorIdB;
+        const uint64_t declaredCoverage = edge.coverage();
+        const auto tallyIt = independentTally.find((a << 32) | b);
+        ++edgesChecked;
+        if(tallyIt == independentTally.end()) {
+            ++edgesUnsupported;
+            cout << timestamp << "  MISMATCH: edge " << a << "->" << b
+                 << " coverage=" << declaredCoverage
+                 << " but independent walk found ZERO occurrences." << endl;
+        } else if(tallyIt->second != declaredCoverage) {
+            ++edgesMismatched;
+            cout << timestamp << "  MISMATCH: edge " << a << "->" << b
+                 << " coverage=" << declaredCoverage
+                 << " independent tally=" << tallyIt->second << endl;
+        }
+    }
+
+    // ...and every adjacency that clears minEdgeCoverage must have an edge.
+    uint64_t missingEdges = 0;
+    for(const auto& [key, count] : independentTally) {
+        if(count < minEdgeCoverage) {
+            continue;
+        }
+        const Shasta2AnchorId a = key >> 32;
+        const Shasta2AnchorId b = key & 0xffffffffULL;
+        const auto found = boost::edge(a, b, *this);
+        if(!found.second) {
+            ++missingEdges;
+            if(missingEdges <= 20) {
+                cout << timestamp << "  MISSING EDGE: " << a << "->" << b
+                     << " independent tally=" << count
+                     << " (>= minEdgeCoverage=" << minEdgeCoverage
+                     << ") but no graph edge exists." << endl;
+            }
+        }
+    }
+
+    cout << timestamp << "Anchor graph verification: " << edgesChecked
+         << " graph edges checked (" << edgesMismatched << " coverage mismatches, "
+         << edgesUnsupported << " with zero independent support), "
+         << independentTally.size() << " distinct journey-consecutive pairs found, "
+         << missingEdges << " missing edges (tally >= minEdgeCoverage but no graph edge)."
+         << endl;
 }
 
 

@@ -1172,31 +1172,23 @@ void dinara::main::assemble(
         *shasta2Journeys,
         minEdgeCoverage,
         threadCount);
-    // The export's drop map is DERIVED from the journeys (below), not resolved
-    // a second time here. An earlier version did resolve it independently --
-    // grouping each read's anchor occurrences by exported position and picking a
-    // keeper -- which meant two implementations of one policy. They disagreed:
-    // 446 drops agreed, 11 were derived-only and 27 resolved-only, and for a
-    // while they even used opposite tie-break preferences, so the exported
-    // anchors contradicted the exported graph. The journeys already carry the
-    // answer, so the export reads it rather than recomputing it.
-    Shasta2Anchors::ExternalAnchorDropMap journeyTieDropMap;
-
-    // The drop map the export applies should be a FUNCTION OF THE JOURNEYS, not
-    // a second opinion about them. The journeys were already rebuilt with ties
-    // resolved; re-deriving that decision here on the anchor objects means two
-    // implementations of one policy, which is exactly how they came to disagree
-    // before (the rebuild kept het, the export kept primary, and the exported
-    // anchors contradicted the exported graph).
+    // The export's drop map is DERIVED from the journeys, never resolved a
+    // second time here: a member (anchor, read) is exported iff that anchor
+    // occurs in that read's journey, so whatever the rebuild dropped is dropped
+    // here by construction and nothing else is.
     //
-    // So recompute it directly: a member (anchor, read) is exported iff that
-    // anchor actually occurs in that read's journey. Anything the rebuild
-    // dropped is dropped here by construction, and nothing else is. The
-    // independently-computed map is kept alongside only to report whether the
-    // two agree -- if they ever diverge, the derivation is authoritative and the
-    // difference is the bug.
+    // An earlier version did resolve it independently -- grouping each read's
+    // anchor occurrences by exported position and picking a keeper -- which
+    // meant two implementations of one policy. They disagreed (446 drops agreed,
+    // 11 derived-only, 27 resolved-only) and for a while even used opposite
+    // tie-break preferences, so the exported anchors contradicted the exported
+    // graph. That second implementation is gone; this is the only one.
+    //
+    // On a default run this is empty: journeyTieDrops is written only by
+    // rebuildAfterNewAnchors, which runs only when Assembly.mode3.detectSnpSites
+    // has appended het anchors.
+    Shasta2Anchors::ExternalAnchorDropMap journeyTieDropMap;
     {
-        // Straight from the rebuild's own record of what it dropped.
         uint64_t derivedDrops = 0;
         for(const auto& [canonicalId, readId]: shasta2Journeys->journeyTieDrops) {
             auto& vec = journeyTieDropMap[canonicalId];
@@ -1234,73 +1226,10 @@ void dinara::main::assemble(
     // Verify and finalize the anchor graph (already built above for the
     // journey path), then export it.
     {
-        // VERIFICATION: independently recompute the journey-consecutive
-        // (anchorA, anchorB) tally directly from the rebuilt journeys
-        // (bypassing findChildren/Shasta2AnchorPair entirely) and cross-check
-        // against every edge in the FINAL anchor graph.
-        if(const char* env = std::getenv("DINARA_VERIFY_ANCHOR_GRAPH")) {
-            if(env[0] != '0') {
-                cout << timestamp << "Verifying anchor graph construction "
-                        "against an independent journey walk..." << endl;
-                std::unordered_map<uint64_t, uint64_t> independentTally;
-                const uint64_t orientedReadCount = shasta2Journeys->size();
-                for(uint64_t v = 0; v < orientedReadCount; v++) {
-                    const OrientedReadId orientedReadId = OrientedReadId::fromValue(v);
-                    const auto journey = (*shasta2Journeys)[orientedReadId];
-                    for(uint64_t i = 0; i + 1 < journey.size(); i++) {
-                        const uint64_t a = uint64_t(journey[i]);
-                        const uint64_t b = uint64_t(journey[i + 1]);
-                        independentTally[(a << 32) | b]++;
-                    }
-                }
-
-                uint64_t edgesChecked = 0, edgesMismatched = 0, edgesUnsupported = 0;
-                auto edgeRange = boost::edges(*assembler.shasta2AnchorGraph);
-                for(auto it = edgeRange.first; it != edgeRange.second; ++it) {
-                    const auto& edge = (*assembler.shasta2AnchorGraph)[*it];
-                    const uint64_t a = edge.anchorIdA;
-                    const uint64_t b = edge.anchorIdB;
-                    const uint64_t declaredCoverage = edge.coverage();
-                    const auto tallyIt = independentTally.find((a << 32) | b);
-                    ++edgesChecked;
-                    if(tallyIt == independentTally.end()) {
-                        ++edgesUnsupported;
-                        cout << timestamp << "  MISMATCH: edge " << a << "->" << b
-                             << " coverage=" << declaredCoverage
-                             << " but independent walk found ZERO occurrences." << endl;
-                    } else if(tallyIt->second != declaredCoverage) {
-                        ++edgesMismatched;
-                        cout << timestamp << "  MISMATCH: edge " << a << "->" << b
-                             << " coverage=" << declaredCoverage
-                             << " independent tally=" << tallyIt->second << endl;
-                    }
-                }
-
-                uint64_t missingEdges = 0;
-                for(const auto& [key, count] : independentTally) {
-                    if(count < minEdgeCoverage) continue;
-                    const Shasta2AnchorId a = key >> 32;
-                    const Shasta2AnchorId b = key & 0xffffffffULL;
-                    const auto found = boost::edge(a, b, *assembler.shasta2AnchorGraph);
-                    if(!found.second) {
-                        ++missingEdges;
-                        if(missingEdges <= 20) {
-                            cout << timestamp << "  MISSING EDGE: " << a << "->" << b
-                                 << " independent tally=" << count
-                                 << " (>= minEdgeCoverage=" << minEdgeCoverage
-                                 << ") but no graph edge exists." << endl;
-                        }
-                    }
-                }
-
-                cout << timestamp << "Anchor graph verification: " << edgesChecked
-                     << " graph edges checked (" << edgesMismatched << " coverage mismatches, "
-                     << edgesUnsupported << " with zero independent support), "
-                     << independentTally.size() << " distinct journey-consecutive pairs found, "
-                     << missingEdges << " missing edges (tally >= minEdgeCoverage but no graph edge)."
-                     << endl;
-            }
-        }
+        // Cross-check the graph against an independent walk of the journeys
+        // (opt in with DINARA_VERIFY_ANCHOR_GRAPH=1).
+        assembler.shasta2AnchorGraph->verifyAgainstJourneys(
+            *shasta2Journeys, minEdgeCoverage);
 
         // Tip cleanup: a het/hom anchor can still end up one-sided (e.g. if
         // every one of its member reads happens to have it as the first/last
