@@ -1322,17 +1322,23 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.msaVerifyFlankBases",
         value<uint64_t>(&assemblyOptions.mode3Options.msaVerifyFlankBases)->
-        default_value(150),
+        default_value(400),
         "How far on each side of a het site to look for a bounding anchor "
-        "shared by every member read. Larger gives the MSA more context and a "
-        "better chance of finding a shared pair, at the cost of a longer "
-        "alignment. Used only with Assembly.mode3.msaVerifySnpSites.")
+        "carried by the member reads -- in effect the MSA's context budget. "
+        "Too little context and abPOA itself aligns badly, so the check "
+        "rejects real sites: measured on E821, 50 confirmed 1406 of 4542 "
+        "sites, 150 confirmed 3871, 400 confirmed 3998 and 800 confirmed "
+        "4046, at 0.13 / 0.55 / 1.49 / 3.74 s. It plateaus around 400, which "
+        "is the default. Used only with Assembly.mode3.msaVerifySnpSites.")
 
         ("Assembly.mode3.msaVerifyMinAgreement",
         value<double>(&assemblyOptions.mode3Options.msaVerifyMinAgreement)->
         default_value(0.9, "0.9"),
-        "Fraction of placed member reads whose SNP base must land in the same "
-        "MSA column for a het site to survive verification. Used only with "
+        "Fraction of placed member reads that must agree, applied both to the "
+        "MSA column their SNP bases land in and to the arm/allele partition. "
+        "Measured on E821 this is nearly flat between 0.6 and 0.9 (4001 vs "
+        "3998 sites confirmed); only 1.0 changes much, rejecting 325 sites "
+        "for a single stray read. Used only with "
         "Assembly.mode3.msaVerifySnpSites.")
 
         ("Assembly.mode3.hetErrorRate",

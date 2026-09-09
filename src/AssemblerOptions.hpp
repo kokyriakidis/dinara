@@ -618,12 +618,15 @@ public:
     // default -- it can only remove sites, so it trades recall for precision
     // and the trade has to be measured before it is trusted.
     bool msaVerifySnpSites = false;
-    // How far to look on each side of the SNP for a bounding anchor shared by
-    // every member. Larger gives the MSA more context and a better chance of
-    // finding a shared pair, at the cost of a longer alignment.
-    uint64_t msaVerifyFlankBases = 150;
-    // Fraction of placed members whose SNP base must land in the same MSA
-    // column for the site to be kept.
+    // How far to look on each side of the SNP for a bounding anchor carried by
+    // the members -- in effect the MSA's context budget, and NOT a minor knob:
+    // starve abPOA of context and it aligns badly, so the check rejects real
+    // sites. On E821 a flank of 50 confirmed 1406 of 4542 sites where 400
+    // confirmed 3998; the curve plateaus around 400.
+    uint64_t msaVerifyFlankBases = 400;
+    // Fraction of placed members that must agree, applied both to the MSA
+    // column their SNP bases land in and to the arm/allele partition. Nearly
+    // flat between 0.6 and 0.9 on E821; only 1.0 changes much.
     double msaVerifyMinAgreement = 0.9;
 
 
