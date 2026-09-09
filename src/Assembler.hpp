@@ -19,7 +19,6 @@
 #include "MarkerGraphEdgePairInfo.hpp"
 #include "MemoryMappedObject.hpp"
 #include "MultithreadedObject.hpp"
-#include "BidirectionalReadGraph.hpp"
 #include "ReadGraph.hpp"
 
 #include "ReadId.hpp"
@@ -438,20 +437,6 @@ public:
 
         // Number of threads. If zero, a number of threads equal to
         // the number of virtual processors is used.
-        uint64_t threadCount
-    );
-
-    // BRG-aware variant of createMarkerGraphVertices.
-    // Uses BidirectionalReadGraph edges (skipping isDeleted) for the
-    // disjoint-set union step instead of ReadGraph edges.
-    // The marker graph reflects the cleaned BRG overlap set.
-    void createMarkerGraphVerticesFromBrg(
-        size_t minCoverage,
-        size_t maxCoverage,
-        uint64_t minCoveragePerStrand,
-        bool allowDuplicateMarkers,
-        double peakFinderMinAreaFraction,
-        uint64_t peakFinderAreaStartIndex,
         uint64_t threadCount
     );
 
@@ -1448,7 +1433,6 @@ private:
 	    ReadGraph readGraph;
 	    ReadGraph readGraphAllAlignments;
 	    DirectedReadGraph directedReadGraph;
-	    BidirectionalReadGraph bidirectionalReadGraph;
     void createReadGraph(
         uint32_t maxAlignmentCount,
         bool preferAlignedFraction);
@@ -1474,31 +1458,6 @@ private:
     void checkReadGraphIsOpen() const;
     void accessDirectedReadGraph();
     void checkDirectedReadGraphIsOpen() const;
-    // BidirectionalReadGraph: one vertex per read, one edge per alignment.
-    void createBidirectionalReadGraph();
-    void createBidirectionalReadGraphFromSelectedAlignments(const vector<bool>& keepAlignment);
-    void accessBidirectionalReadGraph();
-    void accessBidirectionalReadGraphReadWrite();
-    void checkBidirectionalReadGraphIsOpen() const;
-    void removeBidirectionalReadGraph();
-
-    // BidirectionalReadGraph cleaning (string-graph-style operations on BRG).
-    // Individual operations (each builds a temporary directed view):
-    uint64_t reduceBidirectionalReadGraphTransitive(uint32_t gapFuzz = 1000);
-    uint64_t cutBidirectionalReadGraphTips(uint32_t maxShortTipReads = 3);
-    uint64_t cutBidirectionalReadGraphWeakArcs(
-        uint32_t maxExtReads = 3,
-        double lenRatio = 0.975,
-        uint32_t minDiff = 16);
-    // Combined cleaning passes:
-    void cleanBidirectionalReadGraphInitial(
-        uint32_t gapFuzz = 1000,
-        uint32_t maxShortTipReads = 3);
-    void cleanBidirectionalReadGraphIterative(
-        uint32_t cleanRounds = 4,
-        double minDropRate = 0.2,
-        double maxDropRate = 0.8,
-        uint32_t maxShortTipReads = 3);
     void removeReadGraphBridges(uint64_t maxDistance);
     void analyzeReadGraph();
     void readGraphClustering();
@@ -1692,16 +1651,6 @@ private:
             double timeout,
             LocalReadGraph&);
 
-        // Create a local subgraph of the BidirectionalReadGraph.
-        // Uses orientation-aware BFS via edge.traverse().
-        // Produces a LocalReadGraph with derived OrientedReadId vertices.
-        bool createLocalBidirectionalReadGraph(
-            const vector<OrientedReadId>& starts,
-            uint32_t maxDistance,
-            bool allowChimericReads,
-            bool allowInconsistentAlignmentEdges,
-            double timeout,
-            LocalReadGraph&);
 
 
 
@@ -2432,7 +2381,6 @@ public:
     void alignSequencesInBaseRepresentation(const vector<string>&, ostream&);
     void exploreAlignmentGraph(const vector<string>&, ostream&);
     void exploreReadGraph(const vector<string>&, ostream&);
-    void exploreBidirectionalReadGraph(const vector<string>&, ostream&);
     void exploreUndirectedReadGraph(const vector<string>&, ostream&);
     void exploreDirectedReadGraph(const vector<string>&, ostream&);
     static bool parseCommaSeparatedReadIDs(string& commaSeparatedReadIds, vector<OrientedReadId>& readIds, ostream& html);
