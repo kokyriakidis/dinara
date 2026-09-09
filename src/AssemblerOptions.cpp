@@ -314,13 +314,13 @@ void AssemblerOptions::addConfigurableOptions()
         ("Reads.palindromicReads.skipFlagging",
         bool_switch(&readsOptions.palindromicReads.skipFlagging)->
         default_value(false),
-        "Skip flagging palindromic reads. Oxford Nanopore reads should be flagged for better results.")
+        "Skip flagging palindromic reads. Oxford Nanopore reads should be flagged for better results. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Reads.palindromicReads.alignedFractionThreshold",
         value<double>(&readsOptions.palindromicReads.alignedFractionThreshold)->
         default_value(0.8, "0.8"),
         "Minimum fraction of read length covered by the self-alignment chain span "
-        "to flag a read as palindromic.")
+        "to flag a read as palindromic. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Reads.palindromicReads.maxErrorRate",
         value<double>(&readsOptions.palindromicReads.maxErrorRate)->
@@ -375,7 +375,7 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(0.5),
         "Minimum fraction of read length that must be covered by the marker span "
         "(lastMarkerPos + k - firstMarkerPos). Reads below this threshold have all "
-        "markers removed. Set to 0 to disable.")
+        "markers removed. Set to 0 to disable. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("MinHash.version",
         value<int>(&minHashOptions.version)->
@@ -757,7 +757,7 @@ void AssemblerOptions::addConfigurableOptions()
         ("ReadGraph.crossStrandMaxDistance",
         value<int>(&readGraphOptions.crossStrandMaxDistance)->
         default_value(6),
-        "Maximum distance (edges) for strand separation method 1.")
+        "Maximum distance (edges) for strand separation method 1. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("ReadGraph.removeConflicts",
         bool_switch(&readGraphOptions.removeConflicts)->
@@ -855,7 +855,7 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint64_t>(&readGraphOptions.clusterGraphMinEdgeCoverage)->
         default_value(6),
         "Minimum edge coverage for the cluster graph. "
-        "Edges with coverage below this threshold are not created.")
+        "Edges with coverage below this threshold are not created. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("ReadGraph.minMultiNodeChainSupport",
         value<int>(&readGraphOptions.minMultiNodeChainSupport)->
@@ -963,7 +963,7 @@ void AssemblerOptions::addConfigurableOptions()
         ("MarkerGraph.vertexCoverageHistogramFileName",
         value<string>(&markerGraphOptions.vertexCoverageHistogramFileName)->
         default_value("MarkerGraphVertexCoverageHistogram.csv"),
-        "File name for the marker graph vertex coverage histogram CSV.")
+        "File name for the marker graph vertex coverage histogram CSV. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("MarkerGraph.vertexCoverageHistogramCanonicalOnly",
         value<bool>(&markerGraphOptions.vertexCoverageHistogramCanonicalOnly)->
@@ -1019,19 +1019,19 @@ void AssemblerOptions::addConfigurableOptions()
         value<uint64_t>(&assemblyOptions.detangleDiagonalReadCountMin)->
         default_value(1),
         "Minimum number of reads on detangle matrix diagonal elements "
-        "required for detangling.")
+        "required for detangling. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.detangle.offDiagonalReadCountMax",
         value<uint64_t>(&assemblyOptions.detangleOffDiagonalReadCountMax)->
         default_value(2),
         "Maximum number of reads on detangle matrix off-diagonal elements "
-        "allowed for detangling.")
+        "allowed for detangling. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.detangle.offDiagonalRatio",
         value<double>(&assemblyOptions.detangleOffDiagonalRatio)->
         default_value(0.3),
         "Maximum ratio of total off-diagonal elements over diagonal element "
-        "allowed for detangling.")
+        "allowed for detangling. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative",
         bool_switch(&assemblyOptions.iterative)->
@@ -1041,7 +1041,7 @@ void AssemblerOptions::addConfigurableOptions()
         ("Assembly.iterative.iterationCount",
         value<uint64_t>(&assemblyOptions.iterativeIterationCount)->
         default_value(3),
-        "Number of iterations for iterative assembly (experimental).")
+        "Number of iterations for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative.pseudoPathAlignMatchScore",
         value<int64_t>(&assemblyOptions.iterativePseudoPathAlignMatchScore)->
@@ -1061,27 +1061,27 @@ void AssemblerOptions::addConfigurableOptions()
         ("Assembly.iterative.mismatchSquareFactor",
         value<double>(&assemblyOptions.iterativeMismatchSquareFactor)->
         default_value(3.),
-        "Mismatch square factor for iterative assembly (experimental).")
+        "Mismatch square factor for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative.minScore",
         value<double>(&assemblyOptions.iterativeMinScore)->
         default_value(0.),
-        "Minimum pseudo-alignment score for iterative assembly (experimental).")
+        "Minimum pseudo-alignment score for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative.maxAlignmentCount",
         value<uint64_t>(&assemblyOptions.iterativeMaxAlignmentCount)->
         default_value(6),
-        "Maximum number of read graph neighbors for iterative assembly (experimental).")
+        "Maximum number of read graph neighbors for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative.bridgeRemovalIterationCount",
         value<uint64_t>(&assemblyOptions.iterativeBridgeRemovalIterationCount)->
         default_value(3),
-        "Number of read graph bridge removal iterations for iterative assembly (experimental).")
+        "Number of read graph bridge removal iterations for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.iterative.bridgeRemovalMaxDistance",
         value<uint64_t>(&assemblyOptions.iterativeBridgeRemovalMaxDistance)->
         default_value(2),
-        "Maximum distance for read graph bridge removal for iterative assembly (experimental).")
+        "Maximum distance for read graph bridge removal for iterative assembly (experimental). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.anchorCreationMethod",
         value<string>(&assemblyOptions.mode3Options.anchorCreationMethod)->
@@ -1113,7 +1113,7 @@ void AssemblerOptions::addConfigurableOptions()
         value<double>(&assemblyOptions.mode3Options.minAnchorCoverageMultiplier)->
         default_value(1.),
         "Multiplier applied to heuristically determined minimum anchor coverage "
-        "if minAnchorCoverage and maxAnchorCoverage are both 0.")
+        "if minAnchorCoverage and maxAnchorCoverage are both 0. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.maxAnchorCoverageMultiplier",
         value<double>(&assemblyOptions.mode3Options.maxAnchorCoverageMultiplier)->
@@ -1197,14 +1197,14 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(4),
         "Minimum shared read count for an inter-window edge. "
         "Candidates with fewer shared reads are discarded. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.minInterWindowEdgeCoverage",
         value<uint64_t>(&assemblyOptions.mode3Options.minInterWindowEdgeCoverage)->
         default_value(4),
         "Minimum anchor pair coverage (common reads) for an inter-window edge. "
         "Edges whose anchor pair has fewer common reads are discarded. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.minCommonForBackbone",
         value<uint64_t>(&assemblyOptions.mode3Options.minCommonForBackbone)->
@@ -1325,25 +1325,6 @@ void AssemblerOptions::addConfigurableOptions()
         "per allele arm), then rebuild journeys and the anchor graph from "
         "scratch. Requires Assembly.mode3.detectSnpSites.")
 
-        ("Assembly.mode3.transcribeHetBubbles",
-        value<bool>(&assemblyOptions.mode3Options.transcribeHetBubbles)->
-        default_value(false),
-        "If true, run per-edge MSA het detection: append a het anchor per "
-        "detected allele, rebuild journeys, and rebuild the anchor graph from "
-        "them. False by default -- the pipeline collapses hifiasm's filtered "
-        "overlaps into anchors and exports those, leaving locus "
-        "disambiguation to shasta2's downstream read-following, which has "
-        "whole journeys as context instead of one edge at a time. When false "
-        "every other Assembly.mode3.het* option is inert.")
-
-        ("Assembly.mode3.minCommonForHet",
-        value<uint64_t>(&assemblyOptions.mode3Options.minCommonForHet)->
-        default_value(12),
-        "Minimum anchor-pair coverage (common two-sided reads) for an "
-        "anchor-graph edge to be MSA'd during experimental per-edge het "
-        "detection (enabled with DINARA_HET_ON_GRAPH=1). "
-        "(Mode 3 assembly only).")
-
         ("Assembly.mode3.hetErrorRate",
         value<double>(&assemblyOptions.mode3Options.hetErrorRate)->
         default_value(0.025, "0.025"),
@@ -1360,14 +1341,14 @@ void AssemblerOptions::addConfigurableOptions()
         default_value(1000),
         "Minimum base span (first anchor to last anchor) for a read's "
         "journey to be accepted as a window backbone. Reads with shorter "
-        "journey spans are skipped during window creation.")
+        "journey spans are skipped during window creation. DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetMinVaf",
         value<double>(&assemblyOptions.mode3Options.hetMinVaf)->
         default_value(0.12, "0.12"),
         "Minimum variant allele fraction for an alt allele to be accepted "
         "as a het SNP in the per-window abPOA MSA. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetMinSupport",
         value<uint64_t>(&assemblyOptions.mode3Options.hetMinSupport)->
@@ -1375,7 +1356,7 @@ void AssemblerOptions::addConfigurableOptions()
         "Minimum per-allele read support for a het SNP in the per-window "
         "abPOA MSA. 0 (default) auto-derives it from the k-mer coverage "
         "histogram (peak/2 * 0.7, floored at 6). "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetDropHomopolymer",
         value<bool>(&assemblyOptions.mode3Options.hetDropHomopolymer)->
@@ -1384,7 +1365,7 @@ void AssemblerOptions::addConfigurableOptions()
         "(repeat unit length 1). Default false: the flank-linearity test "
         "already guarantees a clean homozygous base on each side, so such SNPs "
         "are real; dropping them discarded far more true SNPs than it kept. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetDropRepeat",
         value<bool>(&assemblyOptions.mode3Options.hetDropRepeat)->
@@ -1392,7 +1373,7 @@ void AssemblerOptions::addConfigurableOptions()
         "If true, drop het SNPs whose backbone context is a short-tandem-repeat "
         "run (repeat unit length 2..6). Default false, for the same reason as "
         "hetDropHomopolymer. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetMaxWindowInDegree",
         value<uint64_t>(&assemblyOptions.mode3Options.hetMaxWindowInDegree)->
@@ -1400,7 +1381,7 @@ void AssemblerOptions::addConfigurableOptions()
         "Skip het-anchor detection in windows whose distinct incoming "
         "inter-window neighbor count is >= this value AND whose outgoing "
         "count is >= hetMaxWindowOutDegree. 0 disables the gate. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.hetMaxWindowOutDegree",
         value<uint64_t>(&assemblyOptions.mode3Options.hetMaxWindowOutDegree)->
@@ -1408,7 +1389,7 @@ void AssemblerOptions::addConfigurableOptions()
         "Skip het-anchor detection in windows whose distinct outgoing "
         "inter-window neighbor count is >= this value AND whose incoming "
         "count is >= hetMaxWindowInDegree. 0 disables the gate. "
-        "(Mode 3 assembly only).")
+        "(Mode 3 assembly only). DEPRECATED AND IGNORED: nothing reads this value.")
 
         ("Assembly.mode3.assemblyGraph.detangleToleranceLow",
         value<uint64_t>(&assemblyOptions.mode3Options.assemblyGraphOptions.detangleToleranceLow)->
@@ -1566,8 +1547,6 @@ void AssemblerOptions::addConfigurableOptions()
 
 void PalindromicReadOptions::write(ostream& s) const
 {
-    s << "palindromicReads.skipFlagging = " << convertBoolToPythonString(skipFlagging) << "\n";
-    s << "palindromicReads.alignedFractionThreshold = " << alignedFractionThreshold << "\n";
     s << "palindromicReads.maxErrorRate = " << maxErrorRate << "\n";
 }
 
@@ -1597,7 +1576,6 @@ void KmersOptions::write(ostream& s) const
     s << "distanceThreshold = " << distanceThreshold << "\n";
     s << "file = " << file << "\n";
     s << "globalFrequencyOverrideDirectory = " << globalFrequencyOverrideDirectory << "\n";
-    s << "minMarkerSpanFraction = " << minMarkerSpanFraction << "\n";
 }
 
 
@@ -1700,7 +1678,6 @@ void ReadGraphOptions::write(ostream& s) const
     s << "preferAlignedFraction = " << convertBoolToPythonString(preferAlignedFraction) << "\n";
     s << "maxChimericReadDistance = " << maxChimericReadDistance << "\n";
     s << "strandSeparationMethod = " << strandSeparationMethod << "\n";
-    s << "crossStrandMaxDistance = " << crossStrandMaxDistance << "\n";
     s << "removeConflicts = " <<
         convertBoolToPythonString(removeConflicts) << "\n";
     s << "markerCountPercentile = " << markerCountPercentile << "\n";
@@ -1721,7 +1698,6 @@ void ReadGraphOptions::write(ostream& s) const
     s << "delta = " << delta << "\n";
     s << "WThreshold = " << WThreshold << "\n";
     s << "WThresholdForBreaks = " << WThresholdForBreaks << "\n";
-    s << "clusterGraphMinEdgeCoverage = " << clusterGraphMinEdgeCoverage << "\n";
     s << "minMultiNodeChainSupport = " << minMultiNodeChainSupport << "\n";
     s << "minIsolatedSiteSupport = " << minIsolatedSiteSupport << "\n";
     s << "filterSecondaryRequireNonRedundantOnBothReads = " <<
@@ -1751,7 +1727,6 @@ void MarkerGraphOptions::write(ostream& s) const
 
     s << "writeVertexCoverageHistogram = " <<
         convertBoolToPythonString(writeVertexCoverageHistogram) << "\n";
-    s << "vertexCoverageHistogramFileName = " << vertexCoverageHistogramFileName << "\n";
     s << "vertexCoverageHistogramCanonicalOnly = " <<
         convertBoolToPythonString(vertexCoverageHistogramCanonicalOnly) << "\n";
 
@@ -1799,10 +1774,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.anchorCreationMethod = " << anchorCreationMethod << "\n";
     s << "mode3.minAnchorCoverage = " << minAnchorCoverage << "\n";
     s << "mode3.maxAnchorCoverage = " << maxAnchorCoverage << "\n";
-    s << "mode3.minAnchorCoverageMultiplier = " << minAnchorCoverageMultiplier << "\n";
     s << "mode3.maxAnchorCoverageMultiplier = " << maxAnchorCoverageMultiplier << "\n";
-    s << "mode3.minInterWindowCoverage = " << minInterWindowCoverage << "\n";
-    s << "mode3.minInterWindowEdgeCoverage = " << minInterWindowEdgeCoverage << "\n";
     s << "mode3.minCommonForBackbone = " << minCommonForBackbone << "\n";
     s << "mode3.maxSkipForBackbone = " << maxSkipForBackbone << "\n";
     s << "mode3.minJourneyEdgeCoverage = " << minJourneyEdgeCoverage << "\n";
@@ -1823,19 +1795,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
         convertBoolToPythonString(createSnpSiteAnchors) << "\n";
-    s << "mode3.transcribeHetBubbles = " <<
-        convertBoolToPythonString(transcribeHetBubbles) << "\n";
-    s << "mode3.minCommonForHet = " << minCommonForHet << "\n";
     s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
-    s << "mode3.minWindowBaseSpan = " << minWindowBaseSpan << "\n";
-    s << "mode3.hetMinVaf = " << hetMinVaf << "\n";
-    s << "mode3.hetMinSupport = " << hetMinSupport << "\n";
-    s << "mode3.hetDropHomopolymer = " <<
-        convertBoolToPythonString(hetDropHomopolymer) << "\n";
-    s << "mode3.hetDropRepeat = " <<
-        convertBoolToPythonString(hetDropRepeat) << "\n";
-    s << "mode3.hetMaxWindowInDegree = " << hetMaxWindowInDegree << "\n";
-    s << "mode3.hetMaxWindowOutDegree = " << hetMaxWindowOutDegree << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);
     assemblyGraphOptions.write(s);

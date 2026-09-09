@@ -621,20 +621,6 @@ public:
     // an existing graph. Off by default -- detection alone changes nothing.
     bool createSnpSiteAnchors = false;
 
-    // Run per-edge MSA het detection (transcribeHetBubbles): build a detection
-    // anchor graph, append a het anchor per detected allele, rebuild journeys,
-    // and rebuild the anchor graph. False by default: the current pipeline
-    // stops at collapsing hifiasm's filtered overlaps into anchors and
-    // exporting them, leaving locus disambiguation to shasta2's downstream
-    // read-following, which sees whole journeys rather than one edge at a time.
-    // With this false the anchor graph is built ONCE from the journeys and no
-    // het anchor is ever created, so every mode3 het* option below is inert.
-    bool transcribeHetBubbles = false;
-
-    // Minimum anchor-pair coverage (common two-sided reads) for an
-    // anchor-graph edge to be considered for per-edge MSA het detection
-    // (experimental, DINARA_HET_ON_GRAPH=1). Edges below this are skipped.
-    uint64_t minCommonForHet;
 
     // Assumed per-read sequencing error rate used by the per-edge MSA het
     // detector's allele significance test: a one-sided binomial test asks

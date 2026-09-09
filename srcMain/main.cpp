@@ -1050,7 +1050,7 @@ void dinara::main::assemble(
     // every consecutive pair surviving in a filtered journey becomes an edge.
     const uint64_t minEdgeCoverage =
         assemblerOptions.assemblyOptions.mode3Options.minJourneyEdgeCoverage;
-    // Snapshot the anchor count before transcribeHetBubbles appends anything,
+    // Snapshot the anchor count before the detector appends anything,
     // so the journeys rebuild below (Shasta2Journeys::rebuildAfterNewAnchors)
     // can fold in exactly the new anchors it creates without also pulling in
     // any other het/hom anchors some other pass might append for a purpose
@@ -1149,58 +1149,12 @@ void dinara::main::assemble(
         }
     }
 
-    const bool doTranscribeHetBubbles =
-        assemblerOptions.assemblyOptions.mode3Options.transcribeHetBubbles;
-    if(doTranscribeHetBubbles) {
-        cout << timestamp << "Creating Shasta2AnchorGraph from journeys "
-             << "(detection pass, consecutive-anchor edges, minEdgeCoverage="
-             << minEdgeCoverage << ")..." << endl;
-        Shasta2AnchorGraph detectionGraph(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            minEdgeCoverage,
-            threadCount);
-
-        const uint64_t minCommonForHet =
-            assemblerOptions.assemblyOptions.mode3Options.minCommonForHet;
-        const double hetErrorRate =
-            assemblerOptions.assemblyOptions.mode3Options.hetErrorRate;
-        cout << timestamp << "transcribeHetBubbles: minCommonForHet="
-             << minCommonForHet << ", hetErrorRate=" << hetErrorRate << "..." << endl;
-        const HetOnGraphResult res = transcribeHetBubbles(
-            detectionGraph, *shasta2Anchors, minCommonForHet, hetErrorRate, threadCount);
-        cout << timestamp << "transcribeHetBubbles results:\n"
-             << "  edges total:             " << res.edgesTotal << "\n"
-             << "  edges skipped (RC mirror processed instead): " << res.edgesSkippedMirror << "\n"
-             << "  edges considered:        " << res.edgesConsidered
-             << " (coverage >= " << minCommonForHet << ")\n"
-             << "  edges skipped coverage:  " << res.edgesSkippedCoverage << "\n"
-             << "  edges skipped length:    " << res.edgesSkippedLen << "\n"
-             << "  edges skipped identical: " << res.edgesSkippedIdentical << "\n"
-             << "  edges MSA'd:             " << res.edgesMsad << "\n"
-             << "  edges with real sites:   " << res.edgesPlanned
-             << " (of which multi-site: " << res.edgesPlannedMultiSite << ")\n"
-             << "  deferred end-bubble:     " << res.edgesDeferredEndBubble << "\n"
-             << "  deferred complex:        " << res.edgesDeferredComplex << "\n"
-             << "  sites transcribed:       " << res.sitesTranscribed << "\n"
-             << "  het anchors created:     " << res.hetAnchorsCreated << "\n"
-             << "  elapsed:                 " << res.elapsedSeconds << " s"
-             << endl;
-        // detectionGraph goes out of scope here -- superseded by the graph
-        // rebuilt from the updated journeys below.
-    } else {
-        cout << timestamp << "Het-bubble transcription disabled "
-             << "(Assembly.mode3.transcribeHetBubbles false): building the "
-             << "anchor graph once from the journeys, no het anchors created."
-             << endl;
-    }
-
-    // Rebuild journeys if EITHER detector appended anchors -- the CIGAR-driven
-    // one above or transcribeHetBubbles. This is the step that makes a new
+    // Rebuild journeys if the CIGAR-driven detector appended anchors. This is
+    // the step that makes a new
     // anchor real: until a read's journey contains it, it is just an isolated
     // vertex the graph builder never links, so the assembly graph comes out
     // unchanged and the anchors do nothing. (That is exactly what happened when
-    // this rebuild was still nested inside the transcribeHetBubbles branch.)
+    // this rebuild was still nested inside a since-removed branch.)
     if(shasta2Anchors->size() > newAnchorsBegin) {
         cout << timestamp << "Rebuilding journeys to include "
              << (shasta2Anchors->size() - newAnchorsBegin)
