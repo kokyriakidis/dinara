@@ -2735,9 +2735,6 @@ public:
     void exploreAnchorGraph(const vector<string>&, ostream&);
 
     // Http server functions for the directed anchor graph (Verkko-style).
-    void exploreDirectedAnchorGraph(const vector<string>&, ostream&);
-    void exploreDirectedAnchorGraphNode(const vector<string>&, ostream&);
-    void exploreDirectedAnchorGraphPath(const vector<string>&, ostream&);
 
 
 public:

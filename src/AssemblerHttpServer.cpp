@@ -253,9 +253,6 @@ void Assembler::fillServerFunctionTable()
     DINARA_ADD_TO_FUNCTION_TABLE(exploreAnchorPair);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreJourney);
 
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraph);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphNode);
-    DINARA_ADD_TO_FUNCTION_TABLE(exploreDirectedAnchorGraphPath);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreReadFollowing);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAssembly);
     DINARA_ADD_TO_FUNCTION_TABLE(exploreLocalAnchorGraph);
@@ -562,12 +559,6 @@ void Assembler::writeNavigation(ostream& html) const
 
         writeNavigation(html, "Anchor Graph", {
             {"Graph summary", "exploreAnchorGraph"},
-            });
-
-        writeNavigation(html, "Directed Anchor Graph", {
-            {"Graph summary", "exploreDirectedAnchorGraph"},
-            {"Node", "exploreDirectedAnchorGraphNode"},
-            {"Path", "exploreDirectedAnchorGraphPath"},
             });
 
         writeNavigation(html, "Shasta2 Anchor Graph", {
