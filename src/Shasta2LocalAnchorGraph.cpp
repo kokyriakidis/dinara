@@ -1,7 +1,6 @@
 // Shasta.
 #include "Shasta2LocalAnchorGraph.hpp"
 #include "Shasta2AnchorGraph.hpp"
-#include "Shasta2AssemblyGraphPostprocessor.hpp"
 #include "computeLayout.hpp"
 #include "html.hpp"
 #include "HttpServer.hpp"
@@ -151,27 +150,21 @@ Shasta2LocalAnchorGraph::Shasta2LocalAnchorGraph(
 
 void Shasta2LocalAnchorGraph::writeGraphviz(
     const string& fileName,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer) const
+    const Shasta2LocalAnchorGraphDisplayOptions& options) const
 {
     ofstream file(fileName);
-    writeGraphviz(file, options, assemblyGraph3Pointer);
+    writeGraphviz(file, options);
 }
 
 
 
 void Shasta2LocalAnchorGraph::writeGraphviz(
     ostream& s,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer) const
+    const Shasta2LocalAnchorGraphDisplayOptions& options) const
 {
     const Shasta2LocalAnchorGraph& graph = *this;
     DINARA_ASSERT(anchorGraphPointer);
     const Shasta2AnchorGraph& anchorGraph = *anchorGraphPointer;
-
-    if(options.vertexColoring == "byAssemblyAnnotations") {
-        DINARA_ASSERT(assemblyGraph3Pointer);
-    }
 
     Shasta2AnchorId referenceAnchorId = invalid<Shasta2AnchorId>;
     if(options.vertexColoring == "byReadComposition") {
@@ -193,25 +186,7 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
         const string anchorIdString = shasta2AnchorIdToString(anchorId);
         const uint64_t coverage = anchors[anchorId].coverage();
 
-        // Get annotation information, if needed.
-        bool hasVertexAnnotation = false;
-        vector<Shasta2AssemblyGraph::edge_descriptor> annotationEdges;
-        if(options.vertexColoring == "byAssemblyAnnotations") {
-            hasVertexAnnotation = assemblyGraph3Pointer->hasVertexAnnotation(anchorId);
-            assemblyGraph3Pointer->findAnnotationEdges(anchorId, annotationEdges);
-        }
-
-        // Annotation text.
-        string annotationText;
-        if(options.vertexColoring == "byAssemblyAnnotations") {
-            if(hasVertexAnnotation) {
-                annotationText = "\\nVertex";
-            }
-            for(const Shasta2AssemblyGraph::edge_descriptor e: annotationEdges) {
-                annotationText.append("\\n");
-                annotationText.append(to_string((*assemblyGraph3Pointer)[e].id));
-            }
-        }
+        const string annotationText;
 
         // Vertex name.
         s << "\"" << anchorIdString << "\"";
@@ -271,19 +246,6 @@ void Shasta2LocalAnchorGraph::writeGraphviz(
                 } else {
                     s << " color=" << colorString;
                     s << " fillcolor=" << colorString;
-                }
-            } else if(options.vertexColoring == "byAssemblyAnnotations") {
-                if(hasVertexAnnotation) {
-                    s << " style=filled fillcolor=Red";
-                } else {
-                    if(annotationEdges.size() > 1) {
-                        s << " style=filled fillcolor=Green";    // Multiple segments
-                    } else if(annotationEdges.size() == 1) {
-                        const uint64_t segmentId = (*assemblyGraph3Pointer)[annotationEdges.front()].id;
-                        const uint32_t hashValue = MurmurHash2(&segmentId, sizeof(segmentId), 759);
-                        const uint32_t hue = hashValue % 1000;
-                        s << "style=filled fillcolor=\"" << double(hue / 1000.) << " .6 .9\"";
-                    }
                 }
             }        }
 
@@ -555,8 +517,7 @@ void Shasta2LocalAnchorGraphDisplayOptions::writeForm(ostream& html) const
 
     // Vertex coloring using assembly annotations.
     html <<
-        "<input type=radio required name=vertexColoring value='byAssemblyAnnotations'" <<
-        (vertexColoring == "byAssemblyAnnotations" ? " checked=on" : "") <<
+
         "> By annotations on assembly stage "
         "<input type=text name=assemblyStage style='text-align:center'";
         if(not assemblyStage.empty()) {
@@ -606,18 +567,17 @@ void Shasta2LocalAnchorGraphDisplayOptions::writeForm(ostream& html) const
 
 void Shasta2LocalAnchorGraph::writeHtml(
     ostream& html,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer)
+    const Shasta2LocalAnchorGraphDisplayOptions& options)
 {
     if((options.layoutMethod == "dot") and (options.vertexLabels or options.edgeLabels)) {
 
         // Use svg output from graphviz.
-        writeHtml1(html, options, assemblyGraph3Pointer);
+        writeHtml1(html, options);
 
     } else {
 
         // Compute graph layout and use it to generate svg.
-        writeHtml2(html, options, assemblyGraph3Pointer);
+        writeHtml2(html, options);
 
     }
 }
@@ -627,15 +587,14 @@ void Shasta2LocalAnchorGraph::writeHtml(
 // This is the code that uses svg output from graphviz.
 void Shasta2LocalAnchorGraph::writeHtml1(
     ostream& html,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer) const
+    const Shasta2LocalAnchorGraphDisplayOptions& options) const
 {
 
 
         // Write it out in graphviz format.
         const string uuid = to_string(boost::uuids::random_generator()());
         const string dotFileName = tmpDirectory() + uuid + ".dot";
-        writeGraphviz(dotFileName, options, assemblyGraph3Pointer);
+        writeGraphviz(dotFileName, options);
 
         // Use graphviz to compute the layout.
         const string svgFileName = dotFileName + ".svg";
@@ -692,8 +651,7 @@ void Shasta2LocalAnchorGraph::writeHtml1(
 // then creates the svg.
 void Shasta2LocalAnchorGraph::writeHtml2(
     ostream& html,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer)
+    const Shasta2LocalAnchorGraphDisplayOptions& options)
 {
     // Use scientific notation because svg does not accept floating points
     // ending with a decimal point.
@@ -723,7 +681,7 @@ void Shasta2LocalAnchorGraph::writeHtml2(
     writeEdges(html, options);
 
     // Write the vertices.
-    writeVertices(html, options, assemblyGraph3Pointer);
+    writeVertices(html, options);
 
     // Finish the svg.
     html << "</svg></div>";
@@ -837,14 +795,9 @@ void Shasta2LocalAnchorGraph::Box::extend(double factor)
 
 void Shasta2LocalAnchorGraph::writeVertices(
     ostream& html,
-    const Shasta2LocalAnchorGraphDisplayOptions& options,
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraph3Pointer) const
+    const Shasta2LocalAnchorGraphDisplayOptions& options) const
 {
     const Shasta2LocalAnchorGraph& graph = *this;
-
-    if(options.vertexColoring == "byAssemblyAnnotations") {
-        DINARA_ASSERT(assemblyGraph3Pointer);
-    }
 
     const double scalingFactor =
         (options.layoutMethod == "sfdp") ? 0.002 : 0.01;
@@ -881,17 +834,6 @@ void Shasta2LocalAnchorGraph::writeVertices(
             anchors.analyzeAnchorPair(referenceAnchorId, anchorId, info);
         }
 
-        // Get annotation information, if needed.
-        bool hasVertexAnnotation = false;
-        vector<Shasta2AssemblyGraph::edge_descriptor> annotationEdges;
-        if(options.vertexColoring == "byAssemblyAnnotations") {
-            hasVertexAnnotation = assemblyGraph3Pointer->hasVertexAnnotation(anchorId);
-            if(not hasVertexAnnotation) {
-                assemblyGraph3Pointer->findAnnotationEdges(anchorId, annotationEdges);
-            }
-        }
-
-
         // Choose the color for this vertex.
         string color;
         if(vertex.distance == maxDistance) {
@@ -919,21 +861,6 @@ void Shasta2LocalAnchorGraph::writeVertices(
                     ",100%,50%)";
 
             }
-        } else if(options.vertexColoring == "byAssemblyAnnotations") {
-            if(hasVertexAnnotation) {
-                color = "Red";
-            } else {
-                if(annotationEdges.size() > 1) {
-                    color = "Green";    // Multiple segments
-                } else if(annotationEdges.size() == 1) {
-                    const uint64_t segmentId = (*assemblyGraph3Pointer)[annotationEdges.front()].id;
-                    const uint32_t hashValue = MurmurHash2(&segmentId, sizeof(segmentId), 759);
-                    const uint32_t hue = hashValue % 360;
-                    color = "hsl(" + to_string(hue) + ",50%,50%)";
-                } else {
-                    color = "Black";
-                }
-            }
         } else {
             color = "Black";
         }
@@ -956,16 +883,6 @@ void Shasta2LocalAnchorGraph::writeVertices(
                 ", J' " << info.correctedJaccard();
             if(info.common > 0) {
                 html << ", offset " << info.offsetInBases;
-            }
-        }
-        if(options.vertexColoring == "byAssemblyAnnotations") {
-            if(hasVertexAnnotation) {
-                html << ", assembly graph vertex";
-            } else if(annotationEdges.size() > 1) {
-                html << ", multiple segments";
-            } else if(annotationEdges.size() == 1) {
-                const uint64_t segmentId = (*assemblyGraph3Pointer)[annotationEdges.front()].id;
-                html << ", segment " << segmentId;
             }
         }
         html << "</title></circle>";

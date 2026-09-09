@@ -1,5 +1,4 @@
 #include "Assembler.hpp"
-#include "Shasta2AssemblyGraphPostprocessor.hpp"
 #include "Shasta2AnchorGraph.hpp"
 #include "Shasta2AnchorPair.hpp"
 #include "Shasta2Anchors.hpp"
@@ -195,78 +194,6 @@ void Assembler::exploreShasta2Anchor(const vector<string>& request, ostream& htm
 
 
 
-    // Assembly graph annotations, if requested.
-    if(not assemblyStage.empty()) {
-
-        const Shasta2AssemblyGraphOptions options;
-        const Shasta2AssemblyGraphPostprocessor& assemblyGraph =
-            getShasta2AssemblyGraph(assemblyStage, options);
-        const auto annotations = assemblyGraph.getAnnotations(anchorId);
-
-        html << "<h2>Assembly graph annotations at assembly stage " << assemblyStage << "</h2>";
-
-        if(annotations.empty()) {
-            html << "This Shasta2Anchor is not referenced in assembly stage " << assemblyStage;
-        } else {
-            html << "<ul>";
-
-            for(const auto& annotation: annotations) {
-                html << "<li>";
-
-                if(annotation.v == Shasta2AssemblyGraph::null_vertex()) {
-                    // This Shasta2AnchorId is used in a step.
-                    const Shasta2AssemblyGraphEdge& edge = assemblyGraph[annotation.e];
-                    const string segmentUrl = "exploreShasta2SegmentSteps?assemblyStage=" + assemblyStage +
-                        "&segmentName=" + to_string(edge.id);
-                    const string stepUrl = "exploreShasta2SegmentStep?assemblyStage=" + assemblyStage +
-                        "&segmentName=" + to_string(edge.id) + "&stepId=" + to_string(annotation.step);
-                    html <<
-                        "Segment <a href='" << segmentUrl << "'>" << edge.id << "</a>"
-                        ", step <a href='" << stepUrl << "'>" << annotation.step << "</a>"
-                        " of " << edge.size() <<
-                        ", " <<
-                        (annotation.isAnchorIdA ? "first" : "second") <<
-                        " anchor.";
-
-                } else {
-
-                    // This Shasta2AnchorId is used in a vertex.
-                    const Shasta2AssemblyGraph::vertex_descriptor v = annotation.v;
-                    html << "Assembly graph vertex with";
-
-                    // Incoming segments.
-                    if(in_degree(v, assemblyGraph) == 0) {
-                        html << " no incoming segments";
-                    } else {
-                        html << " incoming segments";
-                        BGL_FORALL_INEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
-                            const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
-                            const string segmentUrl = "exploreShasta2SegmentSteps?assemblyStage=" + assemblyStage +
-                                "&segmentName=" + to_string(edge.id);
-                            html << " <a href='" << segmentUrl << "'>" << edge.id << "</a>";
-                        }
-                        html << ",";
-                    }
-
-                    // Outgoing segments.
-                    if(out_degree(v, assemblyGraph) == 0) {
-                        html << " no outgoing segments";
-                    } else {
-                        html << " outgoing segments";
-                        BGL_FORALL_OUTEDGES(v, e, assemblyGraph, Shasta2AssemblyGraph) {
-                            const Shasta2AssemblyGraphEdge& edge = assemblyGraph[e];
-                            const string segmentUrl = "exploreShasta2SegmentSteps?assemblyStage=" + assemblyStage +
-                                "&segmentName=" + to_string(edge.id);
-                            html << " <a href='" << segmentUrl << "'>" << edge.id << "</a>";
-                        }
-                        html << ".";
-                    }
-                }
-            }
-
-            html << "</ul>";
-        }
-    }
 
 
 
@@ -766,16 +693,6 @@ void Assembler::exploreShasta2LocalAnchorGraph(
     const Shasta2AnchorGraph& anchorGraph = *shasta2AnchorGraph;
 
 
-    // If needed, get the AssemblyGraph for this assembly stage.
-    const Shasta2AssemblyGraphPostprocessor* assemblyGraphPointer = 0;
-    if(displayOptions.vertexColoring == "byAssemblyAnnotations") {
-        const Shasta2AssemblyGraphOptions options;
-        const Shasta2AssemblyGraphPostprocessor& assemblyGraph =
-            getShasta2AssemblyGraph(displayOptions.assemblyStage, options);
-        assemblyGraphPointer = &assemblyGraph;
-    }
-
-
 
     // Create the Shasta2LocalAnchorGraph starting from these AnchorIds and moving
     // away up to the specified distance.
@@ -792,7 +709,7 @@ void Assembler::exploreShasta2LocalAnchorGraph(
          " vertices and " << num_edges(graph) << " edges.";
 
     // Write it to html.
-    graph.writeHtml(html, displayOptions, assemblyGraphPointer);
+    graph.writeHtml(html, displayOptions);
 
 }
 

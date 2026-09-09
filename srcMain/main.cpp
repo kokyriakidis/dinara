@@ -24,7 +24,6 @@
 #include "Shasta2AnchorsFromSplitVertices.hpp"
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
-#include "Shasta2AssemblyGraph.hpp"
 
 #include "DinaraDetangle.hpp"
 #include "WindowTransitions.hpp"
@@ -3184,58 +3183,6 @@ void dinara::main::assemble(
         cout << timestamp << "Wrote shasta2 anchor graph. Use "
              << "--external-anchor-graph-name " << externalAnchorGraphName << endl;
     } 
-
-    // Build the assembly graph from the anchor graph. This collapses each
-    // maximal non-branching anchor chain into a single segment (compress), so
-    // the graph is far smaller than the anchor graph while preserving its
-    // topology. Iterative short-tip removal + compress then cleans dangling
-    // ends, mirroring the cleanup used in the later (disabled) pipeline.
-    {
-        cout << timestamp << "Creating Shasta2AssemblyGraph (with het bubbles) from "
-             << "the anchor graph..." << endl;
-        Shasta2AssemblyGraphOptions shasta2AssemblyGraphOptions;
-        assembler.shasta2AssemblyGraph = make_shared<Shasta2AssemblyGraph>(
-            *shasta2Anchors,
-            *shasta2Journeys,
-            *assembler.shasta2AnchorGraph,
-            anchorWindows,
-            shasta2AssemblyGraphOptions);
-        auto& shasta2AssemblyGraph = assembler.shasta2AssemblyGraph;
-        shasta2AssemblyGraph->compress();
-        shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph.gfa");
-
-        // Iterative tip removal + compress. Shorter tips are processed first so
-        // their removal can expose longer ones; loop until nothing changes.
-        //
-        // removeShortTips gates each tip on BOTH a window-span cap
-        // (maxTipWindows) and a byte-length cap (maxTipLength). The window span
-        // is the primary topological guardrail. On the journey-based anchor
-        // graph there are NO windows (anchorWindows is empty), so every edge's
-        // windowSequence is empty and the window guard degenerates to a constant
-        // 0 <= maxTipWindows -- always true -- leaving only the far-too-permissive
-        // length cap (2 * averageReadLength). With no long, window-anchored
-        // backbone to protect, that length-only cascade peels the entire graph to
-        // 0 segments. So skip window-based tip removal when there are no windows;
-        // the compressed graph is written as-is. (Journey-path tip cleanup, if
-        // wanted, needs a topology-aware metric rather than window span -- see
-        // Shasta2AssemblyGraph::removeShortTips.)
-        if(!anchorWindows.empty()) {
-            const uint32_t maxTipWindows = 3;
-            const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
-            for(;;) {
-                uint64_t changeCount = 0;
-                changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
-                shasta2AssemblyGraph->compress();
-                if(changeCount == 0) break;
-            }
-        } else {
-            cout << timestamp << "No anchor windows (journey-based graph): "
-                 << "skipping window-based tip removal for the cleaned graph."
-                 << endl;
-        }
-        shasta2AssemblyGraph->writeGfa("Shasta2AssemblyGraph-cleaned.gfa");
-        cout << timestamp << "Wrote Shasta2AssemblyGraph.gfa / -cleaned.gfa" << endl;
-    }
 
     // Store elapsed time for assembly.
     const auto steadyClock1 = std::chrono::steady_clock::now();

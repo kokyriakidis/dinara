@@ -15,7 +15,6 @@ namespace dinara {
     class Shasta2LocalAnchorGraphVertex;
     class Shasta2LocalAnchorGraphEdge;
     class Shasta2LocalAnchorGraphDisplayOptions;
-    class Shasta2AssemblyGraphPostprocessor;
 
     using Shasta2LocalAnchorGraphBaseClass = boost::adjacency_list<
         boost::listS,
@@ -98,28 +97,23 @@ public:
 
     void writeHtml(
         ostream& html,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*);
+        const Shasta2LocalAnchorGraphDisplayOptions&);
     void writeHtml1(
         ostream& html,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*) const;
+        const Shasta2LocalAnchorGraphDisplayOptions&) const;
 
     void writeGraphviz(
         const string& fileName,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*) const;
+        const Shasta2LocalAnchorGraphDisplayOptions&) const;
     void writeGraphviz(
         ostream&,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*) const;
+        const Shasta2LocalAnchorGraphDisplayOptions&) const;
 
 private:
     // Html/svg output without using svg output created by Graphviz.
     void writeHtml2(
         ostream& html,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*);
+        const Shasta2LocalAnchorGraphDisplayOptions&);
 
     // The position of each vertex in the computed layout.
     std::map<vertex_descriptor, array<double, 2> > layout;
@@ -142,8 +136,7 @@ private:
 
     void writeVertices(
         ostream& html,
-        const Shasta2LocalAnchorGraphDisplayOptions&,
-        const Shasta2AssemblyGraphPostprocessor*) const;
+        const Shasta2LocalAnchorGraphDisplayOptions&) const;
     void writeEdges(
         ostream& html,
         const Shasta2LocalAnchorGraphDisplayOptions&) const;
