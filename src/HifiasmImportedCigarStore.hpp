@@ -121,8 +121,8 @@ namespace dinara {
                 const CigarToken raw(tokens[i]);
                 const uint8_t op = raw.op();
                 const uint8_t dinaraOp =
-                    (op == CigarOpIns) ? CigarOpDel :
-                    (op == CigarOpDel) ? CigarOpIns : op;
+                    (op == CigarOpIns) ? uint8_t(CigarOpDel) :
+                    (op == CigarOpDel) ? uint8_t(CigarOpIns) : op;
                 arena.emplace_back(CigarToken(dinaraOp, raw.len()));
                 if(opConsumesQuery(dinaraOp))  querySpan  += raw.len();
                 if(opConsumesTarget(dinaraOp)) targetSpan += raw.len();

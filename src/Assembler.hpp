@@ -479,62 +479,6 @@ public:
     // Must be called after createMarkerGraphVertices and computeCandidateTable.
     void filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount);
 
-    // Create mode3 anchors from a subset of marker graph vertices selected by a sweep-line over
-    // overlap start/end events on each oriented read (using read-graph overlaps).
-    // This produces fewer anchors than using all marker graph vertices, while preserving
-    // marker-graph semantics for each anchor.
-    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesAtOverlapEvents(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
-
-    // Create mode3 anchors from marker graph vertices selected as follows:
-    // - Use a sweep-line over overlap start/end events for each oriented read (from readGraph overlaps).
-    // - For each maximal interval where the active overlap count is >0, scan all marker ordinals in the interval
-    //   and select the marker graph vertex (canonicalized by RC) with maximum vertex coverage in the requested range.
-    // This produces significantly fewer, stronger anchors than using all marker graph vertices.
-    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount,
-        bool enableColinearityPeeling = false,
-        double minDominantFractionToPeel = 0.9);
-
-    // Like createAnchorsFromMarkerGraphVerticesBestPerOverlapInterval, but each selected marker graph vertex
-    // is validated/split using the filtered readGraph overlaps among the oriented reads present in the vertex.
-    // This avoids a single bridging read collapsing two unrelated regions into one anchor.
-    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesBestPerOverlapIntervalDecomposed(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
-
-    // Create mode3 anchors from *all* marker graph vertices, but split each marker graph vertex
-    // into multiple anchors if the oriented reads inside the vertex fall into multiple clusters
-    // based on surviving readGraph overlaps. This mitigates DSU transitive-collapse caused by
-    // chimeric/bridging reads.
-    shared_ptr<mode3::Anchors> createAnchorsFromMarkerGraphVerticesSplitUsingReadGraph(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        const Mode3AssemblyOptions& mode3Options,
-        uint64_t threadCount);
-
-    // Create mode3 anchors directly from filtered overlaps without using markerGraph vertices.
-    // For each oriented read, sweep overlap start/end events to find maximal intervals with active overlaps,
-    // then select one marker ordinal per interval and gather matching marker ordinals on overlapping reads
-    // using AlignmentInfo ordinal-offset bounds and k-mer validation.
-    shared_ptr<mode3::Anchors> createAnchorsFromOverlapsBestPerOverlapInterval(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
-
-    // BidirectionalReadGraph-aware variant of createAnchorsFromOverlapsBestPerOverlapInterval.
-    // Uses orientation-aware traversal via edge.traverse() instead of the strand-doubled
-    // ReadGraph, preserving cross-strand overlaps at inversion/segdup boundaries.
-    shared_ptr<mode3::Anchors> createAnchorsFromOverlapsBestPerOverlapIntervalBidirectional(
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage,
-        uint64_t threadCount);
-
     // Create anchors from BRG-aware (self-RC) marker graph vertices.
     // Handles self-RC vertices by extracting only strand-0 markers for the
     // forward anchor and deriving the RC anchor by flipping.

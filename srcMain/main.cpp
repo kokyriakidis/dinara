@@ -1221,7 +1221,8 @@ void dinara::main::assemble(
 #else
     constexpr uint64_t maxK = 62;
 #endif
-    if(assemblerOptions.kmersOptions.k > maxK or assemblerOptions.kmersOptions.k < 6) {
+    if(assemblerOptions.kmersOptions.k < 6 or
+       uint64_t(assemblerOptions.kmersOptions.k) > maxK) {
         throw runtime_error("Invalid value specified for --Kmers.k. Must be between 6 and " +
             to_string(maxK) + ".");
     }
@@ -2795,16 +2796,6 @@ void dinara::main::assemble(
             // (read, stored position); if one anchor accounts for most of the
             // arm, the arm is redundant with it.
             {
-                // The share of an arm one existing anchor must account for
-                // before the arm counts as a clone of it. Placed in the empty
-                // gap of the measured distribution rather than picked: arms
-                // divide sharply into 404 with no overlap at all plus one at
-                // 10%, then nothing until a cluster at 70/80/90/100%. Anywhere
-                // in 0.2-0.7 selects exactly that cluster, so the precise value
-                // does not matter -- which is the property to want from a
-                // threshold. An earlier 0.8 sat INSIDE the cluster and missed
-                // the three arms at 70%.
-                constexpr double redundantArmFraction = 0.5;
                 std::unordered_map<uint64_t, Shasta2AnchorId> occupant;
                 const uint64_t existing = shasta2Anchors->size();
                 for(Shasta2AnchorId id = 0; id < existing; id++) {
@@ -2815,99 +2806,6 @@ void dinara::main::assemble(
                     }
                 }
                 const uint32_t hetKHalf2 = hetAnchorKHalf();
-                uint64_t armsRedundant = 0, armsPartial = 0, armsClear = 0;
-                for(const Assembler::CigarSnpSite& site: snpSites) {
-                    for(const auto& members: site.alleles) {
-                        if(members.empty()) continue;
-                        std::unordered_map<Shasta2AnchorId, uint64_t> hits;
-                        for(const auto& m: members) {
-                            const auto it = occupant.find(
-                                (uint64_t(m.first.getValue()) << 32) |
-                                uint64_t(m.second + hetKHalf2));
-                            if(it != occupant.end()) hits[it->second]++;
-                        }
-                        uint64_t best = 0;
-                        for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
-                        const double frac = double(best) / double(members.size());
-                        if(frac >= redundantArmFraction) ++armsRedundant;
-                        else if(best > 0) ++armsPartial;
-                        else ++armsClear;
-                    }
-                }
-                {
-                    // Is 0.8 a real boundary or an arbitrary cut on a slope?
-                    // Bucket every arm by the share one existing anchor accounts
-                    // for; a clean split means the threshold's exact value does
-                    // not matter.
-                    std::array<uint64_t, 11> bucket{};
-                    for(const Assembler::CigarSnpSite& site: snpSites) {
-                        for(const auto& members: site.alleles) {
-                            if(members.empty()) continue;
-                            std::unordered_map<Shasta2AnchorId, uint64_t> hits;
-                            for(const auto& m: members) {
-                                const auto it = occupant.find(
-                                    (uint64_t(m.first.getValue()) << 32) |
-                                    uint64_t(m.second + hetKHalf2));
-                                if(it != occupant.end()) hits[it->second]++;
-                            }
-                            uint64_t best = 0;
-                            for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
-                            bucket[std::min<size_t>(10,
-                                size_t(10.0 * double(best) / double(members.size())))]++;
-                        }
-                    }
-                    cout << timestamp << "  arm overlap with the single best existing anchor:";
-                    for(size_t i = 0; i < bucket.size(); i++)
-                        if(bucket[i]) cout << " " << (i * 10) << "%:" << bucket[i];
-                    cout << endl;
-                }
-                // Is the SITE already separated by existing anchors?
-                //
-                // A het anchor exists to split reads that are currently in the
-                // same anchor. If allele A's reads and allele B's reads already
-                // sit in DIFFERENT existing anchors at this position, the marker
-                // graph has separated them (their k=50 k-mers differ at the SNP
-                // base) and there is nothing left to do. Classify each site by
-                // where its two arms land, which is a question about conflation
-                // and needs no fraction.
-                {
-                    uint64_t conflated = 0, separated = 0, partlyAnchored = 0, unanchored = 0;
-                    for(const Assembler::CigarSnpSite& site: snpSites) {
-                        if(site.alleles.size() != 2) continue;
-                        std::array<std::set<Shasta2AnchorId>, 2> land;
-                        std::array<uint64_t, 2> free{0, 0};
-                        for(size_t k = 0; k < 2; k++) {
-                            for(const auto& m: site.alleles[k]) {
-                                const auto it = occupant.find(
-                                    (uint64_t(m.first.getValue()) << 32) |
-                                    uint64_t(m.second + hetKHalf2));
-                                if(it == occupant.end()) ++free[k];
-                                else land[k].insert(it->second);
-                            }
-                        }
-                        const bool aAnchored = !land[0].empty();
-                        const bool bAnchored = !land[1].empty();
-                        if(!aAnchored && !bAnchored) { ++unanchored; continue; }
-                        if(aAnchored && bAnchored) {
-                            std::vector<Shasta2AnchorId> both;
-                            std::set_intersection(land[0].begin(), land[0].end(),
-                                land[1].begin(), land[1].end(), std::back_inserter(both));
-                            if(both.empty()) ++separated; else ++conflated;
-                        } else {
-                            ++partlyAnchored;
-                        }
-                    }
-                    cout << timestamp << "  sites by existing-anchor separation: "
-                         << unanchored << " neither arm anchored (het anchors do the work), "
-                         << separated << " arms in DIFFERENT anchors (already separated), "
-                         << conflated << " arms share an anchor (still conflated), "
-                         << partlyAnchored << " only one arm anchored." << endl;
-                }
-                cout << timestamp << "CIGAR het arms vs existing anchors: "
-                     << armsRedundant << " arm(s) are mostly accounted for by ONE "
-                        "existing anchor (redundant), " << armsPartial
-                     << " partially overlap one, " << armsClear
-                     << " touch no occupied position." << endl;
 
                 // Drop the redundant ones. A marker anchor sitting at the SNP
                 // position ALREADY separates the alleles -- reads carrying the
@@ -3191,7 +3089,7 @@ void dinara::main::assemble(
         // Tip cleanup: a het/hom anchor can still end up one-sided (e.g. if
         // every one of its member reads happens to have it as the first/last
         // entry of its filtered journey); iterate until stable.
-        for(uint64_t tipPass = 0; ; ++tipPass) {
+        for(;;) {
             const uint64_t hetTips =
                 assembler.shasta2AnchorGraph->removeHetArmTips(*shasta2Anchors);
             if(hetTips == 0) break;
@@ -3324,7 +3222,7 @@ void dinara::main::assemble(
         if(!anchorWindows.empty()) {
             const uint32_t maxTipWindows = 3;
             const uint64_t maxTipLength = (maxTipWindows - 1) * averageReadLength;
-            for(uint64_t cleanRound = 0; ; cleanRound++) {
+            for(;;) {
                 uint64_t changeCount = 0;
                 changeCount += shasta2AssemblyGraph->removeShortTips(maxTipWindows, maxTipLength);
                 shasta2AssemblyGraph->compress();
