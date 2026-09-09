@@ -5,18 +5,13 @@
 
 // Dinara.
 #include "Assembler.hpp"
+#include "HetAnchorK.hpp"
+#include "platformDependent.hpp"
 #include "AssemblerOptions.hpp"
-#include "buildId.hpp"
 #include "filesystem.hpp"
-#include "mode3-Anchor.hpp"
 
-#include "mode3-DirectedAnchors.hpp"
-#include "mode3-DirectedAnchorGraph.hpp"
-#include "mode3-AnchorGraph.hpp"
-#include "mode3-AnchorGraphSuperbubbles.hpp"
 #include "Shasta2Anchors.hpp"
 #include "Shasta2AnchorPair.hpp"
-#include "Shasta2AnchorsFromSplitVertices.hpp"
 #include "Shasta2Journeys.hpp"
 #include "Shasta2AnchorGraph.hpp"
 
@@ -24,7 +19,6 @@
 #include "Reads.hpp"
 #include "Tee.hpp"
 #include "timestamp.hpp"
-#include "platformDependent.hpp"
 
 // hifiasm candidate-overlap detector (submodule). C API used to generate read
 // overlaps (with aligned intervals and CIGARs) directly in memory.
@@ -51,17 +45,14 @@ using namespace dinara;
 #include <memory>
 #include <fstream>
 #include <map>
-#include "iostream.hpp"
 #include <set>
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
 
-#include "stdexcept.hpp"
 
 
 // Shasta 2 Integration
-#include "HetAnchorK.hpp"
 #include <atomic>
 #include <exception>
 #include <mutex>
@@ -69,9 +60,6 @@ using namespace dinara;
 #include <vector>
 
 // Minimizer filtering
-#include "MinimizerChecker.hpp"
-#include "MarkerKmers.hpp"
-#include "KmerCounter.hpp"
 
 
 
