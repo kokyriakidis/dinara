@@ -403,6 +403,24 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     uint64_t exportedCount = 0;
     uint64_t droppedMemberCount = 0;
 
+    // INVARIANTS OF THE EXPORTED SET, checked here rather than by an external
+    // script, so a change that breaks them cannot ship. Each one corresponds to
+    // a failure that actually occurred while this path was being built:
+    //
+    //   emptyAnchors        an anchor exported with no members is a vertex no
+    //                       read traverses -- a hole in the graph shasta2 loads.
+    //   thinAnchors         tie resolution once thinned coverage-2 anchors to a
+    //                       single member, silently breaking the coverage floor
+    //                       every anchor was selected under.
+    //   position collisions two anchors at one base of one read is what
+    //                       shasta2's positionOffsetAB rejects outright; the
+    //                       whole tie mechanism exists to prevent it.
+    //
+    // The per-read position map is the only added cost: one entry per exported
+    // member, which is the same order as the data being written.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> positionsByOrientedRead;
+    uint64_t emptyAnchors = 0, thinAnchors = 0;
+
     // Optional dump of the EXACT exported (anchorId, orientedRead, rawPosition)
     // tuples, so shasta2's journey-graph construction can be reconstructed
     // offline to diagnose isolated circular chains. Enabled with
@@ -500,10 +518,11 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
             ++keptMembers;
         }
 
-        // A drop can empty an anchor (or leave it a singleton). shasta2 accepts
-        // low-coverage external anchors; still export the (possibly empty)
-        // anchor to preserve the sequential id-to-id mapping shasta2 relies on.
-        (void)keptMembers;
+        // Still export a thin or empty anchor to preserve the sequential
+        // id-to-id mapping shasta2 relies on, but count it: both states are
+        // supposed to be unreachable, and the report below says so out loud.
+        if(keptMembers == 0) ++emptyAnchors;
+        else if(keptMembers < 2) ++thinAnchors;
 
         data.appendVector();
         names.appendVector(anchorName.begin(), anchorName.end());
@@ -542,6 +561,8 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
             // External anchors store the raw position (first base of the k-mer).
             const uint32_t rawPosition = markerInfo.position - exportShift;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
+            positionsByOrientedRead[markerInfo.orientedReadId.getValue()]
+                .push_back(rawPosition);
             if(expDump) {
                 std::fprintf(expDump, "%llu\t%llu\t%u\t%d\n",
                     (unsigned long long)anchorId,
@@ -556,6 +577,31 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     if(droppedMemberCount > 0) {
         cout << "Dropped " << droppedMemberCount
              << " anchor member(s) to resolve journey position ties." << endl;
+    }
+
+    uint64_t positionCollisions = 0, readsWithCollision = 0;
+    for(auto& [orientedReadValue, positions]: positionsByOrientedRead) {
+        static_cast<void>(orientedReadValue);
+        if(positions.size() < 2) continue;
+        std::sort(positions.begin(), positions.end());
+        uint64_t here = 0;
+        for(size_t i = 1; i < positions.size(); i++) {
+            if(positions[i] == positions[i - 1]) ++here;
+        }
+        if(here) { positionCollisions += here; ++readsWithCollision; }
+    }
+
+    cout << "External anchor invariants: " << emptyAnchors << " empty, "
+         << thinAnchors << " below 2 members, " << positionCollisions
+         << " position collision(s) on " << readsWithCollision << " read(s)."
+         << endl;
+    if(positionCollisions > 0) {
+        throw runtime_error(
+            "Shasta2 external-anchor export failed: " +
+            to_string(positionCollisions) + " position collision(s) across " +
+            to_string(readsWithCollision) + " oriented read(s). Two anchors "
+            "share a base in one read, which shasta2's positionOffsetAB "
+            "rejects; the journey tie resolution should have prevented this.");
     }
 
     return exportedCount;
