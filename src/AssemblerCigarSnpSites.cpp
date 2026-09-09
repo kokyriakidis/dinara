@@ -171,18 +171,46 @@ void Assembler::detectCigarSnpSites(
     // stream carries no marker of where the hole was. Walking such a record from
     // qStart/tStart silently desynchronises (measured: 0.12% of records on the
     // GIAB fixture, 0.48% at 251k overlaps).
-    vector<vector<const HifiasmImportedCigarStore::Record*>> byRead(readCount);
+    // Flat CSR index rather than vector<vector<>>: one vector per read would be
+    // an allocation per read and 24 bytes of header each even for reads with no
+    // overlaps, which on a full dataset is millions of allocations for something
+    // that is written once and then only read. Count degrees, prefix-sum into
+    // offsets, then fill -- two passes over the records and two allocations
+    // total, contiguous for the walk that follows.
+    vector<uint64_t> byReadBegin(readCount + 1, 0);
     uint64_t usable = 0, skippedShort = 0, skippedNoCigar = 0;
+    const auto isUsable = [&](const HifiasmImportedCigarStore::Record& rec) {
+        return rec.cigarTokenCount != 0 &&
+               rec.cigarQuerySpan  == rec.qEnd - rec.qStart &&
+               rec.cigarTargetSpan == rec.tEnd - rec.tStart &&
+               rec.readIdQ < readCount && rec.readIdT < readCount;
+    };
     hifiasmImportedCigarStore.forEachRecord(
         [&](const HifiasmImportedCigarStore::Record& rec) {
             if(rec.cigarTokenCount == 0) { ++skippedNoCigar; return; }
             if(rec.cigarQuerySpan  != rec.qEnd - rec.qStart ||
                rec.cigarTargetSpan != rec.tEnd - rec.tStart) { ++skippedShort; return; }
             if(rec.readIdQ >= readCount || rec.readIdT >= readCount) return;
-            byRead[rec.readIdQ].push_back(&rec);
-            byRead[rec.readIdT].push_back(&rec);
+            ++byReadBegin[rec.readIdQ + 1];
+            ++byReadBegin[rec.readIdT + 1];
             ++usable;
         });
+    for(uint64_t i = 0; i < readCount; i++) byReadBegin[i + 1] += byReadBegin[i];
+    vector<const HifiasmImportedCigarStore::Record*> byReadData(byReadBegin[readCount]);
+    {
+        vector<uint64_t> fill(byReadBegin.begin(), byReadBegin.end() - 1);
+        hifiasmImportedCigarStore.forEachRecord(
+            [&](const HifiasmImportedCigarStore::Record& rec) {
+                if(!isUsable(rec)) return;
+                byReadData[fill[rec.readIdQ]++] = &rec;
+                byReadData[fill[rec.readIdT]++] = &rec;
+            });
+    }
+    const auto recordsOf = [&](ReadId r) {
+        return span<const HifiasmImportedCigarStore::Record* const>(
+            byReadData.data() + byReadBegin[r],
+            byReadBegin[r + 1] - byReadBegin[r]);
+    };
 
     // DINARA_DUMP_IMPORTED_PAF: write the records exactly as imported, as a
     // PAF with CIGARs. This pins the comparison input: the reads, the filter
@@ -300,6 +328,8 @@ void Assembler::detectCigarSnpSites(
         vector<uint16_t> disagree;
         vector<int32_t> coverDelta;
         vector<uint32_t> localCandidates, ownedPositions;
+        // Spans of partners that outrank this read, merged per read.
+        vector<pair<uint32_t, uint32_t>> blockingIntervals;
         vector<uint8_t> contextBuffer;
         // Scratch for sanitizeArm below; reused across sites by this thread.
         vector<pair<OrientedReadId, uint32_t>> armScratch, armClean;
@@ -368,7 +398,7 @@ void Assembler::detectCigarSnpSites(
         for(;;) {
             const ReadId readId = nextReadId.fetch_add(1);
             if(readId >= readCount) break;
-            const auto& records = byRead[readId];
+            const auto& records = recordsOf(readId);
             if(records.empty()) continue;
 
             const uint32_t readLength = uint32_t(reads->getRead(readId).baseCount);
@@ -493,7 +523,6 @@ void Assembler::detectCigarSnpSites(
             // asks cheaply whether it OWNS the site -- lowest ReadId among the
             // reads covering that position -- and only the owner does pass 2.
             // That removes the redundancy before any expensive work, not after.
-            // Cost is candidates x records interval tests, both small.
             //
             // Two reads viewing the same locus agree on the owner because they
             // minimise over the same covering set. They can disagree only where
@@ -532,20 +561,59 @@ void Assembler::detectCigarSnpSites(
             // side effect, and the result stops depending on ReadId ordering
             // (ReadIds come from input order, so which marginal loci survive
             // currently depends on the order the reads were read in).
+            // The test is not "which read is the minimum" but the weaker
+            // "does any read smaller than this one cover the position" -- the
+            // actual minimum is never used. So only records whose partner has a
+            // smaller ReadId can matter; the rest cannot take ownership and need
+            // not be examined per candidate at all.
+            //
+            // Those records' spans are merged into disjoint intervals once, and
+            // since localCandidates is produced by an ascending scan it is
+            // already sorted, so ownership falls out of a single linear sweep of
+            // two sorted sequences. That replaces a candidates x records probe
+            // whose cost grows as the PRODUCT of candidate density and coverage
+            // -- the two quantities that both grow with depth, so the naive form
+            // degrades quadratically exactly where the data gets deeper.
+            //
+            //   before : O(C * R)
+            //   after  : O(R log R + C + R)
+            blockingIntervals.clear();
+            for(const HifiasmImportedCigarStore::Record* rec: records) {
+                const bool selfIsQuery = (rec->readIdQ == readId);
+                const ReadId partner =
+                    selfIsQuery ? ReadId(rec->readIdT) : ReadId(rec->readIdQ);
+                if(partner >= readId) continue;         // cannot own it
+                blockingIntervals.push_back({
+                    selfIsQuery ? rec->qStart : rec->tStart,
+                    selfIsQuery ? rec->qEnd   : rec->tEnd});
+            }
             ownedPositions.clear();
-            for(const uint32_t position: localCandidates) {
-                ReadId owner = readId;
-                for(const HifiasmImportedCigarStore::Record* rec: records) {
-                    const bool selfIsQuery = (rec->readIdQ == readId);
-                    const uint32_t from = selfIsQuery ? rec->qStart : rec->tStart;
-                    const uint32_t to   = selfIsQuery ? rec->qEnd   : rec->tEnd;
-                    if(position >= from && position < to) {
-                        const ReadId partner =
-                            selfIsQuery ? ReadId(rec->readIdT) : ReadId(rec->readIdQ);
-                        if(partner < owner) owner = partner;
+            if(blockingIntervals.empty()) {
+                // Nothing can outrank this read: it owns every candidate.
+                ownedPositions = localCandidates;
+            } else {
+                std::sort(blockingIntervals.begin(), blockingIntervals.end());
+                // Merge in place into disjoint spans.
+                size_t w = 0;
+                for(size_t r = 1; r < blockingIntervals.size(); r++) {
+                    if(blockingIntervals[r].first <= blockingIntervals[w].second) {
+                        blockingIntervals[w].second = std::max(
+                            blockingIntervals[w].second, blockingIntervals[r].second);
+                    } else {
+                        blockingIntervals[++w] = blockingIntervals[r];
                     }
                 }
-                if(owner == readId) ownedPositions.push_back(position);
+                blockingIntervals.resize(w + 1);
+                // Linear sweep: both sequences ascend, so each advances once.
+                size_t iv = 0;
+                for(const uint32_t position: localCandidates) {
+                    while(iv < blockingIntervals.size() &&
+                          blockingIntervals[iv].second <= position) ++iv;
+                    if(iv == blockingIntervals.size() ||
+                       position < blockingIntervals[iv].first) {
+                        ownedPositions.push_back(position);
+                    }
+                }
             }
             ownedSites.fetch_add(ownedPositions.size(), std::memory_order_relaxed);
 
