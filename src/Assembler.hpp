@@ -817,15 +817,11 @@ public:
     /// Runs early (e.g. after computeBaseAlignmentsAndStore) to remove containment overlaps.
     void deleteContainmentOverlaps(uint64_t threadCount);
     /// Delete internal overlaps (ma_hit2arc MA_HT_INT/MA_HT_SHORT_OVLP: excessive overhangs or too short).
-    /// Runs before flagContainedReads to remove spurious internal matches while
-    /// keeping containments. Uses the TIGHT CIGAR span (ad.qs/qe/ts/te), which is
+    /// Removes spurious internal matches while keeping containments. Uses the TIGHT CIGAR span (ad.qs/qe/ts/te), which is
     /// required: extending coordinates to the read tips would zero out both
     /// overhangs and make MA_HT_INT undetectable.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
     void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
-    void removeReadsFlaggedContained(uint64_t threadCount);
-    void flagContainedReads(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
-    void pruneContainedReadsToOneBestOverlapByDpScore(uint64_t threadCount);
 
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
@@ -1480,10 +1476,6 @@ private:
     // Use this together with marker graph vertex coverage thresholds
     // (minCoverage/maxCoverage in createMarkerGraphVertices) to filter
     // instead of pre-filtering per read.
-    // Build a read graph from all alignments.
-    // If pruneContained is true, contained reads (flagged by flagContainedReads)
-    // keep only their single best alignment to a non-contained read.
-    void createReadGraphAllAlignments(bool pruneContained = false);
 
     // Create a read graph using only the cis/trans (phasing) decisions produced by
     // performHifiasmECParity. This ignores all non-phasing deletion reasons.

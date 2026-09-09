@@ -510,7 +510,7 @@ void Assembler::computeBaseAlignmentsAndStoreThreadFunction(size_t threadId) {
             // Hifiasm-parity EXTENDED coordinates (see AlignmentData::extendedQs
             // doc comment): diagonally extrapolate the tight span above out to
             // read boundaries, matching hifiasm's ma_hit_t convention. Used by
-            // any containment/dovetail-type classification (e.g. flagContainedReads),
+            // any containment/dovetail-type classification,
             // never by consumers that want the real/tight aligned span.
             thisAlignmentData.extendedQs = thisAlignmentData.qs;
             thisAlignmentData.extendedQe = thisAlignmentData.qe;

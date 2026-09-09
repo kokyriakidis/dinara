@@ -901,7 +901,7 @@ void dinara::main::assemble(
     //
     // This drops ONLY internal / short overlaps. Containments (MA_HT_QCONT /
     // MA_HT_TCONT) are intentionally KEPT: contained reads are only *flagged*
-    // later (flagContainedReads), never removed here, because dropping their
+    // never removed here, because dropping their
     // overlaps would fragment the graph.
     //
     // Coordinates: this uses the TIGHT CIGAR span (ad.qs/qe/ts/te). Internal
@@ -1040,9 +1040,6 @@ void dinara::main::assemble(
     // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
     // assembler.phaseOverlapsMSA(threadCount);
 
-    // Flag contained reads so they can be excluded from inter-window edge discovery.
-    cout << timestamp << "Flagging contained reads..." << endl;
-    assembler.flagContainedReads(1000, 0.8, 0, threadCount);
 
 
 

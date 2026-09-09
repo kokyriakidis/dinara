@@ -176,9 +176,6 @@ public:
     inline void setChimericFlag(ReadId readId, bool value) {
         readFlags[readId].isChimeric = value;
     }
-    inline void setContainedFlag(ReadId readId, bool value) {
-        readFlags[readId].isContained = value;
-    }
     inline void setStrandFlag(ReadId readId, bool value) {
         readFlags[readId].strand = value;
     }
