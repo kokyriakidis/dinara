@@ -521,6 +521,18 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
     // ~2x the coverage), but primary anchors are the graph backbone, so that
     // swap needs its own verification run before it could be trusted.
     uint64_t hetDropped = 0, primaryDropped = 0, hetOccurrences = 0;
+    // Why a het occurrence lost: the only way it can, given het is preferred,
+    // is that the anchor beating it could not spare a member without falling
+    // below its coverage floor.
+    uint64_t hetLostToFloor = 0, hetLostOther = 0;
+    // Original member count of the anchor that beat a het occurrence, to tell a
+    // genuinely marginal anchor (selected at coverage 2) from one whittled down
+    // to the floor by earlier drops -- the second would make the outcome depend
+    // on the order ties are visited.
+    vector<uint64_t> floorWinnerOriginalCoverage;
+    // Size of the tie group, and how many of its members were het.
+    vector<uint64_t> floorGroupSize, floorGroupHets;
+    vector<uint64_t> overlapShared, overlapPrimary;
 
     filteredJourneys.assign(orientedReadCount, {});
     for(uint64_t readIdValue = 0; readIdValue < readCount; readIdValue++) {
@@ -545,7 +557,37 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
                     unitsDropped += (j - i - 1);
                     for(size_t t = i; t < j; t++) {
                         if(v[t].second == keeper) continue;
-                        if(isHetAnchor(v[t].second)) hetDropped++;
+                        if(isHetAnchor(v[t].second)) {
+                            hetDropped++;
+                            const uint64_t kc = keeper & ~Shasta2AnchorId(1);
+                            if(!isHetAnchor(keeper) &&
+                               (remainingMembers[kc] <= minAnchorCoverage ||
+                                remainingOccurrences[keeper] <= 1)) {
+                                hetLostToFloor++;
+                                floorWinnerOriginalCoverage.push_back(anchors[kc].size());
+                                floorGroupSize.push_back(j - i);
+                                uint64_t nHet = 0;
+                                for(size_t u = i; u < j; u++)
+                                    if(isHetAnchor(v[u].second)) nHet++;
+                                floorGroupHets.push_back(nHet);
+                                // How much of the primary anchor's membership
+                                // does the het anchor that displaced it share?
+                                // If it is nearly all of it, the two describe
+                                // the same locus and the het arm is redundant
+                                // with an anchor that already exists.
+                                {
+                                    const uint64_t hc = v[t].second & ~Shasta2AnchorId(1);
+                                    uint64_t shared = 0;
+                                    for(const Shasta2AnchorMarkerInfo& mp : anchors[kc])
+                                        for(const Shasta2AnchorMarkerInfo& mh : anchors[hc])
+                                            if(mp.orientedReadId == mh.orientedReadId) { shared++; break; }
+                                    overlapShared.push_back(shared);
+                                    overlapPrimary.push_back(anchors[kc].size());
+                                }
+                            } else {
+                                hetLostOther++;
+                            }
+                        }
                         else primaryDropped++;
                         if(remainingOccurrences[v[t].second] > 0)
                             remainingOccurrences[v[t].second]--;
@@ -592,6 +634,47 @@ void Shasta2Journeys::rebuildAfterNewAnchors(Shasta2AnchorId newAnchorsBegin, ui
         uint64_t evicted = 0;
         for(uint64_t a = 0; a < anchorCount; a++) {
             if(initialOccurrences[a] > 0 && remainingOccurrences[a] == 0) ++evicted;
+        }
+        if(hetDropped > 0) {
+            cout << timestamp << "  het occurrences lost because the colliding "
+                    "anchor was at its coverage floor: " << hetLostToFloor
+                 << ", for any other reason: " << hetLostOther << endl;
+            if(!floorWinnerOriginalCoverage.empty()) {
+                std::sort(floorWinnerOriginalCoverage.begin(),
+                          floorWinnerOriginalCoverage.end());
+                cout << timestamp << "    original coverage of those winners:";
+                for(uint64_t i = 0; i < floorWinnerOriginalCoverage.size(); ) {
+                    uint64_t j = i;
+                    while(j < floorWinnerOriginalCoverage.size() &&
+                          floorWinnerOriginalCoverage[j] == floorWinnerOriginalCoverage[i]) j++;
+                    cout << " " << floorWinnerOriginalCoverage[i] << "x:" << (j - i);
+                    i = j;
+                }
+                cout << endl;
+                cout << timestamp << "    tie groups where a het lost, by size:";
+                std::sort(floorGroupSize.begin(), floorGroupSize.end());
+                for(uint64_t i = 0; i < floorGroupSize.size(); ) {
+                    uint64_t j = i;
+                    while(j < floorGroupSize.size() && floorGroupSize[j] == floorGroupSize[i]) j++;
+                    cout << " " << floorGroupSize[i] << "-way:" << (j - i);
+                    i = j;
+                }
+                cout << " (het in group: ";
+                std::sort(floorGroupHets.begin(), floorGroupHets.end());
+                for(uint64_t i = 0; i < floorGroupHets.size(); ) {
+                    uint64_t j = i;
+                    while(j < floorGroupHets.size() && floorGroupHets[j] == floorGroupHets[i]) j++;
+                    cout << floorGroupHets[i] << ":" << (j - i) << " ";
+                    i = j;
+                }
+                cout << ")" << endl;
+                cout << timestamp << "    of the displaced primary anchor's members, "
+                        "the share also in the het anchor:";
+                for(uint64_t i = 0; i < overlapShared.size(); i++) {
+                    cout << " " << overlapShared[i] << "/" << overlapPrimary[i];
+                }
+                cout << endl;
+            }
         }
         cout << timestamp << "  anchors evicted from every journey: " << evicted
              << (evicted == 0 ? "  (none -- an anchor's last occurrence always wins)" : "")

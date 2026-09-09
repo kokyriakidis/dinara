@@ -2786,6 +2786,90 @@ void dinara::main::assemble(
             if(const char* path = std::getenv("DINARA_HET_ARM_DUMP")) {
                 armDump = std::make_unique<ofstream>(path);
             }
+            // DIAGNOSTIC (no behaviour change): is a het arm reproducing an
+            // anchor that already exists? A marker anchor sitting AT the SNP
+            // position already separates the alleles -- its k=50 k-mer differs
+            // by that very base -- so a het arm built over the same reads at
+            // the same positions adds nothing and then competes with it for the
+            // position. Map each arm member to the anchor already occupying its
+            // (read, stored position); if one anchor accounts for most of the
+            // arm, the arm is redundant with it.
+            {
+                std::unordered_map<uint64_t, Shasta2AnchorId> occupant;
+                const uint64_t existing = shasta2Anchors->size();
+                for(Shasta2AnchorId id = 0; id < existing; id++) {
+                    for(const Shasta2AnchorMarkerInfo& mi : (*shasta2Anchors)[id]) {
+                        occupant.emplace(
+                            (uint64_t(mi.orientedReadId.getValue()) << 32) |
+                            uint64_t(mi.position), id);
+                    }
+                }
+                const uint32_t hetKHalf2 = hetAnchorKHalf();
+                uint64_t armsRedundant = 0, armsPartial = 0, armsClear = 0;
+                for(const Assembler::CigarSnpSite& site: snpSites) {
+                    for(const auto& members: site.alleles) {
+                        if(members.empty()) continue;
+                        std::unordered_map<Shasta2AnchorId, uint64_t> hits;
+                        for(const auto& m: members) {
+                            const auto it = occupant.find(
+                                (uint64_t(m.first.getValue()) << 32) |
+                                uint64_t(m.second + hetKHalf2));
+                            if(it != occupant.end()) hits[it->second]++;
+                        }
+                        uint64_t best = 0;
+                        for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
+                        const double frac = double(best) / double(members.size());
+                        if(frac >= 0.8) ++armsRedundant;
+                        else if(best > 0) ++armsPartial;
+                        else ++armsClear;
+                    }
+                }
+                cout << timestamp << "CIGAR het arms vs existing anchors: "
+                     << armsRedundant << " arm(s) are >=80% accounted for by ONE "
+                        "existing anchor (redundant), " << armsPartial
+                     << " partially overlap one, " << armsClear
+                     << " touch no occupied position." << endl;
+
+                // Drop the redundant ones. A marker anchor sitting at the SNP
+                // position ALREADY separates the alleles -- reads carrying the
+                // two bases have different k=50 k-mers, so they were never in
+                // the same marker anchor -- and building a het arm over the same
+                // reads at the same positions just clones it. The clone then
+                // competes with the original for a position shasta2 only allows
+                // one anchor to hold, and the ensuing tie is what was gutting
+                // those primary anchors (17-35 members down to 2) and costing
+                // het occurrences.
+                //
+                // The site is not lost by skipping the arm: the allele stays
+                // represented by the anchor that already holds it, and the
+                // site's other arm still becomes a het anchor, so the bubble is
+                // existing-anchor vs new-het-anchor rather than two rival
+                // copies. Reusing an anchor is strictly better than duplicating
+                // one.
+                uint64_t armsDropped = 0;
+                for(Assembler::CigarSnpSite& site: snpSites) {
+                    for(auto& members: site.alleles) {
+                        if(members.empty()) continue;
+                        std::unordered_map<Shasta2AnchorId, uint64_t> hits;
+                        for(const auto& m: members) {
+                            const auto it = occupant.find(
+                                (uint64_t(m.first.getValue()) << 32) |
+                                uint64_t(m.second + hetKHalf2));
+                            if(it != occupant.end()) hits[it->second]++;
+                        }
+                        uint64_t best = 0;
+                        for(const auto& [a, n]: hits) { (void)a; best = std::max(best, n); }
+                        if(double(best) / double(members.size()) >= 0.8) {
+                            members.clear();
+                            ++armsDropped;
+                        }
+                    }
+                }
+                cout << timestamp << "  dropped " << armsDropped
+                     << " redundant arm(s); the allele stays represented by the "
+                        "anchor that already held it." << endl;
+            }
+
             uint64_t created = 0, skippedThin = 0;
             for(uint64_t siteIndex = 0; siteIndex < snpSites.size(); siteIndex++) {
                 const Assembler::CigarSnpSite& site = snpSites[siteIndex];
