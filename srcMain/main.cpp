@@ -6,6 +6,7 @@
 // Dinara.
 #include "Assembler.hpp"
 #include "HetAnchorK.hpp"
+#include "HetSitePreparation.hpp"
 #include "platformDependent.hpp"
 #include "AssemblerOptions.hpp"
 #include "filesystem.hpp"
@@ -1088,231 +1089,35 @@ void dinara::main::assemble(
             threadCount);
 
         if(assemblerOptions.assemblyOptions.mode3Options.createSnpSiteAnchors) {
-            // Collapse sites that are the SAME LOCUS detected twice.
-            //
-            // Ownership elects one owner per locus as the lowest ReadId among
-            // the covering reads, and two reads viewing one locus agree on that
-            // only when they minimise over the same covering set. Where their
-            // overlap sets differ they disagree and BOTH claim the locus -- the
-            // duplication the ownership comment in AssemblerCigarSnpSites.cpp
-            // predicts. Nothing downstream noticed, because a duplicate is not
-            // wrong per read: each detection is a valid view of a real variant.
-            //
-            // It becomes visible one stage later as a het-vs-het journey tie.
-            // Both detections turn into anchors, both arms contain the same read
-            // at the same base, and the journey rebuild has to drop one
-            // occurrence because shasta2 forbids two anchors at one position.
-            // That accounted for the entire residual het-anchor loss after the
-            // primary-vs-het tie-break was fixed (646 of 1103 dropped
-            // occurrences), so it is worth removing here rather than paying for
-            // it there.
-            //
-            // Two sites are the same locus exactly when they share a member
-            // OCCURRENCE -- the same (OrientedReadId, position) pair -- which
-            // needs no coordinate mapping to test: one read cannot carry two
-            // different alleles at one base. Keep the better-supported
-            // representative (most members over both arms), breaking ties on the
-            // first member's ordinal for determinism, and drop the rest.
+            // Collapse sites that are the SAME LOCUS detected twice, then
+            // drop arm members an existing anchor already holds. Both are pure
+            // functions of their inputs and live in HetSitePreparation.cpp so
+            // they can be tested; see that header for why each is needed.
             {
-                // Sort keys are computed ONCE per site, not inside the
-                // comparator: both of them scan every member of a site, so
-                // evaluating them per comparison would rescan the members
-                // O(log n) times each for nothing.
-                vector<uint64_t> order(snpSites.size());
-                vector<pair<uint64_t, pair<uint64_t, uint32_t>>> key(snpSites.size());
-                for(uint64_t i = 0; i < snpSites.size(); i++) {
-                    order[i] = i;
-                    uint64_t support = 0;
-                    pair<uint64_t, uint32_t> first{~0ULL, 0};
-                    for(const auto& a: snpSites[i].alleles) {
-                        support += a.size();
-                        for(const auto& m: a) {
-                            const pair<uint64_t, uint32_t> k{m.first.getValue(), m.second};
-                            if(k < first) first = k;
-                        }
-                    }
-                    key[i] = {support, first};
-                }
-                std::sort(order.begin(), order.end(), [&](uint64_t x, uint64_t y) {
-                    if(key[x].first != key[y].first)
-                        return key[x].first > key[y].first;   // better supported first
-                    return key[x].second < key[y].second;     // then deterministic
-                });
-                std::unordered_map<uint64_t, uint64_t> claim;   // occurrence -> site
-                vector<bool> dropped(snpSites.size(), false);
-                uint64_t duplicateSites = 0;
-                for(const uint64_t i: order) {
-                    bool clash = false;
-                    for(const auto& a: snpSites[i].alleles) {
-                        for(const auto& m: a) {
-                            const uint64_t key =
-                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
-                            if(claim.count(key)) { clash = true; break; }
-                        }
-                        if(clash) break;
-                    }
-                    if(clash) { dropped[i] = true; ++duplicateSites; continue; }
-                    for(const auto& a: snpSites[i].alleles) {
-                        for(const auto& m: a) {
-                            const uint64_t key =
-                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
-                            claim.emplace(key, i);
-                        }
-                    }
-                }
-                // Would MERGING the duplicate into its keeper be better than
-                // dropping it? Only if the duplicate holds member occurrences
-                // the keeper does not -- reads its owner's overlap set reached
-                // and the keeper's did not. Count them, because that is the
-                // entire value merging could add.
-                uint64_t dupOccurrences = 0, dupUnclaimed = 0;
-                for(uint64_t i = 0; i < snpSites.size(); i++) {
-                    if(!dropped[i]) continue;
-                    for(const auto& a: snpSites[i].alleles) {
-                        for(const auto& m: a) {
-                            ++dupOccurrences;
-                            const uint64_t key =
-                                (uint64_t(m.first.getValue()) << 32) | uint64_t(m.second);
-                            if(claim.find(key) == claim.end()) ++dupUnclaimed;
-                        }
-                    }
-                }
-                if(duplicateSites > 0) {
-                    cout << timestamp << "  duplicate sites held "
-                         << dupOccurrences << " member occurrence(s), of which "
-                         << dupUnclaimed << " are absent from the keeper "
-                            "(the most merging could recover)." << endl;
-                }
-                // Rebuild in a DETERMINISTIC order, not in the order the
-                // detector happened to append.
-                //
-                // detectCigarSnpSites fills snpSites from parallel workers under
-                // a mutex, so its order depends on thread scheduling. That order
-                // becomes the het anchor ids, and anchor ids are the last
-                // tie-break both here and in the journey rebuild -- so two runs
-                // on identical input resolved ties differently and produced
-                // different graphs. Measured before this: two consecutive runs
-                // differed in 8 anchor-graph vertices and dropped different
-                // numbers of het units (32 vs 40).
-                //
-                // firstKey is the minimum (OrientedReadId, position) over the
-                // site's members, which is a property of the DATA rather than of
-                // the schedule, and is unique per site because two sites cannot
-                // share a member occurrence (that is exactly the duplicate test
-                // above).
-                {
-                    vector<uint64_t> keepOrder;
-                    keepOrder.reserve(snpSites.size() - duplicateSites);
-                    for(uint64_t i = 0; i < snpSites.size(); i++) {
-                        if(!dropped[i]) keepOrder.push_back(i);
-                    }
-                    std::sort(keepOrder.begin(), keepOrder.end(),
-                        [&](uint64_t x, uint64_t y) {
-                            return key[x].second < key[y].second;
-                        });
-                    vector<Assembler::CigarSnpSite> kept;
-                    kept.reserve(keepOrder.size());
-                    for(const uint64_t i: keepOrder) {
-                        kept.push_back(std::move(snpSites[i]));
-                    }
-                    snpSites.swap(kept);
-                }
+                const uint64_t duplicateSites = collapseDuplicateLoci(snpSites);
                 cout << timestamp << "CIGAR het sites: dropped "
                      << duplicateSites << " duplicate detection(s) of a locus "
                         "already claimed by a better-supported site, leaving "
                      << snpSites.size() << "." << endl;
+
+                const auto occupied = buildOccupiedPositions(*shasta2Anchors);
+                const uint64_t alreadyAnchored = dropAlreadyAnchoredArmMembers(
+                    snpSites, occupied, hetAnchorKHalf());
+                cout << timestamp << "  " << alreadyAnchored
+                     << " arm member(s) already sit in an anchor that isolates "
+                        "their allele; het anchors are built from the rest." << endl;
             }
 
             // DINARA_HET_ARM_DUMP: one line per arm, "siteIndex armIndex" then
             // the member read names. The arms ARE the haplotype partition this
-            // whole path exists to produce, so this is what lets a ground-truth
-            // check ask the only question that matters about them: do the two
-            // arms of a site separate reads by haplotype, or are they mixed?
-            //
-            // Measured on the 989-read fixture, assigning each read a haplotype
-            // from an independent minimap2 alignment to hg002v1.1 chr1_MATERNAL
-            // and chr1_PATERNAL: over 213 sites, 175 (82.2%) are perfectly
-            // haplotype-pure, mean purity 99.08%, median 100%, and only 74 of
-            // 9563 arm members (0.77%) sit in the arm of the opposite
-            // haplotype -- about the read-level error rate at a single base,
-            // which is the floor. Only 3 sites have both arms dominated by the
-            // same haplotype and so cannot phase anything.
-            //
-            // That is the evidence these anchors work as intended. Site
-            // accuracy (precision 97.9%, recall 96.1%) says the LOCI are right;
-            // this says the PARTITION at each locus is right, which is the part
-            // phasing actually consumes and which site accuracy cannot show.
+            // path exists to produce, so this is what lets a ground-truth check
+            // ask whether the two arms of a site separate reads by haplotype.
+            // Measured on the 989-read fixture against an independent minimap2
+            // alignment: 82.2% of sites perfectly haplotype-pure, 99.08% mean
+            // purity, 0.77% of members in the opposite arm.
             std::unique_ptr<ofstream> armDump;
             if(const char* path = std::getenv("DINARA_HET_ARM_DUMP")) {
                 armDump = std::make_unique<ofstream>(path);
-            }
-            // DIAGNOSTIC (no behaviour change): is a het arm reproducing an
-            // anchor that already exists? A marker anchor sitting AT the SNP
-            // position already separates the alleles -- its k=50 k-mer differs
-            // by that very base -- so a het arm built over the same reads at
-            // the same positions adds nothing and then competes with it for the
-            // position. Map each arm member to the anchor already occupying its
-            // (read, stored position); if one anchor accounts for most of the
-            // arm, the arm is redundant with it.
-            {
-                std::unordered_map<uint64_t, Shasta2AnchorId> occupant;
-                const uint64_t existing = shasta2Anchors->size();
-                for(Shasta2AnchorId id = 0; id < existing; id++) {
-                    for(const Shasta2AnchorMarkerInfo& mi : (*shasta2Anchors)[id]) {
-                        occupant.emplace(
-                            (uint64_t(mi.orientedReadId.getValue()) << 32) |
-                            uint64_t(mi.position), id);
-                    }
-                }
-                const uint32_t hetKHalf2 = hetAnchorKHalf();
-
-                // Drop the redundant ones. A marker anchor sitting at the SNP
-                // position ALREADY separates the alleles -- reads carrying the
-                // two bases have different k=50 k-mers, so they were never in
-                // the same marker anchor -- and building a het arm over the same
-                // reads at the same positions just clones it. The clone then
-                // competes with the original for a position shasta2 only allows
-                // one anchor to hold, and the ensuing tie is what was gutting
-                // those primary anchors (17-35 members down to 2) and costing
-                // het occurrences.
-                //
-                // The site is not lost by skipping the arm: the allele stays
-                // represented by the anchor that already holds it, and the
-                // site's other arm still becomes a het anchor, so the bubble is
-                // existing-anchor vs new-het-anchor rather than two rival
-                // copies. Reusing an anchor is strictly better than duplicating
-                // one.
-                // A member at an OCCUPIED position needs no het anchor: the
-                // anchor already there isolates its allele, necessarily and not
-                // just usually. A marker anchor groups reads sharing a k=50
-                // k-mer centred on that position, and that k-mer spans the SNP
-                // base -- so reads carrying different alleles were never in it.
-                // Measured over every site: 0 have both arms landing in a shared
-                // anchor, which is what that argument predicts.
-                //
-                // So build each arm from its FREE members only. Nothing is lost
-                // by the removal -- the dropped members keep their existing
-                // anchor, which separates them from the other allele exactly as
-                // a het anchor would -- and no fraction is involved. Whether
-                // what remains is still worth an anchor is then decided by the
-                // arm floor that already exists (>= 2 members), not by a new
-                // threshold.
-                uint64_t membersAlreadyAnchored = 0;
-                for(Assembler::CigarSnpSite& site: snpSites) {
-                    for(auto& members: site.alleles) {
-                        const size_t before = members.size();
-                        members.erase(std::remove_if(members.begin(), members.end(),
-                            [&](const pair<OrientedReadId, uint32_t>& m) {
-                                return occupant.count(
-                                    (uint64_t(m.first.getValue()) << 32) |
-                                    uint64_t(m.second + hetKHalf2)) != 0;
-                            }), members.end());
-                        membersAlreadyAnchored += before - members.size();
-                    }
-                }
-                cout << timestamp << "  " << membersAlreadyAnchored
-                     << " arm member(s) already sit in an anchor that isolates "
-                        "their allele; het anchors are built from the rest." << endl;
             }
 
             uint64_t created = 0, skippedThin = 0;

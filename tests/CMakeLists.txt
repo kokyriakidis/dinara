@@ -85,6 +85,7 @@ add_executable(test_integration
     test_phasing_coordinates.cpp
     test_msa_het_kernel.cpp
     test_cigar_snp_sites.cpp
+    test_het_site_preparation.cpp
     ${DINARA_SRC_FILES}
     $<TARGET_OBJECTS:catch_main>
 )
