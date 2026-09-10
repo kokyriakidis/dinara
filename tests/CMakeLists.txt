@@ -55,13 +55,6 @@ file(GLOB DINARA_SRC_FILES CONFIGURE_DEPENDS
 )
 # Remove main.cpp (it has its own main())
 list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*main\\.cpp$")
-list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
-# Theseus disabled: these files use fork-only theseus APIs (align_from,
-# multi-segment constructor) that upstream theseus-lib does not provide.
-# Excluded from the build until theseus usage is reworked. Callers are stubbed.
-list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
-list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
-list(FILTER DINARA_SRC_FILES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 # AssemblerHifiasmEC.cpp excluded: it was the only consumer of the removed
 # AlignedEvidenceStore. Overlap phasing now runs off OverlapCigarStore; the
 # hifiasm EC parity path is unused and kept in-tree for reference only.
@@ -72,10 +65,6 @@ find_library(ASTARPA_LIB astarpa_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH
 find_library(POASTA_LIB poasta_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(SIMD_MINIMIZERS_LIB simd_minimizers_c PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
 find_library(ABPOA_LIB abpoa PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
-find_library(THESEUS_LIB theseus PATHS ${DINARA_BUILD_DIR}/lib NO_DEFAULT_PATH)
-if(NOT THESEUS_LIB)
-    set(THESEUS_LIB "")
-endif()
 find_package(ZLIB REQUIRED)
 
 # Integration test executable
@@ -118,7 +107,7 @@ else()
         atomic boost_system boost_program_options boost_chrono boost_serialization
         spoa png lapack blas gfortran m pthread
         -Wl,--start-group
-        ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${THESEUS_LIB}
+        ${ABPOA_LIB} ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB}
         ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS}
         z
         -Wl,--end-group

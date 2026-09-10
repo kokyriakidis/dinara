@@ -37,17 +37,6 @@ add_definitions(-DDINARA_ENABLE_VARIANT_CLUSTERING=0)
 
 # Source files
 file(GLOB SOURCES CONFIGURE_DEPENDS ../src/*.cpp ../srcMain/*.cpp ../src/ksw2/ksw2_extd2_sse.c)
-list(FILTER SOURCES EXCLUDE REGEX ".*/mode3-AnchorFromHetSites\\.cpp$")
-# Theseus disabled: these files use fork-only theseus APIs (align_from,
-# multi-segment constructor) that upstream theseus-lib does not provide.
-# Excluded from the build until theseus usage is reworked. Callers are stubbed.
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerPhasingMSA\\.cpp$")
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerTheseusReadWindowMSA\\.cpp$")
-# AssemblerMultiSegmentMSA.cpp excluded: the per-window multi-segment MSA test
-# has been reimplemented on abPOA (AssemblerAbpoaMultiSegmentMSA.cpp), which is
-# faster and avoids the theseus fork's terminal-condition / quadratic-blowup
-# issues. The theseus-based version is retained in-tree for reference only.
-list(FILTER SOURCES EXCLUDE REGEX ".*/AssemblerMultiSegmentMSA\\.cpp$")
 # AssemblerHifiasmEC.cpp excluded: it was the only consumer of the removed
 # AlignedEvidenceStore (SNP/indel evidence streams). The overlap-phasing
 # pipeline now runs entirely off OverlapCigarStore, so the hifiasm EC parity
@@ -103,19 +92,6 @@ endif()
 # (shasta2/AnchorGraph.hpp, shasta2/AnchorPair.hpp) used only to write the
 # shasta2-compatible external anchor/assembly graph in Shasta2*GraphExport.cpp.
 
-# Find theseus library (the kokyriakidis fork). No translation unit currently
-# built links theseus symbols: the theseus-using MSA prototypes
-# (AssemblerTheseus*MSA.cpp, AssemblerMultiSegmentMSA.cpp,
-# AssemblerDirectOverlapMSA.cpp, AssemblerPhasingMSA.cpp) are excluded above,
-# and the former svanchors TU was removed. Retained for when those prototypes
-# are re-enabled; kept optional so the build works without it.
-find_library(THESEUS_LIB theseus)
-if(THESEUS_LIB)
-    message(STATUS "theseus found (fork API used by the excluded MSA prototypes).")
-else()
-    message(WARNING "theseus library not found. Run InstallPrerequisites.")
-    set(THESEUS_LIB "")
-endif()
 
 # Define our executable.
 add_executable(dinaraExecutable ${SOURCES})
@@ -136,7 +112,7 @@ if(APPLE)
         hifiasm_overlaps
         atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
         lapack blas gfortran z m
-        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB})
+        ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB})
 else()
     # For arcane reasons, statically linking with the pthread
     # library on Linux requires "--whole-archive".
@@ -147,7 +123,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran quadmath z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
     else(X86_64)
         target_link_libraries(
             dinaraExecutable
@@ -155,7 +131,7 @@ else()
             atomic boost_system boost_program_options boost_chrono boost_serialization spoa png z
             lapack blas gfortran z m
             -Wl,--whole-archive -lpthread -Wl,--no-whole-archive
-            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${THESEUS_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
+            ${ASTARPA_LIB} ${POASTA_LIB} ${SIMD_MINIMIZERS_LIB} ${ABPOA_LIB} ${HTS_LINK_FLAGS} ${CURL_LINK_FLAGS} z m)
     endif(X86_64)
 endif()
   
