@@ -1079,18 +1079,14 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAlleleFraction,
-            // Repeat context stops REJECTING when MSA verification is on.
-            //
-            // Not "routing": every surviving site goes to the MSA regardless,
-            // so the flag has no destination to route to -- it only decides
-            // whether the context rejects. longcallD really does route (only
-            // its REP_HET_VAR variants reach realignment); we verify everything,
-            // which is measurably better here because 53 of our false positives
-            // sit in CLEAN context where no predicate would flag them.
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer and
-                not assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr and
-                not assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites,
+            // Both context gates default to OFF: the MSA catches the same
+            // artifacts without their collateral damage (they cost 4.4 true
+            // variants per false positive removed), and 53 of our false
+            // positives sit in CLEAN context where no predicate would flag them
+            // anyway. When one IS set it rejects, MSA or not -- an option that
+            // is silently ignored is worse than one that is simply off.
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageRate,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageFloor,
             assemblerOptions.assemblyOptions.mode3Options.snpSitePloidy,

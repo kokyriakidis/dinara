@@ -599,8 +599,8 @@ public:
     // single cause of missed real variants (49 of 58 filter-rejected truth
     // SNVs) while the VAF floor already removes the false positives it was
     // meant to catch -- so it defaults OFF. See AssemblerCigarSnpSites.cpp.
-    bool snpSiteFilterHomopolymer = true;
-    bool snpSiteFilterStr = true;
+    bool snpSiteFilterHomopolymer = false;
+    bool snpSiteFilterStr = false;
     // hifiasm's `cc`, from the LIVE phasing path (gen_rphase_dp0_single_path):
     //     cc = ((het_cov > 0) ? het_cov : (hom_cov / ploidy));
     //     cc *= cut_rate;  if (cc < cut_bd) cc = cut_bd;

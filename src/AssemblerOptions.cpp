@@ -1303,19 +1303,20 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.snpSiteFilterHomopolymer",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer)->
-        default_value(true),
-        "Reject het sites in a homopolymer. This gate is SUPPRESSED whenever "
-        "Assembly.mode3.msaVerifySnpSites is on: every site goes to the MSA "
-        "regardless, so there is nothing for the flag to route -- it simply "
-        "stops rejecting, and the MSA decides. Suppressing it is worth 12 "
-        "points of recall on verifiable truth (81.5% -> 93.3%) because a run "
-        "of 3 beside a site happens constantly by chance. The context is still "
-        "MEASURED and reported either way.")
+        default_value(false),
+        "Reject het sites in a homopolymer. OFF by default: measured against "
+        "the HG002 chr12 track it removes 115 false positives at a cost of 508 "
+        "true variants, 4.4 lost per one removed, because hifiasm's predicate "
+        "fires on a run of 3 beside the site and that happens constantly by "
+        "chance. The MSA catches the same artifacts without the collateral "
+        "damage. The context is still MEASURED and reported when off, so the "
+        "funnel and the owned-site dump stay informative. Set true to reject "
+        "(honoured whether or not the MSA is running).")
 
         ("Assembly.mode3.snpSiteFilterStr",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterStr)->
-        default_value(true),
-        "Reject het sites in a short tandem repeat (unit length 2..6). Suppressed when Assembly.mode3.msaVerifySnpSites is on, exactly as for Assembly.mode3.snpSiteFilterHomopolymer; see that option.")
+        default_value(false),
+        "Reject het sites in a short tandem repeat (unit length 2..6). OFF by default for the same reason as Assembly.mode3.snpSiteFilterHomopolymer; see that option. Still measured and reported when off.")
 
         ("Assembly.mode3.createSnpSiteAnchors",
         value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
