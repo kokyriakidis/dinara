@@ -367,6 +367,7 @@ public:
         double minAlleleFraction,
         bool filterHomopolymer,
         bool filterStr,
+        uint64_t minHomopolymerRun,
         double alleleCoverageRate,
         uint64_t alleleCoverageFloor,
         uint64_t ploidy,

@@ -1081,6 +1081,7 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAlleleFraction,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinHomopolymerRun,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageRate,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageFloor,
             assemblerOptions.assemblyOptions.mode3Options.snpSitePloidy,

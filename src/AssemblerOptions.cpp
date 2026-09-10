@@ -1294,9 +1294,24 @@ void AssemblerOptions::addConfigurableOptions()
         "false positives cluster at ~0.1, real hets at 0.4-0.5.")
 
         ("Assembly.mode3.snpSiteFilterHomopolymer",
-        bool_switch(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer),
-        "Reject het sites inside a homopolymer. Off by default: measured to cost "
-        "far more real variants than it removes false positives.")
+        value<bool>(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer)->
+        default_value(true),
+        "Reject het sites beside a homopolymer run of at least "
+        "Assembly.mode3.snpSiteMinHomopolymerRun bases. ON by default: ONT "
+        "basecalling in a long run is unreliable regardless of what a truth "
+        "track says, and the truth track is itself ambiguous there. This was "
+        "off while the gate fired on runs of 3, where it cost 10.3 points of "
+        "recall on verifiable truth; gated on run length it costs 0.3.")
+
+        ("Assembly.mode3.snpSiteMinHomopolymerRun",
+        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinHomopolymerRun)->
+        default_value(5),
+        "Minimum homopolymer run length immediately beside a het site before "
+        "Assembly.mode3.snpSiteFilterHomopolymer rejects it. The gate used to "
+        "fire on a run of 3, which happens constantly by chance -- on E821 that "
+        "rejected 10261 sites and cost 392 truth variants sitting in no "
+        "homopolymer at all. ONT basecalling error scales with run length, so "
+        "this gates on length rather than on mere presence.")
 
         ("Assembly.mode3.snpSiteFilterStr",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterStr)->
@@ -1803,6 +1818,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.journeyTiePreferHet = " << convertBoolToPythonString(journeyTiePreferHet) << "\n";
     s << "mode3.snpSiteMinAlleleFraction = " << snpSiteMinAlleleFraction << "\n";
     s << "mode3.snpSiteFilterHomopolymer = " << convertBoolToPythonString(snpSiteFilterHomopolymer) << "\n";
+    s << "mode3.snpSiteMinHomopolymerRun = " << snpSiteMinHomopolymerRun << "\n";
     s << "mode3.snpSiteFilterStr = " << convertBoolToPythonString(snpSiteFilterStr) << "\n";
     s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<

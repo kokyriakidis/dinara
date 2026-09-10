@@ -592,8 +592,14 @@ public:
     // single cause of missed real variants (49 of 58 filter-rejected truth
     // SNVs) while the VAF floor already removes the false positives it was
     // meant to catch -- so it defaults OFF. See AssemblerCigarSnpSites.cpp.
-    bool snpSiteFilterHomopolymer = false;
+    bool snpSiteFilterHomopolymer = true;
     bool snpSiteFilterStr = true;
+    // Minimum homopolymer RUN LENGTH adjacent to a site before the homopolymer
+    // gate rejects it. The old gate fired on a run of 3, which occurs constantly
+    // by chance: measured on E821 it rejected 10261 sites and cost 392 truth
+    // variants that sit in no homopolymer at all. ONT error scales with run
+    // length, so gate on length rather than on mere presence.
+    uint64_t snpSiteMinHomopolymerRun = 5;
     // hifiasm's `cc`, from the LIVE phasing path (gen_rphase_dp0_single_path):
     //     cc = ((het_cov > 0) ? het_cov : (hom_cov / ploidy));
     //     cc *= cut_rate;  if (cc < cut_bd) cc = cut_bd;

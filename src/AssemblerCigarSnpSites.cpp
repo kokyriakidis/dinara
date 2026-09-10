@@ -115,6 +115,7 @@ void Assembler::detectCigarSnpSites(
     double minAlleleFraction,
     bool filterHomopolymer,
     bool filterStr,
+    uint64_t minHomopolymerRun,
     double alleleCoverageRate,
     uint64_t alleleCoverageFloor,
     uint64_t ploidy,
@@ -779,8 +780,35 @@ void Assembler::detectCigarSnpSites(
                         KmVarKey key{};
                         key.type = KmVarType::Snp;
                         key.pos = uint32_t(sitePosition - lo);
-                        inHomopolymer = kmIsRepeatUnitRange(
-                            contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 1, 1);
+                        // Homopolymer test, LENGTH-AWARE. kmIsRepeatUnitRange
+                        // with unit 1 fires on a run of only 3 immediately
+                        // beside the site, and 3-base runs occur constantly by
+                        // chance -- which is why the old gate rejected 10261
+                        // sites here and, measured against the HG002 track, 392
+                        // truth variants that are not in a homopolymer at all.
+                        //
+                        // ONT homopolymer error scales with RUN LENGTH: runs of
+                        // 3 basecall fine, long ones do not. So require a run of
+                        // at least minHomopolymerRun bases adjacent to the site
+                        // before rejecting it.
+                        {
+                            const uint8_t* const ctx = contextBuffer.data();
+                            const int64_t n = int64_t(contextBuffer.size());
+                            const int64_t p = int64_t(key.pos);
+                            const auto runFrom = [&](int64_t start, int64_t step) {
+                                if(start < 0 || start >= n) return uint32_t(0);
+                                const uint8_t b = ctx[start];
+                                uint32_t len = 0;
+                                for(int64_t q = start; q >= 0 && q < n && ctx[q] == b; q += step) {
+                                    ++len;
+                                }
+                                return len;
+                            };
+                            const uint32_t after = runFrom(p + 1, 1);
+                            const uint32_t before = runFrom(p - 1, -1);
+                            inHomopolymer =
+                                (std::max(after, before) >= minHomopolymerRun);
+                        }
                         inStr = kmIsRepeatUnitRange(
                             contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 2, 6);
                     }
