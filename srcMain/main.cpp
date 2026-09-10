@@ -1110,7 +1110,6 @@ void dinara::main::assemble(
                     const uint64_t rejected = msaVerifyHetSites(
                         snpSites,
                         assembler.getReads(),
-                        *shasta2Anchors,
                         uint32_t(assemblerOptions.assemblyOptions.mode3Options.msaVerifyFlankBases),
                         assemblerOptions.assemblyOptions.mode3Options.msaVerifyMinAgreement,
                         threadCount,
@@ -1124,6 +1123,25 @@ void dinara::main::assemble(
                             cout << "    "
                                  << msaVerdictReasonName(MsaSiteVerdict::Reason(i))
                                  << ": " << reasons[i] << endl;
+                        }
+                    }
+                }
+
+                // DINARA_MSA_KEPT_DUMP: one line per (member read, position)
+                // of every site still standing here. Intersecting it with
+                // DINARA_SNP_SITE_DUMP recovers exactly which detected sites
+                // survived, which is what lets the truth-set evaluator score
+                // the verification instead of just counting it.
+                if(const char* path = std::getenv("DINARA_MSA_KEPT_DUMP")) {
+                    ofstream keptDump(path);
+                    for(const auto& site: snpSites) {
+                        for(const auto& allele: site.alleles) {
+                            for(const auto& [orientedReadId, position]: allele) {
+                                const auto nm = assembler.getReads().getReadName(
+                                    orientedReadId.getReadId());
+                                keptDump.write(&*nm.begin(), std::streamsize(nm.size()));
+                                keptDump << '\t' << position << '\n';
+                            }
                         }
                     }
                 }

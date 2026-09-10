@@ -193,149 +193,6 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
 
 namespace {
 
-// The anchor index: for each oriented read, its anchors as (position,
-// anchorId) ascending by position, stored as a flat CSR rather than a vector
-// per read.
-//
-// This is the expensive half of the pass and it does NOT scale with the number
-// of sites -- it walks every anchor member in the assembly (16M on a 6 Mb
-// fixture), so on a large genome it grows with the genome while the
-// verification itself grows only with the site count. Measured single-threaded
-// it was 0.52 s of a 1.12 s pass, so it runs on every thread: a counting pass
-// sizes each read's slice exactly, a fill pass scatters into it, and the
-// per-read sorts are independent.
-class AnchorIndex {
-public:
-    vector<uint64_t> begin_;                                  // size n+1
-    vector<std::pair<uint32_t, Shasta2AnchorId>> data_;
-
-    span<const std::pair<uint32_t, Shasta2AnchorId>> operator[](uint64_t v) const
-    {
-        return span<const std::pair<uint32_t, Shasta2AnchorId>>(
-            data_.data() + begin_[v], data_.data() + begin_[v + 1]);
-    }
-};
-
-AnchorIndex buildAnchorIndex(
-    const Shasta2Anchors& anchors, uint64_t orientedReadCount, uint64_t threadCount)
-{
-    AnchorIndex index;
-    index.begin_.assign(orientedReadCount + 1, 0);
-    const uint64_t anchorCount = anchors.size();
-
-    const auto runOverAnchors = [&](auto&& body) {
-        const uint64_t chunk = (anchorCount + threadCount - 1) / threadCount;
-        vector<std::thread> threads;
-        threads.reserve(threadCount);
-        for(uint64_t t = 0; t < threadCount; t++) {
-            threads.emplace_back([&, t]() {
-                body(t * chunk, std::min(anchorCount, (t + 1) * chunk));
-            });
-        }
-        for(std::thread& thread : threads) thread.join();
-    };
-
-    // Counting pass. One relaxed atomic per oriented read: O(orientedReadCount)
-    // rather than O(threadCount * orientedReadCount), which matters once the
-    // read count is large.
-    {
-        vector<std::atomic<uint64_t>> counts(orientedReadCount);
-        for(std::atomic<uint64_t>& c : counts) c.store(0, std::memory_order_relaxed);
-        runOverAnchors([&](uint64_t begin, uint64_t end) {
-            for(Shasta2AnchorId id = begin; id < end; id++) {
-                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
-                    const uint64_t v = mi.orientedReadId.getValue();
-                    if(v < orientedReadCount) {
-                        counts[v].fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-            }
-        });
-        uint64_t total = 0;
-        for(uint64_t v = 0; v < orientedReadCount; v++) {
-            index.begin_[v] = total;
-            total += counts[v].load(std::memory_order_relaxed);
-        }
-        index.begin_[orientedReadCount] = total;
-        index.data_.resize(total);
-    }
-
-    // Fill pass. Entries land inside a read's slice in nondeterministic order,
-    // which does not matter: the slice is sorted immediately afterwards.
-    {
-        vector<std::atomic<uint64_t>> cursor(orientedReadCount);
-        for(uint64_t v = 0; v < orientedReadCount; v++) {
-            cursor[v].store(index.begin_[v], std::memory_order_relaxed);
-        }
-        runOverAnchors([&](uint64_t begin, uint64_t end) {
-            for(Shasta2AnchorId id = begin; id < end; id++) {
-                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
-                    const uint64_t v = mi.orientedReadId.getValue();
-                    if(v < orientedReadCount) {
-                        index.data_[cursor[v].fetch_add(1, std::memory_order_relaxed)] =
-                            {mi.position, id};
-                    }
-                }
-            }
-        });
-    }
-
-    // Sort each read's slice; reads are independent.
-    {
-        const uint64_t chunk = (orientedReadCount + threadCount - 1) / threadCount;
-        vector<std::thread> threads;
-        threads.reserve(threadCount);
-        for(uint64_t t = 0; t < threadCount; t++) {
-            threads.emplace_back([&, t]() {
-                const uint64_t begin = t * chunk;
-                const uint64_t end = std::min(orientedReadCount, (t + 1) * chunk);
-                for(uint64_t v = begin; v < end; v++) {
-                    std::sort(index.data_.data() + index.begin_[v],
-                              index.data_.data() + index.begin_[v + 1]);
-                }
-            });
-        }
-        for(std::thread& thread : threads) thread.join();
-    }
-
-    return index;
-}
-
-// One candidate bounding anchor, accumulated across the members that carry it.
-class Candidate {
-public:
-    uint32_t votes = 0;
-    uint64_t distanceSum = 0;   // summed |anchor position - SNP position|
-};
-
-// Rank candidates: most members first, then closest to the SNP (a tighter
-// interval is a cheaper alignment and gives ambiguity less room), then smallest
-// id so the choice never depends on hash order.
-Shasta2AnchorId pickBoundingAnchor(
-    const std::unordered_map<Shasta2AnchorId, Candidate>& candidates)
-{
-    Shasta2AnchorId best = 0;
-    const Candidate* bestCandidate = nullptr;
-    for(const auto& [id, candidate] : candidates) {
-        if(bestCandidate == nullptr) {
-            best = id; bestCandidate = &candidate; continue;
-        }
-        if(candidate.votes != bestCandidate->votes) {
-            if(candidate.votes > bestCandidate->votes) { best = id; bestCandidate = &candidate; }
-            continue;
-        }
-        // Compare mean distance without dividing: a*d2 < b*d1 <=> d1/v1 < d2/v2.
-        const uint64_t lhs = candidate.distanceSum * uint64_t(bestCandidate->votes);
-        const uint64_t rhs = bestCandidate->distanceSum * uint64_t(candidate.votes);
-        if(lhs != rhs) {
-            if(lhs < rhs) { best = id; bestCandidate = &candidate; }
-            continue;
-        }
-        if(id < best) { best = id; bestCandidate = &candidate; }
-    }
-    return best;
-}
-
 // One abPOA instance, reused across every site a thread handles.
 //
 // abpoa_init/abpoa_free allocate substantial structures, and doing that per
@@ -351,6 +208,11 @@ public:
         abpt->out_msa = 1;
         abpt->out_cons = 0;
         abpt->disable_seeding = 1;
+        // Disable adaptive banding. A band saves time by assuming the
+        // alignment stays near the diagonal, which is the assumption that
+        // breaks in the noisy, indel-rich stretches these sites live in.
+        // longcallD sets the same for its realignment.
+        abpt->wb = -1;
         abpoa_post_set_para(abpt);
     }
     ~MsaRunner()
@@ -409,7 +271,6 @@ private:
 uint64_t dinara::msaVerifyHetSites(
     vector<Assembler::CigarSnpSite>& sites,
     const Reads& reads,
-    const Shasta2Anchors& anchors,
     uint32_t flankBases,
     double minAgreementFraction,
     uint64_t threadCount,
@@ -427,9 +288,6 @@ uint64_t dinara::msaVerifyHetSites(
 
     const auto tBegin = std::chrono::steady_clock::now();
     const uint64_t orientedReadCount = 2 * reads.readCount();
-    const AnchorIndex anchorIndex =
-        buildAnchorIndex(anchors, orientedReadCount, threadCount);
-    const auto tIndexed = std::chrono::steady_clock::now();
 
     vector<uint8_t> keep(sites.size(), 1);
     const uint64_t reasonCount = MsaSiteVerdict::reasonCount;
@@ -448,10 +306,6 @@ uint64_t dinara::msaVerifyHetSites(
             // One abPOA instance for this thread's whole batch, plus hoisted
             // scratch: this loop runs tens of thousands of times.
             MsaRunner msaRunner;
-            std::unordered_map<Shasta2AnchorId, Candidate> leftCandidates, rightCandidates;
-            // Per member, the positions of the candidate anchors on THAT read,
-            // so the extraction pass never rescans the read's anchor list.
-            vector<std::unordered_map<Shasta2AnchorId, uint32_t>> positionsByMember;
             vector<std::pair<OrientedReadId, uint32_t>> members;
             vector<uint8_t> armOfMember;
             vector<vector<uint8_t>> sequences;
@@ -477,67 +331,45 @@ uint64_t dinara::msaVerifyHetSites(
                     continue;
                 }
 
-                // Candidate bounding anchors, gathered by QUORUM rather than by
-                // unanimity. Requiring every member to share both bounds sounds
-                // safer but is not: one read missing one anchor empties the
-                // intersection, and measured on E821 that rejected 4207 of 4542
-                // sites for "no shared anchors" while exactly ONE failed the
-                // homology test -- it measured the requirement, not the data.
-                // Members lacking the chosen bounds simply do not participate,
-                // exactly like a read clipped by the interval.
-                leftCandidates.clear();
-                rightCandidates.clear();
-                positionsByMember.assign(members.size(), {});
+                // PER-READ windows: each member contributes flankBases either
+                // side of its OWN copy of the SNP. No shared bound, and no
+                // anchor involved in the windowing at all.
+                //
+                // Requiring a shared bounding anchor was self-defeating. An
+                // anchor is a k=50 marker stored at its MIDPOINT, so it spans
+                // about +/-25 bases, and two reads share it only if they share
+                // all 50 -- which reads carrying different alleles cannot do
+                // when the window covers the SNP. Every anchor within ~k/2 of
+                // the site is therefore arm-specific by construction. Bounding
+                // by the nearest shared anchor picks one only a single
+                // haplotype holds and starves the MSA of the other arm: that
+                // variant rejected 4157 of 4542 sites as "not biallelic", which
+                // was the frame's failure being reported as the data's.
+                // Bounding by a well-attended anchor avoided that only because
+                // attendance is a proxy for "outside the k/2 window", which is
+                // why its results drifted with the search radius (1406 sites
+                // confirmed at radius 50 against 3998 at 400).
+                //
+                // POA does not need shared endpoints -- it aligns ragged ends
+                // perfectly well -- so dropping the requirement dissolves the
+                // conflict: every member participates and no site is lost for
+                // want of a bound two haplotypes happen to share.
+                sequences.clear();
+                snpOffset.clear();
+                armOfRow.clear();
                 bool viable = true;
                 for(uint64_t i = 0; i < members.size(); i++) {
                     const auto& [orientedReadId, position] = members[i];
                     const uint64_t v = orientedReadId.getValue();
                     if(v >= orientedReadCount) { viable = false; break; }
-                    const auto sorted = anchorIndex[v];
 
-                    const uint32_t low = (position > flankBases) ? (position - flankBases) : 0u;
-                    auto it = std::lower_bound(sorted.begin(), sorted.end(),
-                        std::make_pair(low, Shasta2AnchorId(0)));
-                    for(; it != sorted.end() && it->first <= position + flankBases; ++it) {
-                        const uint32_t anchorPosition = it->first;
-                        const Shasta2AnchorId id = it->second;
-                        // Record the position on THIS read once, so extraction
-                        // below is a hash lookup instead of a linear rescan.
-                        positionsByMember[i].emplace(id, anchorPosition);
-                        if(anchorPosition < position) {
-                            Candidate& c = leftCandidates[id];
-                            ++c.votes;
-                            c.distanceSum += position - anchorPosition;
-                        } else if(anchorPosition > position) {
-                            Candidate& c = rightCandidates[id];
-                            ++c.votes;
-                            c.distanceSum += anchorPosition - position;
-                        }
-                    }
-                }
-                if(!viable || leftCandidates.empty() || rightCandidates.empty()) {
-                    keep[siteIndex] = 0;
-                    ++reasons[uint64_t(MsaSiteVerdict::Reason::noSharedAnchors)];
-                    continue;
-                }
-
-                const Shasta2AnchorId leftAnchor = pickBoundingAnchor(leftCandidates);
-                const Shasta2AnchorId rightAnchor = pickBoundingAnchor(rightCandidates);
-
-                // Extract each member's substring between those anchors, where
-                // its SNP base sits inside it, and which arm it belongs to.
-                sequences.clear();
-                snpOffset.clear();
-                armOfRow.clear();
-                for(uint64_t i = 0; i < members.size(); i++) {
-                    const auto& [orientedReadId, position] = members[i];
-                    const auto& byId = positionsByMember[i];
-                    const auto leftIt = byId.find(leftAnchor);
-                    const auto rightIt = byId.find(rightAnchor);
-                    if(leftIt == byId.end() || rightIt == byId.end()) continue;
-                    const uint32_t leftPos = leftIt->second;
-                    const uint32_t rightPos = rightIt->second;
-                    if(!(leftPos <= position && position < rightPos)) continue;
+                    const uint64_t readLength =
+                        reads.getReadRawSequenceLength(orientedReadId.getReadId());
+                    const uint32_t leftPos =
+                        (position > flankBases) ? (position - flankBases) : 0u;
+                    const uint32_t rightPos = uint32_t(std::min<uint64_t>(
+                        readLength, uint64_t(position) + flankBases + 1));
+                    if(rightPos <= position) continue;
 
                     vector<uint8_t> seq;
                     seq.reserve(rightPos - leftPos);
@@ -548,6 +380,11 @@ uint64_t dinara::msaVerifyHetSites(
                     snpOffset.push_back(position - leftPos);
                     armOfRow.push_back(armOfMember[i]);
                     sequences.push_back(std::move(seq));
+                }
+                if(not viable) {
+                    keep[siteIndex] = 0;
+                    ++reasons[uint64_t(MsaSiteVerdict::Reason::noSharedAnchors)];
+                    continue;
                 }
                 if(sequences.size() < defaultMinPlacedRows) {
                     keep[siteIndex] = 0;
@@ -583,8 +420,7 @@ uint64_t dinara::msaVerifyHetSites(
         return 1.e-9 * double(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
     };
     performanceLog << timestamp << "MSA het verification: "
-        << seconds(tBegin, tIndexed) << " s building the anchor index, "
-        << seconds(tIndexed, tVerified) << " s verifying "
+        << seconds(tBegin, tVerified) << " s for "
         << sites.size() << " sites." << endl;
 
     vector<uint64_t> reasons(reasonCount, 0);

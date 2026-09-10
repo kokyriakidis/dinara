@@ -1322,24 +1322,22 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.msaVerifyFlankBases",
         value<uint64_t>(&assemblyOptions.mode3Options.msaVerifyFlankBases)->
-        default_value(400),
-        "How far on each side of a het site to look for a bounding anchor "
-        "carried by the member reads -- in effect the MSA's context budget. "
-        "Too little context and abPOA itself aligns badly, so the check "
-        "rejects real sites: measured on E821, 50 confirmed 1406 of 4542 "
-        "sites, 150 confirmed 3871, 400 confirmed 3998 and 800 confirmed "
-        "4046, at 0.13 / 0.55 / 1.49 / 3.74 s. It plateaus around 400, which "
-        "is the default. Used only with Assembly.mode3.msaVerifySnpSites.")
+        default_value(150),
+        "Half-width of the window each member read contributes to the MSA, "
+        "centred on its own copy of the site. Scored against the HG002 truth "
+        "track on E821, 50 and 150 are indistinguishable (both keep 4392 true "
+        "variants at 99.7-99.8% precision) and cost 0.39 s and ~1.5 s; 150 is "
+        "the default for margin against nearby indels. Used only with "
+        "Assembly.mode3.msaVerifySnpSites.")
 
         ("Assembly.mode3.msaVerifyMinAgreement",
         value<double>(&assemblyOptions.mode3Options.msaVerifyMinAgreement)->
         default_value(0.9, "0.9"),
         "Fraction of placed member reads that must agree, applied both to the "
         "MSA column their SNP bases land in and to the arm/allele partition. "
-        "Measured on E821 this is nearly flat between 0.6 and 0.9 (4001 vs "
-        "3998 sites confirmed); only 1.0 changes much, rejecting 325 sites "
-        "for a single stray read. Used only with "
-        "Assembly.mode3.msaVerifySnpSites.")
+        "Measured on E821 this is nearly flat between 0.6 and 0.9; only 1.0 "
+        "changes much, rejecting sites for a single stray read. Used only "
+        "with Assembly.mode3.msaVerifySnpSites.")
 
         ("Assembly.mode3.hetErrorRate",
         value<double>(&assemblyOptions.mode3Options.hetErrorRate)->

@@ -46,7 +46,6 @@
 // set.
 
 #include "Assembler.hpp"
-#include "Shasta2Anchors.hpp"
 #include "cstdint.hpp"
 #include "vector.hpp"
 
@@ -122,13 +121,11 @@ MsaSiteVerdict verifyColumnAgreement(
 // The driver: verify every site and erase the ones that fail, returning the
 // number erased. Sites are independent, so this runs on `threadCount` threads.
 //
-// `flankBases` is how far to look on each side of the SNP for a bounding anchor
-// carried by the members; a larger value gives more candidates and a better
-// chance of a well-supported pair, at the cost of a longer alignment.
+// `flankBases` is the half-width of the window each member contributes, centred
+// on its own copy of the site. No anchors are involved: see the note above.
 uint64_t msaVerifyHetSites(
     vector<Assembler::CigarSnpSite>& sites,
     const Reads& reads,
-    const Shasta2Anchors& anchors,
     uint32_t flankBases,
     double minAgreementFraction,
     uint64_t threadCount,
