@@ -21,6 +21,7 @@
 #include "vector.hpp"
 #include "span.hpp"
 
+#include <cstdlib>
 #include <unordered_map>
 
 namespace dinara {
@@ -67,9 +68,17 @@ namespace dinara {
             uint32_t chainCount = 0;
         };
 
+        ~HifiasmImportedCigarStore() { releaseChainArena(); }
+
+        // The store OWNS the adopted chain arena (a plain C allocation), so
+        // copying it would double-free. Move-only.
+        HifiasmImportedCigarStore() = default;
+        HifiasmImportedCigarStore(const HifiasmImportedCigarStore&) = delete;
+        HifiasmImportedCigarStore& operator=(const HifiasmImportedCigarStore&) = delete;
+
         void clear() {
             arena.clear();
-            chainArena.clear();
+            releaseChainArena();
             sameStrand.clear();
             reverseStrand.clear();
         }
@@ -80,8 +89,28 @@ namespace dinara {
             arena.reserve(arenaTokens);
         }
 
-        void reserveChain(size_t chainAnchors) {
-            chainArena.reserve(chainAnchors);
+        // Take ownership of hifiasm's own native-chain arena instead of copying
+        // it. hifiasm hands back one flat array of packed anchors plus, per
+        // overlap, the offset/length of that overlap's slice within it -- which
+        // is exactly the layout this store needs. Copying it bought nothing but
+        // a lifetime: the caller used to free the arena right after import,
+        // while chainOf() is not consumed until computeBaseAlignmentsAndStore.
+        // Adopting it removes the copy AND the duplicate residency.
+        //
+        // Measured on E821 chr12:11-17Mb (161.6M anchors, 1.20 GiB): the copy
+        // cost 715 ms, of which only 173 ms was the memcpy itself (7.5 GB/s) --
+        // the other 542 ms was 315,663 minor page faults at ~1.7 us each,
+        // zeroing pages that were about to be overwritten. Pre-faulting the
+        // reservation confirmed it (715 ms -> 173 ms with the cost merely moved
+        // into the reserve). Not copying at all removes both halves.
+        //
+        // `arena` MUST be a malloc/realloc allocation (it is: hifiasm's sink
+        // grows it with realloc and the caller receives it via out_chain). The
+        // store frees it in clear() and in its destructor; the caller must not.
+        void adoptChainArena(uint64_t* arena, uint64_t anchorCount) {
+            releaseChainArena();
+            chainArenaData = arena;
+            chainArenaCount = anchorCount;
         }
 
         // Append one overlap's CIGAR (raw hifiasm tokens) and its metadata.
@@ -132,18 +161,20 @@ namespace dinara {
             (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
         }
 
-        // Attach the native chain anchors to an already-added record (same
-        // pairKey/strand). Copies the packed (q_start<<32)|t_start anchors into
-        // the chain arena. Not thread-safe; call from the single ingest thread.
-        void addChain(uint64_t pairKey, bool isSameStrand,
-                      span<const uint64_t> anchors) {
+        // Point an already-added record at its slice of the adopted chain arena
+        // (see adoptChainArena). Records the offset/count hifiasm already
+        // computed -- no anchor is copied or touched. Out-of-range slices are
+        // ignored rather than trusted, so a record can never hand out a span
+        // past the arena. Not thread-safe; call from the single ingest thread.
+        void setChain(uint64_t pairKey, bool isSameStrand,
+                      uint64_t anchorOffset, uint32_t anchorCount) {
             auto& m = isSameStrand ? sameStrand : reverseStrand;
             auto it = m.find(pairKey);
             if(it == m.end()) return;
-            it->second.chainOffset = chainArena.size();
-            it->second.chainCount = uint32_t(anchors.size());
-            for(size_t i = 0; i < anchors.size(); ++i)
-                chainArena.push_back(anchors[i]);
+            if(chainArenaData == nullptr) return;
+            if(anchorOffset + anchorCount > chainArenaCount) return;
+            it->second.chainOffset = anchorOffset;
+            it->second.chainCount = anchorCount;
         }
 
         // Look up the CIGAR record for a candidate. Returns nullptr if absent.
@@ -160,7 +191,10 @@ namespace dinara {
 
         // Native chain-anchor slice for a record (empty if none imported).
         span<const uint64_t> chainOf(const Record& rec) const {
-            return { chainArena.data() + rec.chainOffset, rec.chainCount };
+            if(chainArenaData == nullptr or rec.chainCount == 0) {
+                return {};
+            }
+            return { chainArenaData + rec.chainOffset, rec.chainCount };
         }
 
         bool empty() const { return sameStrand.empty() && reverseStrand.empty(); }
@@ -178,10 +212,20 @@ namespace dinara {
         }
 
     private:
+        void releaseChainArena() {
+            std::free(chainArenaData);
+            chainArenaData = nullptr;
+            chainArenaCount = 0;
+        }
+
         // Flat token arena (native hifiasm frame).
         std::vector<CigarToken> arena;
-        // Flat native-chain anchor arena (packed (q_start<<32)|t_start).
-        std::vector<uint64_t> chainArena;
+        // hifiasm's own flat native-chain anchor arena (packed
+        // (q_start<<32)|t_start), ADOPTED not copied -- this store frees it.
+        // Record::chainOffset/chainCount index into it directly, using the
+        // offsets hifiasm itself assigned.
+        uint64_t* chainArenaData = nullptr;
+        uint64_t chainArenaCount = 0;
         std::unordered_map<uint64_t, Record> sameStrand;
         std::unordered_map<uint64_t, Record> reverseStrand;
     };

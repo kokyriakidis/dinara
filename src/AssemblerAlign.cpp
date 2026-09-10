@@ -289,7 +289,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     uint64_t readCountFromHifiasm,
     const uint16_t* cigar,
     uint64_t cigarLen,
-    const uint64_t* chain,
+    uint64_t* chain,          // ownership transfers -- see Assembler.hpp
     uint64_t chainLen,
     uint64_t threadCount,
     uint32_t minOverlapLength,
@@ -433,7 +433,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
     if(cigar != nullptr) {
         uint64_t cigarOverlaps = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), cigarLen);
-        if(chain != nullptr) hifiasmImportedCigarStore.reserveChain(chainLen);
+        // Adopt hifiasm's chain arena rather than copying it; the store owns
+        // and frees it from here on (main must NOT free chain).
+        if(chain != nullptr) hifiasmImportedCigarStore.adoptChainArena(chain, chainLen);
         // Verification: does the imported CIGAR's own consumed span match the
         // declared box (q_end-q_start / t_end-t_start)? The box comes from the
         // pre-alignment chain-derived candidate interval (overlap_region::
@@ -459,9 +461,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
             ++cigarOverlaps;
             if(chain != nullptr && o.chain_len > 0 &&
                o.chain_offset + o.chain_len <= chainLen) {
-                hifiasmImportedCigarStore.addChain(
-                    e.key, o.is_same_strand != 0,
-                    span<const uint64_t>(chain + o.chain_offset, size_t(o.chain_len)));
+                hifiasmImportedCigarStore.setChain(
+                    e.key, o.is_same_strand != 0, o.chain_offset, o.chain_len);
             }
 
             // Walk the JUST-STORED (already op2/op3-transposed, dinara
@@ -596,7 +597,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
         uint64_t intervalOverlaps = 0;
         uint64_t chainOverlaps = 0, chainAnchorsTotal = 0;
         hifiasmImportedCigarStore.reserve(entries.size(), 0);
-        if(chain != nullptr) hifiasmImportedCigarStore.reserveChain(chainLen);
+        // Adopt hifiasm's chain arena rather than copying it; the store owns
+        // and frees it from here on (main must NOT free chain).
+        if(chain != nullptr) hifiasmImportedCigarStore.adoptChainArena(chain, chainLen);
         for(const PafEntry& e : entries) {
             if(e.sourceIndex == uint64_t(-1)) continue;
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
@@ -612,9 +615,8 @@ void Assembler::importAlignmentCandidatesFromMemory(
             // target-alignment frame). Consumed by mapNativeChainToOrdinals.
             if(chain != nullptr && o.chain_len > 0 &&
                o.chain_offset + o.chain_len <= chainLen) {
-                hifiasmImportedCigarStore.addChain(
-                    e.key, o.is_same_strand != 0,
-                    span<const uint64_t>(chain + o.chain_offset, size_t(o.chain_len)));
+                hifiasmImportedCigarStore.setChain(
+                    e.key, o.is_same_strand != 0, o.chain_offset, o.chain_len);
                 ++chainOverlaps;
                 chainAnchorsTotal += o.chain_len;
             }

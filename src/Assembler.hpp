@@ -932,7 +932,17 @@ public:
         // by all overlaps via hifiasm_overlap_t::chain_offset/chain_len.
         // Required whenever overlapCount > 0 (asserted): it is the only source
         // of marker ordinals (mapNativeChainToOrdinals), with no fallback.
-        const uint64_t* chain,
+        //
+        // OWNERSHIP TRANSFERS. hifiasmImportedCigarStore ADOPTS this arena
+        // (HifiasmImportedCigarStore::adoptChainArena) rather than copying it,
+        // and frees it in clear()/its destructor. The caller must NOT free it
+        // and must not use it after the store is cleared or destroyed --
+        // createMarkersFromNativeChain, which reads the same arena, therefore
+        // has to run while the store is still alive (it does). Must be a
+        // malloc/realloc allocation; out_chain from
+        // hifiasm_detect_overlaps_from_store is. Non-const for exactly that
+        // reason: a pointer whose ownership moves should not look borrowed.
+        uint64_t* chain,
         uint64_t chainLen,
         uint64_t threadCount = 0,
         // Candidate filter (OverlapCandidates.minOverlapLength): keep an overlap
