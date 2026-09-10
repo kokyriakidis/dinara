@@ -36,6 +36,25 @@
 // and why bounding by shared anchors is the load-bearing part of the design
 // rather than an implementation detail.
 //
+// THE NEIGHBOURHOOD TEST, AND ITS PRICE
+//
+// Assembly.mode3.msaVerifyRejectAtNoisyFlank rejects a site once that many of its
+// flanking MSA columns are ALSO biallelic -- hifiasm's "a snp very close to
+// another is not a real snp" asked in alignment space. It genuinely buys
+// precision, and it genuinely costs a lot of recall, because a het SNP's
+// neighbours are frequently OTHER het SNPs: heterozygous variants cluster in
+// haplotype-divergent regions, so the test also finds the regions richest in
+// real variants. Measured against the HG002 chr12 track:
+//
+//   max noisy flank    sites    FP   precision   recall(verifiable)   TP lost/FP
+//              off      4632    16       99.7%                93.4%           --
+//                4      4599    13       99.7%                92.7%        8 : 1
+//                2      4510    11       99.8%                91.1%       17 : 1
+//                1      4137     5       99.9%                83.9%       33 : 1
+//
+// Default 0 (off). Where to sit on that curve is a policy call about what a
+// false anchor costs relative to a missing one, not something the data settles.
+//
 // LIMITS
 //
 // Inside a short tandem repeat the MSA is itself ambiguous: abPOA picks *an*
@@ -65,6 +84,7 @@ public:
     // rows that placed and carry one of the two alleles.
     uint32_t partitionAgreeing = 0;
     uint32_t partitionTotal = 0;
+    uint32_t noisyFlankColumns = 0;
 
     // Why a site failed, for the funnel report. Stable and ordered so the
     // report reads as a funnel; keep in sync with reasonName().
@@ -75,9 +95,10 @@ public:
         msaFailed,          // abPOA produced no usable matrix
         columnsDisagree,    // members' SNP bases landed in different columns
         notBiallelic,       // agreed column is not cleanly biallelic
-        partitionMismatch   // column splits the reads differently than the arms
+        partitionMismatch,  // column splits the reads differently than the arms
+        noisyNeighbourhood  // neighbouring columns disagree too: a smear
     };
-    static constexpr uint64_t reasonCount = 7;
+    static constexpr uint64_t reasonCount = 8;
     Reason reason = Reason::noSharedAnchors;
 };
 
@@ -115,7 +136,9 @@ MsaSiteVerdict verifyColumnAgreement(
     const vector<uint32_t>& snpOffsetInRow,
     const vector<uint8_t>& armOfRow,
     double minAgreementFraction,
-    uint32_t minPlacedRows);
+    uint32_t minPlacedRows,
+    uint32_t flankColumns,
+    uint32_t noisyFlankColumns);
 
 
 // The driver: verify every site and erase the ones that fail, returning the
@@ -128,6 +151,8 @@ uint64_t msaVerifyHetSites(
     const Reads& reads,
     uint32_t flankBases,
     double minAgreementFraction,
+    uint32_t flankColumns,
+    uint32_t noisyFlankColumns,
     uint64_t threadCount,
     vector<uint64_t>* reasonCountsOut = nullptr);
 

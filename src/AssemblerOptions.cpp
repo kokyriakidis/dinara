@@ -1357,6 +1357,31 @@ void AssemblerOptions::addConfigurableOptions()
         "changes much, rejecting sites for a single stray read. Used only "
         "with Assembly.mode3.msaVerifySnpSites.")
 
+        ("Assembly.mode3.msaVerifyFlankColumns",
+        value<uint64_t>(&assemblyOptions.mode3Options.msaVerifyFlankColumns)->
+        default_value(10),
+        "How many MSA columns either side of a het site the neighbourhood test "
+        "inspects. Used only with Assembly.mode3.msaVerifyRejectAtNoisyFlank.")
+
+        ("Assembly.mode3.msaVerifyRejectAtNoisyFlank",
+        value<uint64_t>(&assemblyOptions.mode3Options.msaVerifyRejectAtNoisyFlank)->
+        default_value(0),
+        "Reject a het site once THIS MANY of its flanking MSA columns are also "
+        "noisy. A flanking column counts as noisy when it is biallelic by the "
+        "same rule used for the site itself: at least two distinct bases, each "
+        "carried by at least two of the reads placed in the alignment. The "
+        "window is Assembly.mode3.msaVerifyFlankColumns columns either side, so "
+        "20 columns by default. A value of 2 therefore means 'two or more noisy "
+        "neighbours rejects the site', tolerating at most one. "
+        "This is hifiasm's 'a snp very close to another is not a real snp' "
+        "asked in alignment space, where an intervening indel cannot distort "
+        "the distance. It buys precision and costs recall, because a het SNP's "
+        "neighbours are frequently other het SNPs. On the HG002 chr12 track, "
+        "4 / 2 / 1 give 99.7% / 99.8% / 99.9% precision at 92.7% / 91.1% / "
+        "83.9% recall, losing 8 / 17 / 33 true variants per false positive "
+        "removed. 0 disables (default); pick a point on that curve if false "
+        "anchors are costlier to you than missing ones.")
+
         ("Assembly.mode3.hetErrorRate",
         value<double>(&assemblyOptions.mode3Options.hetErrorRate)->
         default_value(0.025, "0.025"),
@@ -1829,6 +1854,8 @@ void Mode3AssemblyOptions::write(ostream& s) const
         convertBoolToPythonString(msaVerifySnpSites) << "\n";
     s << "mode3.msaVerifyFlankBases = " << msaVerifyFlankBases << "\n";
     s << "mode3.msaVerifyMinAgreement = " << msaVerifyMinAgreement << "\n";
+    s << "mode3.msaVerifyFlankColumns = " << msaVerifyFlankColumns << "\n";
+    s << "mode3.msaVerifyRejectAtNoisyFlank = " << msaVerifyRejectAtNoisyFlank << "\n";
     s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);

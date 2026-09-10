@@ -639,6 +639,12 @@ public:
     // column their SNP bases land in and to the arm/allele partition. Nearly
     // flat between 0.6 and 0.9 on E821; only 1.0 changes much.
     double msaVerifyMinAgreement = 0.9;
+    // Neighbourhood test: reject a site once this many of its flanking MSA
+    // columns are also biallelic. Buys precision, costs a lot of recall -- a
+    // het SNP's neighbours are frequently other het SNPs. See the table in
+    // HetSiteMsaVerification.hpp. 0 disables.
+    uint64_t msaVerifyFlankColumns = 10;
+    uint64_t msaVerifyRejectAtNoisyFlank = 0;
 
 
     // Assumed per-read sequencing error rate used by the per-edge MSA het

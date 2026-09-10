@@ -34,6 +34,7 @@ const char* dinara::msaVerdictReasonName(MsaSiteVerdict::Reason reason)
     case MsaSiteVerdict::Reason::columnsDisagree:   return "members landed in different columns";
     case MsaSiteVerdict::Reason::notBiallelic:      return "agreed column not biallelic";
     case MsaSiteVerdict::Reason::partitionMismatch: return "column splits reads differently than the arms";
+    case MsaSiteVerdict::Reason::noisyNeighbourhood: return "neighbouring columns also disagree (smear, not a point variant)";
     }
     return "unknown";
 }
@@ -52,7 +53,9 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
     const vector<uint32_t>& snpOffsetInRow,
     const vector<uint8_t>& armOfRow,
     double minAgreementFraction,
-    uint32_t minPlacedRows)
+    uint32_t minPlacedRows,
+    uint32_t flankColumns,
+    uint32_t noisyFlankColumns)
 {
     MsaSiteVerdict verdict;
     if(nSeq < 2 || msaLen <= 0 ||
@@ -180,6 +183,50 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
         return verdict;
     }
 
+    // Does the site LOOK like a point variant, or like a smear?
+    //
+    // A misaligned difference spreads disagreement across several neighbouring
+    // columns; a clean SNP is one disagreeing column among agreeing ones. This
+    // is hifiasm's "a snp very close to another is not a real snp"
+    // (generate_haplotypes_DP) asked in alignment space, where an intervening
+    // indel cannot distort the distance between two sites.
+    //
+    // It buys precision and costs a LOT of recall, because the premise is only
+    // half true for a diploid: a het SNP's neighbours are frequently OTHER het
+    // SNPs, since heterozygous variants cluster in haplotype-divergent regions.
+    // So it also finds the regions richest in real variants. Measured against
+    // the HG002 chr12 track (see the header for the table), rejecting at 4, 2
+    // or 1 noisy flanking columns costs 8, 17 and 33 true variants per false
+    // positive removed. Off by default for that reason; it is exposed because
+    // the right point on that curve is a policy choice, not a fact.
+    if(noisyFlankColumns > 0) {
+        uint32_t noisy = 0;
+        const int lo = std::max(0, bestColumn - int(flankColumns));
+        const int hi = std::min(msaLen - 1, bestColumn + int(flankColumns));
+        for(int c = lo; c <= hi; c++) {
+            if(c == bestColumn) {
+                continue;
+            }
+            std::array<uint32_t, 4> n{0, 0, 0, 0};
+            for(int row = 0; row < nSeq; row++) {
+                if(columnOfRow[size_t(row)] < 0) continue;
+                const uint8_t v = msa[row][c];
+                if(int(v) == gapValue || v >= 4) continue;
+                ++n[v];
+            }
+            uint32_t alleles = 0;
+            for(const uint32_t k : n) {
+                if(k >= 2) ++alleles;
+            }
+            if(alleles >= 2) ++noisy;
+        }
+        verdict.noisyFlankColumns = noisy;
+        if(noisy >= noisyFlankColumns) {
+            verdict.reason = MsaSiteVerdict::Reason::noisyNeighbourhood;
+            return verdict;
+        }
+    }
+
     verdict.verified = true;
     verdict.reason = MsaSiteVerdict::Reason::ok;
     return verdict;
@@ -273,6 +320,8 @@ uint64_t dinara::msaVerifyHetSites(
     const Reads& reads,
     uint32_t flankBases,
     double minAgreementFraction,
+    uint32_t flankColumns,
+    uint32_t noisyFlankColumns,
     uint64_t threadCount,
     vector<uint64_t>* reasonCountsOut)
 {
@@ -397,7 +446,8 @@ uint64_t dinara::msaVerifyHetSites(
                     [&](uint8_t** msa, int nSeq, int msaLen, int gapValue) {
                         verdict = verifyColumnAgreement(
                             msa, nSeq, msaLen, gapValue, snpOffset, armOfRow,
-                            minAgreementFraction, defaultMinPlacedRows);
+                            minAgreementFraction, defaultMinPlacedRows,
+                            flankColumns, noisyFlankColumns);
                     });
                 if(!ran) {
                     keep[siteIndex] = 0;

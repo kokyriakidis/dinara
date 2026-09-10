@@ -41,10 +41,12 @@ public:
 MsaSiteVerdict run(const Matrix& m,
     const std::vector<uint32_t>& offsets,
     const std::vector<uint8_t>& arms,
-    double minAgreement = 0.9)
+    double minAgreement = 0.9,
+    uint32_t rejectAtNoisyFlank = 0)      // 0 = neighbourhood test off, as shipped
 {
     return verifyColumnAgreement(
-        m.data(), m.nSeq(), m.len(), gap, offsets, arms, minAgreement, minPlaced);
+        m.data(), m.nSeq(), m.len(), gap, offsets, arms, minAgreement, minPlaced,
+        /*flankColumns*/ 10, rejectAtNoisyFlank);
 }
 
 } // namespace
@@ -277,4 +279,29 @@ TEST_CASE("MSA verification refuses fewer than two rows", "[msahet]")
 
     CHECK_FALSE(v.verified);
     CHECK(v.reason == MsaSiteVerdict::Reason::tooFewMembers);
+}
+
+
+TEST_CASE("MSA verification can reject a site whose neighbourhood is also noisy",
+          "[msahet]")
+{
+    // Column 2 is the site and columns 1 and 3 disagree too -- the signature of
+    // a smeared misalignment rather than a point variant. Off by default
+    // (rejectAtNoisyFlank 0) because a het SNP's neighbours are often other het
+    // SNPs; this pins the mechanism, not the policy.
+    Matrix m({
+        {A, C, G, T, A},
+        {A, C, G, T, A},
+        {A, G, T, C, A},
+        {A, G, T, C, A},
+    });
+    const std::vector<uint32_t> offsets{2, 2, 2, 2};
+    const std::vector<uint8_t> arms{0, 0, 1, 1};
+
+    CHECK(run(m, offsets, arms, 0.9, /*rejectAtNoisyFlank*/ 0).verified);
+
+    const auto strict = run(m, offsets, arms, 0.9, /*rejectAtNoisyFlank*/ 2);
+    CHECK_FALSE(strict.verified);
+    CHECK(strict.reason == MsaSiteVerdict::Reason::noisyNeighbourhood);
+    CHECK(strict.noisyFlankColumns == 2);      // columns 1 and 3
 }
