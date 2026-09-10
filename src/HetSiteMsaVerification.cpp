@@ -359,13 +359,24 @@ uint64_t dinara::msaVerifyHetSites(
     vector<vector<uint64_t>> reasonsByThread(
         threadCount, vector<uint64_t>(reasonCount, 0));
 
-    const uint64_t chunk = (sites.size() + threadCount - 1) / threadCount;
+    // DYNAMIC scheduling, one site at a time.
+    //
+    // Cost per site scales with its member count and window length, coverage
+    // varies along the genome, and collapseDuplicateLoci leaves sites ordered
+    // by read -- so a static partition hands contiguous, cost-correlated blocks
+    // to each thread. Measured, that matters less than it sounds: 8.79 s vs
+    // 9.54 s on four threads, and nothing at twenty (3.82 vs 3.80). Kept
+    // because it is strictly more robust to a skewed site distribution and one
+    // relaxed atomic per site is nothing against ~15 ms of POA.
+    //
+    // Do not read the thread scaling here as poor. This box has TEN physical
+    // cores with two threads each, so 4 -> 20 threads is 2.5x more compute, not
+    // 5x; the measured 2.3-2.5x is the hardware limit, not an inefficiency.
+    std::atomic<uint64_t> nextSite{0};
     vector<std::thread> threads;
     threads.reserve(threadCount);
     for(uint64_t t = 0; t < threadCount; t++) {
         threads.emplace_back([&, t]() {
-            const uint64_t begin = t * chunk;
-            const uint64_t end = std::min<uint64_t>(sites.size(), (t + 1) * chunk);
             vector<uint64_t>& reasons = reasonsByThread[t];
 
             // One abPOA instance for this thread's whole batch, plus hoisted
@@ -377,7 +388,12 @@ uint64_t dinara::msaVerifyHetSites(
             vector<uint32_t> snpOffset;
             vector<uint8_t> armOfRow;
 
-            for(uint64_t siteIndex = begin; siteIndex < end; siteIndex++) {
+            for(;;) {
+                const uint64_t siteIndex =
+                    nextSite.fetch_add(1, std::memory_order_relaxed);
+                if(siteIndex >= sites.size()) {
+                    break;
+                }
                 const Assembler::CigarSnpSite& site = sites[siteIndex];
 
                 // Flatten the arms, remembering which arm each member came
