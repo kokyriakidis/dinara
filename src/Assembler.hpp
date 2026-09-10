@@ -398,9 +398,6 @@ public:
         span<const uint64_t> anchors,
         vector< array<uint32_t, 2> >& ordinals) const;
 
-    // Lightweight marker-chain materialization for marker-graph prototypes.
-    // Old Phasing Logic Stub (for AssemblerPhasing.cpp compatibility)
-    void performPhasing(uint64_t threadCount);
     void accessAlignmentData();
     void accessAlignmentDataReadWrite();
 
@@ -445,8 +442,6 @@ public:
     void filterMarkerGraphVerticesByChainConsistency(uint64_t threadCount);
 
 
-    // Create and run Verkko-style directed anchor graph resolution.
-    void runDirectedAnchorGraphResolution();
 
 
     // Find the vertex of the global marker graph that contains a given marker.
@@ -816,7 +811,6 @@ public:
     /// required: extending coordinates to the read tips would zero out both
     /// overhangs and make MA_HT_INT undetectable.
     void deleteInternalOverlaps(uint64_t maxHang, double maxHangRate, uint64_t minOverlapLength, uint64_t threadCount);
-    void filterOverlapsByRegionalCliques(uint64_t minIntervalOverlap, uint64_t minRegionSize, double minCliqueFraction, uint64_t threadCount);
 
     void applyOntChemicalArcMask(uint64_t threadCount);
     void applyOntChemicalArcMask(uint64_t chemicalCov, uint64_t chemicalFlank, double dupRate, uint64_t threadCount);
@@ -1450,22 +1444,8 @@ private:
     void readGraphClustering();
     void writeReadGraphEdges(bool useReadName=false) const;
 
-    void createReadGraph3(uint64_t maxAlignmentCount);
-    void createReadGraph4(uint64_t maxAlignmentCount);
 
-    void createReadGraph4AllAlignments(uint32_t maxAlignmentCount);
-    void createReadGraph4withStrandSeparation(
-        uint64_t maxAlignmentCount,
-        double epsilon,
-        double delta,
-        double WThreshold,
-        double WThresholdForBreaks
-        );
-    void removeReadGraph();
 
-    void accessReadGraphAllAlignments();
-    void accessReadGraphAllAlignmentsReadWrite();
-    void checkReadGraphAllAlignmentsIsOpen() const;
 
     // Create a read graph keeping all alignments without any filtering.
     // Use this together with marker graph vertex coverage thresholds
@@ -1535,8 +1515,6 @@ public:
 #if 0
     // Functions and data for the version that uses mini-assemblies.
 private:
-    void createReadGraph2ThreadFunction(size_t threadId);
-    void createReadGraph2LowLevel(ReadId);
     class CreateReadGraph2Data {
     public:
         vector<bool> keepAlignment;
@@ -1562,15 +1540,12 @@ public:
 
     // Strict strand separation in the read graph.
     void flagCrossStrandReadGraphEdges2();
-    void flagCrossStrandReadGraphEdges4();
-    void flagCrossStrandReadGraphEdges5();
 
 
 
 	    // Create the ReadGraph given a bool vector that specifies which
 	    // alignments should be used in the read graph.
 	    void createReadGraphUsingSelectedAlignments(vector<bool>& keepAlignment);
-    void createReadGraphUsingAllAlignments(vector<bool>& keepAlignment);
 
 
 
@@ -1657,13 +1632,7 @@ public:
 
     void performHifiasmECFinalFilteringParity(uint64_t threadCount);
 
-    // Old function (to be removed/replaced)
-    void performHifiasmECFiltering(uint64_t threadCount);
-    void performPhasingThreadFunction(uint64_t threadId);
     
-    // Phasing using canonical OverlapIndex (sets is_match/strong flags)
-    void performPhasingCanonical(uint64_t threadCount);
-    void performPhasingCanonicalThreadFunction(uint64_t threadId);
 
 
 
@@ -1739,25 +1708,12 @@ public:
     void findMarkerGraphReverseComplementVertices(uint64_t threadCount);
     void accessMarkerGraphVertices(bool readWriteAccess = false);
     void accessMarkerGraphReverseComplementVertex(bool readWriteAccess = false);
-    void removeMarkerGraphVertices();
-    void accessDisjointSetsHistogram();
 private:
     void findMarkerGraphReverseComplementVerticesThreadFunction1(size_t threadId);
     void findMarkerGraphReverseComplementVerticesThreadFunction2(size_t threadId);
 
 
 
-    // Given a marker graph vertex, follow all of the contributing oriented
-    // reads to their next vertex, but without moving forward more than
-    // maxSkip markers.
-    // In the returned vector, each entry correspond to a marker in the given vertex
-    // (in the same order) and gives the next VertexId for that oriented read.
-    // The next VertexId can be invalidVertexId if the oriented read has no vertices
-    // past the starting VertexId.
-    void findNextMarkerGraphVertices(
-        MarkerGraphVertexId,
-        uint32_t maxSkip,
-        vector<MarkerGraphVertexId>&) const;
 
     // Find the common KmerId for all the markers of a marker graph vertex.
     KmerId getMarkerGraphVertexKmerId(MarkerGraphVertexId) const;
@@ -1766,17 +1722,9 @@ private:
 
     // Create marker graph edges.
 public:
-    void createMarkerGraphEdges(uint64_t threadCount);
     void accessMarkerGraphEdges(bool accessEdgesReadWrite, bool accessConnectivityReadWrite = false);
-    void accessMarkerGraphEdgeMarkerIntervals();
-    void checkMarkerGraphEdgesIsOpen() const;
     void accessMarkerGraphConsensus();
 private:
-    void createMarkerGraphEdgesThreadFunction0(size_t threadId);
-    void createMarkerGraphEdgesThreadFunction1(size_t threadId);
-    void createMarkerGraphEdgesThreadFunction2(size_t threadId);
-    void createMarkerGraphEdgesThreadFunction12(size_t threadId, size_t pass);
-    void createMarkerGraphEdgesBySourceAndTarget(uint64_t threadCount);
     class CreateMarkerGraphEdgesData {
     public:
         vector< shared_ptr< MemoryMapped::Vector<MarkerGraph::Edge> > > threadEdges;
@@ -1801,12 +1749,7 @@ private:
     // - This will only create the MarkerGraph::edgeMarkerIntervals
     //   and MarkerGraph::edgeSequence and nothing else.
 public:
-    void createPrimaryMarkerGraphEdges(
-        uint64_t minPrimaryCoverage,
-        uint64_t maxPrimaryCoverage,
-        uint64_t threadCount);
 private:
-    void createPrimaryMarkerGraphEdgesThreadFunction(uint64_t threadId);
     class CreatePrimaryMarkerGraphEdgesData {
     public:
         uint64_t minPrimaryCoverage;
@@ -1862,42 +1805,25 @@ public:
 
 
 
-    // Set marker graph edge flags to specified values for all marker graph edges.
-    // Specify any value other than 0 or 1 leaves that flag unchanged.
-    // Only useful for debugging.
-    void setMarkerGraphEdgeFlags(
-        uint8_t wasRemovedByTransitiveReduction,
-        uint8_t wasPruned,
-        uint8_t isSuperBubbleEdge,
-        uint8_t isLowCoverageCrossEdge,
-        uint8_t wasAssembled);
 
 
 
     // Find the reverse complement of each marker graph edge.
 public:
-    void findMarkerGraphReverseComplementEdges(uint64_t threadCount);
     void accessMarkerGraphReverseComplementEdge();
 private:
-    void findMarkerGraphReverseComplementEdgesThreadFunction1(size_t threadId);
-    void findMarkerGraphReverseComplementEdgesThreadFunction2(size_t threadId);
 
 
     // Check that the marker graph is strand symmetric.
     // This can only be called after both findMarkerGraphReverseComplementVertices
     // and findMarkerGraphReverseComplementEdges have been called.
 public:
-    void checkMarkerGraphIsStrandSymmetric(uint64_t threadCount = 0);
 private:
-    void checkMarkerGraphIsStrandSymmetricThreadFunction1(size_t threadId);
-    void checkMarkerGraphIsStrandSymmetricThreadFunction2(size_t threadId);
 
 
 
 public:
 
-    // Prune leaves from the strong subgraph of the global marker graph.
-    void pruneMarkerGraphStrongSubgraph(size_t iterationCount);
 
 private:
 
@@ -2003,86 +1929,22 @@ private:
         OrientedReadId,
         vector< pair<uint32_t, MarkerGraph::VertexId> >&);
 
-    // Find the markers contained in a given vertex of the global marker graph.
-    // The markers are stored as pairs(oriented read id, ordinal).
-    void getGlobalMarkerGraphVertexMarkers(
-        MarkerGraph::VertexId,
-        vector< pair<OrientedReadId, uint32_t> >&) const;
 
-    void getGlobalMarkerGraphVertexChildren(
-        MarkerGraphVertexId,
-        vector< pair<MarkerGraphVertexId, vector<MarkerInterval> > >&,
-        vector< pair<MarkerGraphVertexId, MarkerInterval> >& workArea
-        ) const;
 
-    // Given two marker graph vertices, get the marker intervals
-    // that a possible edge between the two vertices would have.
-    void getMarkerIntervals(
-        MarkerGraphVertexId,
-        MarkerGraphVertexId,
-        vector<MarkerInterval>&
-        ) const;
 
-    // Return true if a vertex of the global marker graph has more than
-    // one marker for at least one oriented read id.
-    bool isBadMarkerGraphVertex(MarkerGraph::VertexId) const;
 
-    // Write csv files with detailed marker graph information.
-    void debugWriteMarkerGraph(const string& fileNamePrefix = "") const;
 
     // Write a csv file with information on all marker graph vertices for which
     // isBadMarkerGraphVertex returns true.
 public:
-    void writeBadMarkerGraphVertices() const;
 private:
 
-    // Find out if a vertex is a forward or backward leaf of the pruned
-    // strong subgraph of the marker graph.
-    // A forward leaf is a vertex with out-degree 0.
-    // A backward leaf is a vertex with in-degree 0.
-    bool isForwardLeafOfMarkerGraphPrunedStrongSubgraph(MarkerGraph::VertexId) const;
-    bool isBackwardLeafOfMarkerGraphPrunedStrongSubgraph(MarkerGraph::VertexId) const;
-
-    // Given an edge of the pruned strong subgraph of the marker graph,
-    // return the next/previous edge in the linear chain the edge belongs to.
-    // If the edge is the last/first edge in its linear chain, return MarkerGraph::invalidEdgeId.
-    MarkerGraphEdgeId nextEdgeInMarkerGraphPrunedStrongSubgraphChain(MarkerGraphEdgeId) const;
-    MarkerGraphEdgeId previousEdgeInMarkerGraphPrunedStrongSubgraphChain(MarkerGraphEdgeId) const;
-
-    // Return the out-degree or in-degree (number of outgoing/incoming edges)
-    // of a vertex of the pruned strong subgraph of the marker graph.
-    size_t markerGraphPrunedStrongSubgraphOutDegree(MarkerGraph::VertexId) const;
-    size_t markerGraphPrunedStrongSubgraphInDegree (MarkerGraph::VertexId) const;
-
-    // Return true if an edge disconnects the local subgraph.
-    bool markerGraphEdgeDisconnectsLocalStrongSubgraph(
-        MarkerGraphEdgeId edgeId,
-        size_t maxDistance,
-
-        // Work areas, to reduce memory allocation activity.
-
-        // Each of these two must be sized maxDistance+1.
-        array<vector< vector<MarkerGraphEdgeId> >, 2>& verticesByDistance,
-
-        // Each of these two must be sized globalMarkerGraphVertices.size()
-        // and set to all false on entry.
-        // It is left set to all false on exit, so it can be reused.
-        array<vector<bool>, 2>& vertexFlags
-        ) const;
 
 
 
-    // Each oriented read corresponds to a path in the marker graph.
-    // This function computes a subset of that path
-    // covering the specified range of marker ordinals for the given
-    // oriented read.
-    void computeOrientedReadMarkerGraphPath(
-        OrientedReadId,
-        uint32_t firstOrdinal,
-        uint32_t lastOrdinal,
-        vector<MarkerGraphEdgeId>& path,
-        vector< pair<uint32_t, uint32_t> >& pathOrdinals
-        ) const;
+
+
+
 
     // Create the marker connectivity graph starting with a given marker.
     void createMarkerConnectivityGraph(
@@ -2106,41 +1968,7 @@ private:
 
 
 
-    // Extract a local subgraph of the global marker graph.
-    bool extractLocalMarkerGraph(
-        OrientedReadId,
-        uint32_t ordinal,
-        uint64_t distance,
-        int timeout,                 // Or 0 for no timeout.
-        uint64_t minVertexCoverage,
-        uint64_t minEdgeCoverage,
-        bool useWeakEdges,
-        bool usePrunedEdges,
-        bool useSuperBubbleEdges,
-        bool useLowCoverageCrossEdges,
-        bool useRemovedSecondaryEdges,
-        LocalMarkerGraph0&
-        );
-    bool extractLocalMarkerGraph(
-        MarkerGraph::VertexId,
-        uint64_t distance,
-        int timeout,                 // Or 0 for no timeout.
-        uint64_t minVertexCoverage,
-        uint64_t minEdgeCoverage,
-        bool useWeakEdges,
-        bool usePrunedEdges,
-        bool useSuperBubbleEdges,
-        bool useLowCoverageCrossEdges,
-        bool useRemovedSecondaryEdges,
-        LocalMarkerGraph0&
-        );
 
-    // Compute consensus sequence for a vertex of the marker graph.
-    void computeMarkerGraphVertexConsensusSequence(
-        MarkerGraph::VertexId,
-        vector<Base>& sequence,
-        vector<uint32_t>& repeatCounts
-        );
 
 
 
@@ -2185,19 +2013,6 @@ private:
 
 
 
-    // Use spoa to compute consensus sequence for an edge of the marker graph.
-    // This does not include the bases corresponding to the flanking markers.
-    void computeMarkerGraphEdgeConsensusSequenceUsingSpoa(
-        MarkerGraphEdgeId,
-        uint32_t markerGraphEdgeLengthThresholdForConsensus,
-        const std::unique_ptr<spoa::AlignmentEngine>& spoaAlignmentEngine,
-        spoa::Graph& spoaAlignmentGraph,
-        vector<Base>& sequence,
-        vector<uint32_t>& repeatCounts,
-        uint8_t& overlappingBaseCount,
-        ComputeMarkerGraphEdgeConsensusSequenceUsingSpoaDetail&,
-        vector< pair<uint32_t, CompressedCoverageData> >* coverageData // Optional
-        );
 
 
 
@@ -2205,18 +2020,7 @@ private:
     // The first argument is a number of marker graph edges.
     // See the code for detail on its meaning and how it is used.
 public:
-    void simplifyMarkerGraph(
-        const vector<size_t>& maxLength, // One value for each iteration.
-        bool debug);
 private:
-    void simplifyMarkerGraphIterationPart1(
-        size_t iteration,
-        size_t maxLength,
-        bool debug);
-    void simplifyMarkerGraphIterationPart2(
-        size_t iteration,
-        size_t maxLength,
-        bool debug);
 
 
 
@@ -2226,23 +2030,14 @@ private:
     // and all edges that are not marked as removed.
     // Output is to csv files.
 public:
-    void computeMarkerGraphCoverageHistogram();
 
 
-    // Compute consensus repeat counts for each vertex of the marker graph.
-    void assembleMarkerGraphVertices(uint64_t threadCount);
-    void accessMarkerGraphVertexRepeatCounts();
 private:
-    void assembleMarkerGraphVerticesThreadFunction(size_t threadId);
 public:
 
 
 
-    // Optional computation of coverage data for marker graph vertices.
-    // This is only called if Assembly.storeCoverageData in dinara.conf is True.
-    void computeMarkerGraphVerticesCoverageData(uint64_t threadCount);
 private:
-    void computeMarkerGraphVerticesCoverageDataThreadFunction(size_t threadId);
     class ComputeMarkerGraphVerticesCoverageDataData {
     public:
 
@@ -2264,7 +2059,6 @@ private:
     // This is only available if the run had Assembly.storeCoverageData set to True
     // in dinara.conf.
 public:
-    void accessMarkerGraphCoverageData();
 
 
 
@@ -2499,16 +2293,12 @@ public:
     // oriented reads that co-occur on any Shasta2 journey anchor (marker-graph collapse;
     // can exceed alignmentTable neighbors). Use to scope windows, anchor separation, evidence.
     MemoryMapped::VectorOfVectors<uint32_t, uint32_t> strand0JourneyCoReads;
-    void computeStrand0JourneyCoReadsTable();
 
     // Non-overlapping journeys derived from shasta2Journeys.
     // Indexed by OrientedReadId.getValue(). Computed after journey creation.
     // AnchorId is uint64_t (shasta2::AnchorId).
     std::vector<std::vector<uint64_t>> shasta2LinearJourneys;
 
-    void computeTheseusTargetBackboneMSAPrototype(
-        uint64_t maxReads,
-        uint64_t threadCount);
 
 
     std::shared_ptr<Shasta2AnchorGraph> shasta2AnchorGraph;
@@ -2544,81 +2334,11 @@ public:
 
 #if DINARA_TESTING
 namespace dinara::testing {
-    // Test-only hook: apply the same overlap-support splitting (including bridge removal
-    // and quasi-clique peeling) used by marker-vertex anchor decomposition.
-    vector<vector<uint32_t>> splitVertexByOverlapSupportForTesting(
-        const vector<vector<uint32_t>>& adjAll,
-        const vector<vector<uint32_t>>& adjCis,
-        bool hasAnyCisEdge,
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage);
 
-    // Test-only hook: run Markov Clustering (MCL) on an (undirected) adjacency list.
-    // The adjacency does not need to be symmetric; it is symmetrized internally.
-    vector<vector<uint32_t>> mclClusterForTesting(
-        const vector<vector<uint32_t>>& adj,
-        double inflation,
-        uint32_t maxIterations);
 
-    // Test-only hook: split using a provided core mask (see Mode3 vertexSplit.useNonContainedCores).
-    vector<vector<uint32_t>> splitVertexByOverlapSupportWithCoreMaskForTesting(
-        const vector<vector<uint32_t>>& adjAll,
-        const vector<vector<uint32_t>>& adjCis,
-        bool hasAnyCisEdge,
-        const vector<uint8_t>& isCore,
-        uint32_t coreMinSize,
-        uint32_t attachMinSupport,
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage);
 
-    // Test-only hook: run the same "auto" logic as the vertex-based anchor splitter:
-    // - optional non-contained core splitting + attachment
-    // - optional MCL secondary splitting (with suspicious-vertex checks)
-    // - quasi-clique peeling
-    vector<vector<uint32_t>> autoSplitVertexForTesting(
-        const vector<vector<uint32_t>>& adjAll,
-        const vector<vector<uint32_t>>& adjCis,
-        bool hasAnyCisEdge,
-        const vector<uint8_t>& isCore,
-        bool useNonContainedCores,
-        uint32_t coreMinSize,
-        uint32_t attachMinSupport,
-        bool useMclSecondary,
-        uint32_t mclMinVertexSize,
-        double mclInflation,
-        uint32_t mclMaxIterations,
-        double suspiciousMaxDensity,
-        double suspiciousMaxAverageClustering,
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage);
 
-    // Same as autoSplitVertexForTesting, but also returns whether the MCL branch was attempted.
-    std::pair<vector<vector<uint32_t>>, bool> autoSplitVertexWithMclTriedFlagForTesting(
-        const vector<vector<uint32_t>>& adjAll,
-        const vector<vector<uint32_t>>& adjCis,
-        bool hasAnyCisEdge,
-        const vector<uint8_t>& isCore,
-        bool useNonContainedCores,
-        uint32_t coreMinSize,
-        uint32_t attachMinSupport,
-        bool useMclSecondary,
-        uint32_t mclMinVertexSize,
-        double mclInflation,
-        uint32_t mclMaxIterations,
-        double suspiciousMaxDensity,
-        double suspiciousMaxAverageClustering,
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage);
 
-    // Test-only hook: clique-cover splitter (maximal cliques on core reads + attachment + peeling).
-    vector<vector<uint32_t>> splitVertexByCliqueCoverForTesting(
-        const vector<vector<uint32_t>>& adjAll,
-        const vector<vector<uint32_t>>& adjCis,
-        bool hasAnyCisEdge,
-        const vector<uint8_t>& isCore,
-        uint32_t attachMinSupport,
-        uint64_t minAnchorCoverage,
-        uint64_t maxAnchorCoverage);
 }
 #endif
 
