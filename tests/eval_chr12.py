@@ -22,6 +22,15 @@ with open('truth_chr12_11_17_snv.tsv') as fh:
         truth[(pc, int(pp))] = int(mp)
         canon.add(int(mp))
 
+# The truth track covers only part of the requested window, so a site outside its
+# span cannot be scored either way -- counting those as false positives just
+# measures where the track stops. Restrict both numerator and denominator to it.
+truth_span = {}
+for (c, p_) in truth:
+    lo, hi = truth_span.get(c, (p_, p_))
+    truth_span[c] = (min(lo, p_), max(hi, p_))
+print("truth span: " + str(truth_span))
+
 best = {}
 for line in open('reads_vs_chr12.paf'):
     f = line.rstrip('\n').split('\t')
@@ -74,9 +83,13 @@ def score(path, tol=2):
         m = projector(a)
         for s in ss:
             tp = m.get(s['pos'])
-            if tp is not None:
-                s['tname'] = a['tname']; s['tpos'] = tp
-                projected.append(s)
+            if tp is None:
+                continue
+            lo_hi = truth_span.get(a["tname"])
+            if lo_hi is None or not (lo_hi[0] <= tp <= lo_hi[1]):
+                continue
+            s['tname'] = a['tname']; s['tpos'] = tp
+            projected.append(s)
     def match(s):
         for d in range(-tol, tol + 1):
             c = truth.get((s['tname'], s['tpos'] + d))
