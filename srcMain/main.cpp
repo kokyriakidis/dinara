@@ -486,36 +486,71 @@ namespace {
 // sequences hifiasm expects, so the caller must fall back to the file path.
 //
 // This RAII helper converts dinara's 2-bit reads to ASCII, loads them, and
-// releases the store on scope exit. hifiasm copies the bases into its own
-// store during load, so the temporary ASCII buffers are freed immediately
-// after each read is inserted (only one read's worth is live at a time).
+// releases the store on scope exit.
+//
+// The ASCII detour is not avoidable by pointing at dinara's storage: both sides
+// keep the bases 2-bit packed, but through incompatible schemes. dinara's
+// LongBaseSequenceView is BIT-PLANE (per 64 bases, one uint64_t holding every
+// base's low bit and one holding every high bit); hifiasm's ha_compress_base is
+// BYTE-PACKED (4 bases per byte, two adjacent bits each, read back through
+// Get_READ/recover_UC_Read). Neither can read the other's words, so the bases
+// are expanded to ASCII here and repacked by hifiasm on the way in.
+//
+// Both conversions are per-read independent, so both run in parallel; measured
+// on the E821 fixture (284,446,148 bases) they were 470 ms and 314 ms
+// single-threaded.
+//
+// EVERY read's ASCII buffer is live until load returns, not one at a time:
+// hifiasm_reads_store_load takes all the hifiasm_read_t views at once and its
+// pass 1 must see every length before pass 2 reads any sequence. That is
+// 271 MiB on this fixture. Freeing them as they are consumed would need a
+// two-phase bridge API (submit lengths, then insert reads one by one).
 class HifiasmReadStore {
 public:
-    HifiasmReadStore(const Reads& reads) : loaded(false)
+    HifiasmReadStore(const Reads& reads, uint64_t threadCount) : loaded(false)
     {
+        if(threadCount == 0) threadCount = 1;
         const ReadId n = reads.readCount();
         readViews.resize(n);
         // One contiguous ASCII buffer per read, kept alive until after the
         // load call returns (hifiasm_read_t stores pointers into them).
         asciiSeqs.resize(n);
-        for(ReadId i = 0; i < n; i++) {
-            const LongBaseSequenceView seq = reads.getRead(i);
-            const uint64_t len = seq.baseCount;
-            std::string& s = asciiSeqs[i];
-            s.resize(len);
-            for(uint64_t j = 0; j < len; j++) {
-                s[j] = seq[j].character();  // 2-bit base -> 'A'/'C'/'G'/'T'
-            }
-            const span<const char> name = reads.getReadName(i);
+        // Expand in parallel: one bit-plane extraction per base over the whole
+        // input, and read i touches only asciiSeqs[i] / readViews[i]. Both
+        // vectors are sized above, so no thread grows either one.
+        {
+            std::atomic<ReadId> nextRead{0};
+            const ReadId batch = 16;
+            vector<std::thread> expanders;
+            for(uint64_t t = 0; t < threadCount; t++) {
+                expanders.emplace_back([&]() {
+                    for(;;) {
+                        const ReadId begin = nextRead.fetch_add(batch);
+                        if(begin >= n) return;
+                        const ReadId end = std::min(ReadId(begin + batch), n);
+                        for(ReadId i = begin; i < end; i++) {
+                            const LongBaseSequenceView seq = reads.getRead(i);
+                            const uint64_t len = seq.baseCount;
+                            std::string& s = asciiSeqs[i];
+                            s.resize(len);
+                            for(uint64_t j = 0; j < len; j++) {
+                                s[j] = seq[j].character();  // 2-bit -> 'A'/'C'/'G'/'T'
+                            }
+                            const span<const char> name = reads.getReadName(i);
 
-            hifiasm_read_t& r = readViews[i];
-            r.seq = s.data();
-            r.seq_len = len;
-            r.name = name.data();
-            r.name_len = uint32_t(name.size());
+                            hifiasm_read_t& r = readViews[i];
+                            r.seq = s.data();
+                            r.seq_len = len;
+                            r.name = name.data();
+                            r.name_len = uint32_t(name.size());
+                        }
+                    }
+                });
+            }
+            for(auto& t : expanders) t.join();
         }
         const int rc = hifiasm_reads_store_load(
-            readViews.data(), uint64_t(readViews.size()));
+            readViews.data(), uint64_t(readViews.size()), int(threadCount));
         if(rc != 0) {
             throw runtime_error(
                 "Failed to load reads into hifiasm store (code " +
@@ -654,7 +689,7 @@ void dinara::main::assemble(
     performanceLog << timestamp
         << "Loading " << assembler.getReads().readCount()
         << " reads into hifiasm in-memory store (no file re-reads)." << endl;
-    HifiasmReadStore hifiasmStore(assembler.getReads());
+    HifiasmReadStore hifiasmStore(assembler.getReads(), threadCount);
     performanceLog << timestamp << "hifiasm read store loaded." << endl;
 
     // Markers and overlaps share one no-HPC minimizer space at the marker k
