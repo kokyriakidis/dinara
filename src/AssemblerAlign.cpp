@@ -26,6 +26,7 @@ using namespace dinara;
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
 #include <thread>
 
 // hifiasm in-memory overlap bridge (hifiasm_overlap_t).
@@ -287,7 +288,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
     const char* names,
     const uint64_t* nameOffsets,
     uint64_t readCountFromHifiasm,
-    const uint16_t* cigar,
+    uint16_t* cigar,
     uint64_t cigarLen,
     uint64_t* chain,          // ownership transfers -- see Assembler.hpp
     uint64_t chainLen,
@@ -432,9 +433,11 @@ void Assembler::importAlignmentCandidatesFromMemory(
     // (query,target) alignment frame; reframing to read0/read1 happens at use.
     if(cigar != nullptr) {
         uint64_t cigarOverlaps = 0;
-        hifiasmImportedCigarStore.reserve(entries.size(), cigarLen);
-        // Adopt hifiasm's chain arena rather than copying it; the store owns
-        // and frees it from here on (main must NOT free chain).
+        hifiasmImportedCigarStore.reserve(entries.size());
+        // Adopt hifiasm's arenas rather than copying them; the store owns and
+        // frees both from here on (main must NOT free chain, and must not hand
+        // cigar to hifiasm_overlaps_mem_free).
+        hifiasmImportedCigarStore.adoptCigarArena(cigar, cigarLen);
         if(chain != nullptr) hifiasmImportedCigarStore.adoptChainArena(chain, chainLen);
         // Verification: does the imported CIGAR's own consumed span match the
         // declared box (q_end-q_start / t_end-t_start)? The box comes from the
@@ -446,6 +449,17 @@ void Assembler::importAlignmentCandidatesFromMemory(
         uint64_t spanMatchCount = 0, spanMismatchCount = 0;
         uint64_t spanMismatchBasesQ = 0, spanMismatchBasesT = 0;
         uint64_t basesChecked = 0, basesAgree = 0, basesDisagree = 0;
+        // One entry per registered record: which slice of the adopted arena is
+        // its own. Collected in the registration pass below so the transpose
+        // pass never has to re-derive (or re-test) which overlaps survived.
+        struct TransposeJob {
+            uint64_t key;
+            uint64_t cigarOffset;
+            uint32_t cigarTokenCount;
+            bool isSameStrand;
+        };
+        vector<TransposeJob> toTranspose;
+        toTranspose.reserve(entries.size());
         for(const PafEntry& e : entries) {
             if(e.sourceIndex == uint64_t(-1)) continue;
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
@@ -453,26 +467,81 @@ void Assembler::importAlignmentCandidatesFromMemory(
             if(o.cigar_offset + o.cigar_len > cigarLen) continue; // defensive
             const ReadId readId0 = hifiToDinara[o.q_id];
             const ReadId readId1 = hifiToDinara[o.t_id];
-            hifiasmImportedCigarStore.add(
+            hifiasmImportedCigarStore.addRecord(
                 e.key, o.is_same_strand != 0,
-                span<const uint16_t>(cigar + o.cigar_offset, size_t(o.cigar_len)),
+                o.cigar_offset, uint32_t(o.cigar_len),
                 uint32_t(readId0), uint32_t(readId1),
                 o.q_start, o.q_end, o.t_start, o.t_end);
+            toTranspose.push_back(TransposeJob{
+                e.key, o.cigar_offset, uint32_t(o.cigar_len),
+                o.is_same_strand != 0});
             ++cigarOverlaps;
             if(chain != nullptr && o.chain_len > 0 &&
                o.chain_offset + o.chain_len <= chainLen) {
                 hifiasmImportedCigarStore.setChain(
                     e.key, o.is_same_strand != 0, o.chain_offset, o.chain_len);
             }
+        }
 
-            // Walk the JUST-STORED (already op2/op3-transposed, dinara
-            // convention) tokens to get the CIGAR's own query/target span.
+        // Transpose every registered record's tokens in place, in parallel.
+        //
+        // This is the only pass that touches a token, and it neither copies nor
+        // allocates: the tokens stay in hifiasm's own arena (now owned by the
+        // store) and only their op bits are rewritten. hifiasm assigns each
+        // overlap a disjoint slice, and toTranspose holds one job per REGISTERED
+        // record, so no slice is visited twice -- which matters, because the
+        // 2<->3 swap is its own inverse and a second visit would silently
+        // restore hifiasm's convention.
+        //
+        // The spans land in a per-job array rather than in the records, so no
+        // thread ever writes to the store: they are folded in serially below.
+        vector<uint32_t> jobQuerySpan(toTranspose.size());
+        vector<uint32_t> jobTargetSpan(toTranspose.size());
+        {
+            std::atomic<uint64_t> nextJob{0};
+            const uint64_t batch = 256;
+            vector<std::thread> transposers;
+            for(uint64_t t = 0; t < threadCount; t++) {
+                transposers.emplace_back([&]() {
+                    for(;;) {
+                        const uint64_t begin = nextJob.fetch_add(batch);
+                        if(begin >= toTranspose.size()) return;
+                        const uint64_t end =
+                            std::min(begin + batch, uint64_t(toTranspose.size()));
+                        for(uint64_t j = begin; j < end; j++) {
+                            const TransposeJob& job = toTranspose[j];
+                            hifiasmImportedCigarStore.transposeInPlace(
+                                job.cigarOffset, job.cigarTokenCount,
+                                jobQuerySpan[j], jobTargetSpan[j]);
+                        }
+                    }
+                });
+            }
+            for(auto& t : transposers) t.join();
+        }
+        for(uint64_t j = 0; j < toTranspose.size(); j++) {
+            hifiasmImportedCigarStore.setCigarSpans(
+                toTranspose[j].key, toTranspose[j].isSameStrand,
+                jobQuerySpan[j], jobTargetSpan[j]);
+        }
+
+        // Second pass: verify each record now that its tokens are in dinara's
+        // convention and its spans are recorded.
+        for(const PafEntry& e : entries) {
+            if(e.sourceIndex == uint64_t(-1)) continue;
+            const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
+            if(o.cigar_len == 0) continue;
+            if(o.cigar_offset + o.cigar_len > cigarLen) continue; // defensive
+            const ReadId readId0 = hifiToDinara[o.q_id];
+            const ReadId readId1 = hifiToDinara[o.t_id];
+
+            // Does the CIGAR's own consumed span match the declared box?
             const HifiasmImportedCigarStore::Record* rec =
                 hifiasmImportedCigarStore.find(e.key, o.is_same_strand != 0);
             if(rec != nullptr) {
-                // add() accumulated these while transposing the tokens; read
-                // them back rather than re-walking, so the stored spans and the
-                // ones checked here can never drift apart.
+                // transposeInPlace accumulated these while rewriting the tokens;
+                // read them back rather than re-walking, so the stored spans and
+                // the ones checked here can never drift apart.
                 const uint64_t qConsumed = rec->cigarQuerySpan;
                 const uint64_t tConsumed = rec->cigarTargetSpan;
                 const uint64_t declaredQ = uint64_t(o.q_end) - uint64_t(o.q_start);
@@ -596,7 +665,7 @@ void Assembler::importAlignmentCandidatesFromMemory(
         // and the empty-ordinals guard downstream would drop every overlap.
         uint64_t intervalOverlaps = 0;
         uint64_t chainOverlaps = 0, chainAnchorsTotal = 0;
-        hifiasmImportedCigarStore.reserve(entries.size(), 0);
+        hifiasmImportedCigarStore.reserve(entries.size());
         // Adopt hifiasm's chain arena rather than copying it; the store owns
         // and frees it from here on (main must NOT free chain).
         if(chain != nullptr) hifiasmImportedCigarStore.adoptChainArena(chain, chainLen);
@@ -605,9 +674,9 @@ void Assembler::importAlignmentCandidatesFromMemory(
             const hifiasm_overlap_t& o = overlaps[e.sourceIndex];
             const ReadId readId0 = hifiToDinara[o.q_id];
             const ReadId readId1 = hifiToDinara[o.t_id];
-            hifiasmImportedCigarStore.add(
+            hifiasmImportedCigarStore.addRecord(
                 e.key, o.is_same_strand != 0,
-                span<const uint16_t>(),   // no tokens: interval-only record
+                /*cigarOffset*/ 0, /*cigarTokenCount*/ 0,   // interval-only record
                 uint32_t(readId0), uint32_t(readId1),
                 o.q_start, o.q_end, o.t_start, o.t_end);
             ++intervalOverlaps;

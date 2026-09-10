@@ -22,6 +22,7 @@
 #include "span.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 
 namespace dinara {
@@ -68,25 +69,136 @@ namespace dinara {
             uint32_t chainCount = 0;
         };
 
-        ~HifiasmImportedCigarStore() { releaseChainArena(); }
+        ~HifiasmImportedCigarStore() { releaseCigarArena(); releaseChainArena(); }
 
-        // The store OWNS the adopted chain arena (a plain C allocation), so
-        // copying it would double-free. Move-only.
+        // The store OWNS the adopted CIGAR and chain arenas (plain C
+        // allocations), so copying it would double-free. Move-only.
         HifiasmImportedCigarStore() = default;
         HifiasmImportedCigarStore(const HifiasmImportedCigarStore&) = delete;
         HifiasmImportedCigarStore& operator=(const HifiasmImportedCigarStore&) = delete;
 
         void clear() {
-            arena.clear();
+            releaseCigarArena();
             releaseChainArena();
             sameStrand.clear();
             reverseStrand.clear();
         }
 
-        void reserve(size_t overlapCount, size_t arenaTokens) {
+        void reserve(size_t overlapCount) {
             sameStrand.reserve(overlapCount);
             reverseStrand.reserve(overlapCount);
-            arena.reserve(arenaTokens);
+        }
+
+        // Take ownership of hifiasm's own CIGAR token arena, exactly as
+        // adoptChainArena does for the chain anchors. hifiasm's uint16_t token
+        // and dinara's CigarToken are the SAME 16 bits (op in [15:14], length
+        // in [13:0]) -- CigarToken is a one-field struct over that word and its
+        // uint16_t constructor takes a raw hifiasm token -- so the arena needs
+        // no re-encoding to be readable as CigarToken, only the op2/op3
+        // transpose, which transposeInPlace does WITHOUT copying.
+        //
+        // Must be a malloc/realloc allocation (out_cigar is). The store frees
+        // it; the caller must not, and must not pass it to
+        // hifiasm_overlaps_mem_free.
+        void adoptCigarArena(uint16_t* arena, uint64_t tokenCount) {
+            releaseCigarArena();
+            cigarArenaData = arena;
+            cigarArenaCount = tokenCount;
+        }
+
+        // Register one overlap's record WITHOUT touching a single token: the
+        // tokens already sit in the adopted arena at hifiasm's own offset.
+        // cigarQuerySpan/cigarTargetSpan are left zero for transposeInPlace +
+        // setCigarSpans to fill.
+        void addRecord(uint64_t pairKey, bool isSameStrand,
+                       uint64_t cigarOffset, uint32_t cigarTokenCount,
+                       uint32_t readIdQ, uint32_t readIdT,
+                       uint32_t qStart, uint32_t qEnd,
+                       uint32_t tStart, uint32_t tEnd) {
+            Record rec;
+            rec.cigarOffset = cigarOffset;
+            rec.cigarTokenCount = cigarTokenCount;
+            rec.readIdQ = readIdQ;
+            rec.readIdT = readIdT;
+            rec.qStart = qStart;
+            rec.qEnd = qEnd;
+            rec.tStart = tStart;
+            rec.tEnd = tEnd;
+            rec.isSameStrand = isSameStrand;
+            (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
+        }
+
+        // Transpose one overlap's tokens IN PLACE in the adopted arena, from
+        // hifiasm's op convention to dinara's, and report what the tokens span.
+        //
+        // hifiasm's op2 consumes the TARGET and op3 the QUERY; dinara's op2
+        // (CigarOpIns) consumes the query and op3 (CigarOpDel) the target. So
+        // the fix is to swap 2 <-> 3 and leave 0/1 alone. In the packed word the
+        // op is bits [15:14], so op2 = 0b10 and op3 = 0b11 differ only in bit
+        // 14, and ops 0/1 both have bit 15 clear: flipping bit 14 exactly when
+        // bit 15 is set does the swap with no branch and cannot disturb the
+        // 14-bit length.
+        //
+        // Touches only [offset, offset+count), which hifiasm assigns disjointly
+        // per overlap, so callers may run this over different records
+        // concurrently. It is NOT idempotent -- swapping twice restores
+        // hifiasm's convention -- so call it exactly once per record.
+        void transposeInPlace(uint64_t cigarOffset, uint32_t cigarTokenCount,
+                              uint32_t& querySpan, uint32_t& targetSpan) const {
+            uint64_t q = 0, t = 0;
+            uint16_t* const first = cigarArenaData + cigarOffset;
+            for(uint32_t i = 0; i < cigarTokenCount; i++) {
+                uint16_t data = first[i];
+                data = uint16_t(data ^ ((data >> 1) & 0x4000u));
+                first[i] = data;
+                const CigarToken token(data);
+                const uint8_t op = token.op();
+                if(opConsumesQuery(op))  q += token.len();
+                if(opConsumesTarget(op)) t += token.len();
+            }
+            querySpan = uint32_t(q);
+            targetSpan = uint32_t(t);
+        }
+
+        // Convenience for a producer that has no arena to adopt and must build
+        // one overlap at a time: grow the owned arena by these raw hifiasm
+        // tokens, register the record, transpose, record the spans. Exactly
+        // what importAlignmentCandidatesFromMemory does across its three
+        // passes, for one overlap -- and the ONLY entry point that copies a
+        // token, which is why the import path does not use it. There is still
+        // just one arena, and the store still owns and frees it.
+        void addCopyingTokens(uint64_t pairKey, bool isSameStrand,
+                              span<const uint16_t> tokens,
+                              uint32_t readIdQ, uint32_t readIdT,
+                              uint32_t qStart, uint32_t qEnd,
+                              uint32_t tStart, uint32_t tEnd) {
+            const uint64_t offset = cigarArenaCount;
+            if(not tokens.empty()) {
+                // realloc, so the arena stays the plain C allocation that
+                // releaseCigarArena() frees -- same shape as an adopted one.
+                uint16_t* const grown = static_cast<uint16_t*>(std::realloc(
+                    cigarArenaData,
+                    size_t(cigarArenaCount + tokens.size()) * sizeof(uint16_t)));
+                DINARA_ASSERT(grown != nullptr);
+                cigarArenaData = grown;
+                std::memcpy(cigarArenaData + cigarArenaCount, &*tokens.begin(),
+                    tokens.size() * sizeof(uint16_t));
+                cigarArenaCount += tokens.size();
+            }
+            addRecord(pairKey, isSameStrand, offset, uint32_t(tokens.size()),
+                readIdQ, readIdT, qStart, qEnd, tStart, tEnd);
+            uint32_t querySpan = 0, targetSpan = 0;
+            transposeInPlace(offset, uint32_t(tokens.size()), querySpan, targetSpan);
+            setCigarSpans(pairKey, isSameStrand, querySpan, targetSpan);
+        }
+
+        void setCigarSpans(uint64_t pairKey, bool isSameStrand,
+                           uint32_t querySpan, uint32_t targetSpan) {
+            auto& m = isSameStrand ? sameStrand : reverseStrand;
+            auto it = m.find(pairKey);
+            if(it == m.end()) return;
+            it->second.cigarQuerySpan = querySpan;
+            it->second.cigarTargetSpan = targetSpan;
         }
 
         // Take ownership of hifiasm's own native-chain arena instead of copying
@@ -113,54 +225,6 @@ namespace dinara {
             chainArenaCount = anchorCount;
         }
 
-        // Append one overlap's CIGAR (raw hifiasm tokens) and its metadata.
-        // Not thread-safe: call from a single thread after dedup.
-        //
-        // hifiasm's exported op2/op3 are the transpose of dinara's convention:
-        // in hifiasm's bit_extz_t frame op2 consumes the TARGET and op3 consumes
-        // the QUERY, whereas dinara's OverlapCigarStore defines op2 (CigarOpIns)
-        // as query-consuming and op3 (CigarOpDel) as target-consuming. Verified
-        // by base content: walking the raw tokens with op2=target/op3=query makes
-        // every op0 (match) column pair identical bases, while the opposite
-        // interpretation mismatches ~70% of them. Transpose op2<->op3 here, at
-        // the single ingest boundary, so every downstream consumer (and the
-        // recorded qStart/qEnd/tStart/tEnd spans) share dinara's convention.
-        void add(uint64_t pairKey, bool isSameStrand,
-                 span<const uint16_t> tokens,
-                 uint32_t readIdQ, uint32_t readIdT,
-                 uint32_t qStart, uint32_t qEnd,
-                 uint32_t tStart, uint32_t tEnd) {
-            Record rec;
-            rec.cigarOffset = arena.size();
-            rec.cigarTokenCount = uint32_t(tokens.size());
-            rec.readIdQ = readIdQ;
-            rec.readIdT = readIdT;
-            rec.qStart = qStart;
-            rec.qEnd = qEnd;
-            rec.tStart = tStart;
-            rec.tEnd = tEnd;
-            rec.isSameStrand = isSameStrand;
-            // The transpose already visits every token, so accumulate what the
-            // CIGAR spans here rather than in a second pass. Lengths are summed
-            // in DINARA's convention (post-transpose), matching qStart/qEnd and
-            // tStart/tEnd.
-            uint64_t querySpan = 0;
-            uint64_t targetSpan = 0;
-            for(size_t i = 0; i < tokens.size(); ++i) {
-                const CigarToken raw(tokens[i]);
-                const uint8_t op = raw.op();
-                const uint8_t dinaraOp =
-                    (op == CigarOpIns) ? uint8_t(CigarOpDel) :
-                    (op == CigarOpDel) ? uint8_t(CigarOpIns) : op;
-                arena.emplace_back(CigarToken(dinaraOp, raw.len()));
-                if(opConsumesQuery(dinaraOp))  querySpan  += raw.len();
-                if(opConsumesTarget(dinaraOp)) targetSpan += raw.len();
-            }
-            rec.cigarQuerySpan  = uint32_t(querySpan);
-            rec.cigarTargetSpan = uint32_t(targetSpan);
-            (isSameStrand ? sameStrand : reverseStrand)[pairKey] = rec;
-        }
-
         // Point an already-added record at its slice of the adopted chain arena
         // (see adoptChainArena). Records the offset/count hifiasm already
         // computed -- no anchor is copied or touched. Out-of-range slices are
@@ -184,9 +248,16 @@ namespace dinara {
             return it == m.end() ? nullptr : &it->second;
         }
 
-        // Token slice for a record.
+        // Token slice for a record, viewed over the adopted arena. Safe to
+        // reinterpret: CigarToken is a single uint16_t with hifiasm's own bit
+        // layout (static_assert(sizeof(CigarToken) == 2) in OverlapCigarStore).
         span<const CigarToken> tokensOf(const Record& rec) const {
-            return { arena.data() + rec.cigarOffset, rec.cigarTokenCount };
+            if(cigarArenaData == nullptr or rec.cigarTokenCount == 0) {
+                return {};
+            }
+            return {
+                reinterpret_cast<const CigarToken*>(cigarArenaData + rec.cigarOffset),
+                rec.cigarTokenCount };
         }
 
         // Native chain-anchor slice for a record (empty if none imported).
@@ -212,14 +283,24 @@ namespace dinara {
         }
 
     private:
+        void releaseCigarArena() {
+            std::free(cigarArenaData);
+            cigarArenaData = nullptr;
+            cigarArenaCount = 0;
+        }
+
         void releaseChainArena() {
             std::free(chainArenaData);
             chainArenaData = nullptr;
             chainArenaCount = 0;
         }
 
-        // Flat token arena (native hifiasm frame).
-        std::vector<CigarToken> arena;
+        // hifiasm's own flat CIGAR token arena, ADOPTED not copied -- this store
+        // frees it. Record::cigarOffset/cigarTokenCount index into it using the
+        // offsets hifiasm itself assigned; transposeInPlace rewrites the op bits
+        // there rather than into a second arena.
+        uint16_t* cigarArenaData = nullptr;
+        uint64_t cigarArenaCount = 0;
         // hifiasm's own flat native-chain anchor arena (packed
         // (q_start<<32)|t_start), ADOPTED not copied -- this store frees it.
         // Record::chainOffset/chainCount index into it directly, using the

@@ -926,7 +926,7 @@ public:
         const char* names,
         const uint64_t* nameOffsets,
         uint64_t readCountFromHifiasm,
-        const uint16_t* cigar,
+        uint16_t* cigar,
         uint64_t cigarLen,
         // Native dense chain-anchor arena (packed (q_start<<32)|t_start) shared
         // by all overlaps via hifiasm_overlap_t::chain_offset/chain_len.

@@ -309,7 +309,7 @@ TEST_CASE("HifiasmImportedCigarStore transposes op2/op3 at ingest") {
 
     HifiasmImportedCigarStore store;
     const uint64_t pairKey = (uint64_t(0) << 32) | uint64_t(1);
-    store.add(pairKey, /*isSameStrand*/ true,
+    store.addCopyingTokens(pairKey, /*isSameStrand*/ true,
               span<const uint16_t>(rawTokens.data(), rawTokens.size()),
               /*readIdQ*/ 0, /*readIdT*/ 1, qStart, qEnd, tStart, tEnd);
 

@@ -879,14 +879,17 @@ void dinara::main::assemble(
     assembler.initiateSaveBinaryData(&Assembler::saveMarkers);
 
 
-    hifiasm_overlaps_mem_free(ov, names, nameOff, cigar);
-    // NOT free(chain): importAlignmentCandidatesFromMemory handed the native
-    // chain arena to hifiasmImportedCigarStore, which now owns it and frees it
-    // (see adoptChainArena). It used to be copied here and freed there, which
-    // cost 715 ms and 1.2 GiB of duplicate residency on the E821 fixture --
-    // and only 173 ms of that was the copy; the rest was faulting in the pages
-    // it was about to overwrite. createMarkersFromNativeChain above reads the
-    // same arena and runs before this point, so the adoption is safe.
+    // cigar is passed as nullptr, and chain is not freed at all:
+    // importAlignmentCandidatesFromMemory handed BOTH arenas to
+    // hifiasmImportedCigarStore, which owns and frees them (adoptCigarArena /
+    // adoptChainArena). They used to be copied there and freed here, which on
+    // the E821 fixture cost 715 ms and 1.2 GiB of duplicate residency for the
+    // chain and ~400 ms and 157 MB for the CIGAR -- and for the chain only
+    // 173 ms of that was the copy, the rest being faults on pages about to be
+    // overwritten. createMarkersFromNativeChain above reads the chain arena and
+    // runs before this point, so the adoption is safe for both.
+    hifiasm_overlaps_mem_free(ov, names, nameOff, /*cigar*/ nullptr);
+    cigar = nullptr;
     chain = nullptr;
 
     // The overlap-path filter (built above and reused for overlap detection) is

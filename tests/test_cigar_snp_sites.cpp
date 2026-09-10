@@ -100,7 +100,7 @@ public:
         }
         if(runOp != 0xff) tokens.push_back(CigarToken(runOp, runLen).data);
 
-        assembler->hifiasmImportedCigarStore.add(
+        assembler->hifiasmImportedCigarStore.addCopyingTokens(
             pairKey, /*isSameStrand*/ true,
             span<const uint16_t>(tokens.data(), tokens.size()),
             uint32_t(q), uint32_t(t),
