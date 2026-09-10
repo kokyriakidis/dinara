@@ -888,9 +888,14 @@ void dinara::main::assemble(
     assembler.computeCandidateTable();
 
 
+    // Optional overlap phasing, kept for future use. Both are compiled:
+    // AssemblerPhasing.cpp and AssemblerPhasingKmeans.cpp.
     // assembler.phaseOverlaps(threadCount);
     // assembler.phaseOverlapsKmeans(threadCount);
 
+    // performHifiasmECParity lives in AssemblerHifiasmEC.cpp, which is
+    // EXCLUDED from both builds (see Executable/CMakeLists.txt). Uncommenting
+    // this line does not link until that exclusion is lifted.
     // assembler.performHifiasmECParity(threadCount);
 
     // ---- Post-phasing overlap cleaning ----
@@ -1025,11 +1030,6 @@ void dinara::main::assemble(
         threadCount,
         shasta2Owner);
     auto& shasta2Journeys = assembler.shasta2Journeys;
-
-    // MSA-based overlap phasing — disabled, replaced by CIGAR-based window pipeline.
-    // assembler.phaseOverlapsMSA(threadCount);
-
-
 
 
     // Build the DETECTION anchor graph from the current (pre-het) journeys,
