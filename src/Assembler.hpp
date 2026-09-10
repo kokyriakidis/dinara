@@ -535,11 +535,6 @@ public:
     // isOnt: enables ONT-specific Fisher exact strand bias filter.
     void phaseOverlapsKmeans(uint64_t threadCount, bool isOnt = false);
 
-    // POA-based overlap phasing using Theseus MSA on anchor windows.
-    // Requires shasta2Anchors and shasta2Journeys to be populated.
-    // Coexists with phaseOverlapsKmeans — both write hifiasmEcMatchState.
-    void phaseOverlapsMSA(uint64_t threadCount);
-
     // Hifiasm Error Correction
     void performHifiasmECParity(uint64_t threadCount);
     // Experimental: EC parity using induced alignments through marker graph vertices.
