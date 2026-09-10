@@ -645,6 +645,10 @@ public:
     // HetSiteMsaVerification.hpp. 0 disables.
     uint64_t msaVerifyFlankColumns = 10;
     uint64_t msaVerifyRejectAtNoisyFlank = 0;
+    // Let abPOA band the alignment. 2.4x faster (1.57 s vs 3.82 s on E821) and
+    // costs 2 false positives out of 4632 sites. Off by default; the whole pass
+    // is only 3.8 s here, but site count scales with the genome.
+    bool msaVerifyBanded = false;
 
 
     // Assumed per-read sequencing error rate used by the per-edge MSA het

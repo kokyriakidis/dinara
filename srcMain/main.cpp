@@ -1119,6 +1119,7 @@ void dinara::main::assemble(
                         assemblerOptions.assemblyOptions.mode3Options.msaVerifyMinAgreement,
                         uint32_t(assemblerOptions.assemblyOptions.mode3Options.msaVerifyFlankColumns),
                         uint32_t(assemblerOptions.assemblyOptions.mode3Options.msaVerifyRejectAtNoisyFlank),
+                        assemblerOptions.assemblyOptions.mode3Options.msaVerifyBanded,
                         threadCount,
                         &reasons);
                     cout << timestamp << "MSA verification: "

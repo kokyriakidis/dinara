@@ -153,6 +153,7 @@ uint64_t msaVerifyHetSites(
     double minAgreementFraction,
     uint32_t flankColumns,
     uint32_t noisyFlankColumns,
+    bool banded,
     uint64_t threadCount,
     vector<uint64_t>* reasonCountsOut = nullptr);
 

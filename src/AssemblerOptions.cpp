@@ -1382,6 +1382,22 @@ void AssemblerOptions::addConfigurableOptions()
         "removed. 0 disables (default); pick a point on that curve if false "
         "anchors are costlier to you than missing ones.")
 
+        ("Assembly.mode3.msaVerifyBanded",
+        value<bool>(&assemblyOptions.mode3Options.msaVerifyBanded)->
+        default_value(false),
+        "Let abPOA band the verification alignment. Banding assumes the "
+        "alignment stays near the diagonal, which is exactly what breaks in "
+        "the indel-rich stretches these sites live in, so it is off by default "
+        "(longcallD disables it too). It is however where ALL of this pass's "
+        "time goes: measured on E821, banded 1.57 s against 3.82 s unbanded, "
+        "for a difference of 5 sites out of 4632 -- banded admits 3 more, two "
+        "false positives and one true variant. Those two false positives are "
+        "both in AT/TA dinucleotide microsatellites, which is the mechanism: a "
+        "repeat is where the correct alignment leaves the diagonal, so the band "
+        "forces a wrong but consistent placement that the column test cannot "
+        "see. Worth turning on for a whole genome, where the site count scales "
+        "and 2.25 s does not stay small -- at the cost of exactly this class.")
+
         ("Assembly.mode3.hetErrorRate",
         value<double>(&assemblyOptions.mode3Options.hetErrorRate)->
         default_value(0.025, "0.025"),
@@ -1856,6 +1872,7 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.msaVerifyMinAgreement = " << msaVerifyMinAgreement << "\n";
     s << "mode3.msaVerifyFlankColumns = " << msaVerifyFlankColumns << "\n";
     s << "mode3.msaVerifyRejectAtNoisyFlank = " << msaVerifyRejectAtNoisyFlank << "\n";
+    s << "mode3.msaVerifyBanded = " << convertBoolToPythonString(msaVerifyBanded) << "\n";
     s << "mode3.hetErrorRate = " << hetErrorRate << "\n";
     vertexSplitOptions.write(s);
     primaryGraphOptions.write(s);

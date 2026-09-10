@@ -264,7 +264,7 @@ namespace {
 // each thread keeps one of these for its whole batch.
 class MsaRunner {
 public:
-    MsaRunner()
+    explicit MsaRunner(bool banded)
     {
         ab = abpoa_init();
         abpt = abpoa_init_para();
@@ -275,7 +275,28 @@ public:
         // alignment stays near the diagonal, which is the assumption that
         // breaks in the noisy, indel-rich stretches these sites live in.
         // longcallD sets the same for its realignment.
-        abpt->wb = -1;
+        // Adaptive banding. A band assumes the alignment stays near the
+        // diagonal, which is the assumption that breaks in indel-rich stretches
+        // -- longcallD disables it for the same reason. It is also where ALL of
+        // this pass's time goes: on E821, banded 1.57 s against 3.82 s
+        // unbanded, a 2.4x difference, for 5 sites out of 4632 (banded admits
+        // 3 more: 2 false positives and 1 true variant).
+        //
+        // The three false positives banding admits are ALL in AT/TA
+        // dinucleotide microsatellites (PAT 12708900 GTATATATATATA, 14480898
+        // ATATATATTCATA, 14480744 ATATGTTCATATA), which is exactly the
+        // mechanism: a repeat is where the correct alignment shifts off the
+        // diagonal by a repeat unit, so the band forces a wrong but CONSISTENT
+        // placement, every base lands in one column, and the check passes a
+        // site it should have caught. Banding fails precisely where this
+        // verification is worth doing.
+        //
+        // Unbanded by default for that reason. Worth revisiting on a whole
+        // genome, where site count scales and 2.25 s does not stay small --
+        // hence the option rather than a hard-coded choice.
+        if(not banded) {
+            abpt->wb = -1;
+        }
         abpoa_post_set_para(abpt);
     }
     ~MsaRunner()
@@ -289,9 +310,10 @@ public:
     // Align `sequences` and hand the row-major MSA matrix to `consume`.
     // False if abPOA produced nothing usable.
     template<class Consume>
-    bool run(const vector<vector<uint8_t>>& sequences, Consume&& consume)
+    bool run(const vector<vector<uint8_t>>& sequences, uint64_t count,
+        Consume&& consume)
     {
-        const int nSeq = int(sequences.size());
+        const int nSeq = int(count);
         if(nSeq < 2) {
             return false;
         }
@@ -338,6 +360,7 @@ uint64_t dinara::msaVerifyHetSites(
     double minAgreementFraction,
     uint32_t flankColumns,
     uint32_t noisyFlankColumns,
+    bool banded,
     uint64_t threadCount,
     vector<uint64_t>* reasonCountsOut)
 {
@@ -381,7 +404,7 @@ uint64_t dinara::msaVerifyHetSites(
 
             // One abPOA instance for this thread's whole batch, plus hoisted
             // scratch: this loop runs tens of thousands of times.
-            MsaRunner msaRunner;
+            MsaRunner msaRunner(banded);
             vector<std::pair<OrientedReadId, uint32_t>> members;
             vector<uint8_t> armOfMember;
             vector<vector<uint8_t>> sequences;
@@ -435,7 +458,12 @@ uint64_t dinara::msaVerifyHetSites(
                 // perfectly well -- so dropping the requirement dissolves the
                 // conflict: every member participates and no site is lost for
                 // want of a bound two haplotypes happen to share.
-                sequences.clear();
+                // Reuse the sequence buffers rather than clear()ing the outer
+                // vector, which would destroy every inner one and hand back its
+                // storage. At ~35 members and ~4900 sites that was 170k
+                // malloc/free pairs per run, contended across every thread, for
+                // buffers that are all the same size.
+                uint64_t sequenceCount = 0;
                 snpOffset.clear();
                 armOfRow.clear();
                 bool viable = true;
@@ -452,7 +480,11 @@ uint64_t dinara::msaVerifyHetSites(
                         readLength, uint64_t(position) + flankBases + 1));
                     if(rightPos <= position) continue;
 
-                    vector<uint8_t> seq;
+                    if(sequenceCount == sequences.size()) {
+                        sequences.emplace_back();
+                    }
+                    vector<uint8_t>& seq = sequences[sequenceCount];
+                    seq.clear();                       // keeps capacity
                     seq.reserve(rightPos - leftPos);
                     for(uint32_t p = leftPos; p < rightPos; p++) {
                         seq.push_back(uint8_t(
@@ -460,21 +492,21 @@ uint64_t dinara::msaVerifyHetSites(
                     }
                     snpOffset.push_back(position - leftPos);
                     armOfRow.push_back(armOfMember[i]);
-                    sequences.push_back(std::move(seq));
+                    ++sequenceCount;
                 }
                 if(not viable) {
                     keep[siteIndex] = 0;
                     ++reasons[uint64_t(MsaSiteVerdict::Reason::noSharedAnchors)];
                     continue;
                 }
-                if(sequences.size() < defaultMinPlacedRows) {
+                if(sequenceCount < defaultMinPlacedRows) {
                     keep[siteIndex] = 0;
                     ++reasons[uint64_t(MsaSiteVerdict::Reason::tooFewMembers)];
                     continue;
                 }
 
                 MsaSiteVerdict verdict;
-                const bool ran = msaRunner.run(sequences,
+                const bool ran = msaRunner.run(sequences, sequenceCount,
                     [&](uint8_t** msa, int nSeq, int msaLen, int gapValue) {
                         verdict = verifyColumnAgreement(
                             msa, nSeq, msaLen, gapValue, snpOffset, armOfRow,
