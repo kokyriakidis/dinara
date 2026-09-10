@@ -1106,10 +1106,9 @@ void dinara::main::assemble(
                         "already claimed by a better-supported site, leaving "
                      << snpSites.size() << "." << endl;
 
-                // EXPERIMENTAL MSA verification, before anything is built
-                // from these sites. See HetSiteMsaVerification.hpp: the CIGAR
-                // pass proves two bases DIFFER, this asks whether they are the
-                // same locus.
+                // MSA verification, before anything is built from these
+                // sites. See HetSiteMsaVerification.hpp: the CIGAR pass proves
+                // two bases DIFFER, this asks whether they are the same locus.
                 if(assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites) {
                     vector<uint64_t> reasons;
                     const uint64_t before = snpSites.size();
@@ -1120,7 +1119,7 @@ void dinara::main::assemble(
                         assemblerOptions.assemblyOptions.mode3Options.msaVerifyMinAgreement,
                         threadCount,
                         &reasons);
-                    cout << timestamp << "MSA verification (EXPERIMENTAL): "
+                    cout << timestamp << "MSA verification: "
                          << (before - rejected) << " of " << before
                          << " sites confirmed, " << rejected << " rejected."
                          << endl;

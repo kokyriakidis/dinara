@@ -1,8 +1,8 @@
 #ifndef DINARA_HET_SITE_MSA_VERIFICATION_HPP
 #define DINARA_HET_SITE_MSA_VERIFICATION_HPP
 
-// EXPERIMENTAL: verify CIGAR-detected het sites with an MSA over the interval
-// between two anchors the member reads share.
+// Verify CIGAR-detected het sites with an MSA of the reads that carry them.
+
 //
 // WHAT THIS CHECKS THAT NOTHING ELSE DOES
 //

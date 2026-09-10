@@ -611,13 +611,18 @@ public:
     // an existing graph. Off by default -- detection alone changes nothing.
     bool createSnpSiteAnchors = false;
 
-    // EXPERIMENTAL: before building anchors, re-check each surviving site with
-    // an MSA over the interval between two anchors every member shares. The
-    // pairwise CIGARs can agree that two bases differ while disagreeing about
-    // whether they are the same locus; an MSA answers that in one frame. Off by
-    // default -- it can only remove sites, so it trades recall for precision
-    // and the trade has to be measured before it is trusted.
-    bool msaVerifySnpSites = false;
+    // Before building anchors, re-check each surviving site with an MSA of its
+    // member reads. The pairwise CIGARs can agree that two bases differ while
+    // disagreeing about whether they are the same locus; an MSA answers that in
+    // one frame, and nothing else in the chain can.
+    //
+    // ON by default. It removes sites, but it is also what lets the
+    // homopolymer/STR predicates ROUTE rather than reject, so enabling it
+    // raises recall as well as precision (81.5% -> 93.3% on verifiable truth,
+    // 98.6% -> 99.7% precision). Scored on POSITION, though: whether a site's
+    // read partition is right -- what phasing actually consumes -- is not
+    // measured by that.
+    bool msaVerifySnpSites = true;
     // Half-width of the window each member read contributes to the MSA,
     // centred on its own copy of the site. Against the HG002 truth track on
     // E821, 50 and 150 are indistinguishable (4392 true variants kept either
