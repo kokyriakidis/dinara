@@ -572,8 +572,15 @@ public:
     // if the alternate is not snpSiteMinAltDominance of all the disagreement.
     // Note hifiasm's own source marks both thresholds "Fix-attention: looks
     // definitely wrong", so they are values to revisit, not gospel.
-    double snpSiteMinPurity = 0.95;
-    double snpSiteMinAltDominance = 0.70;
+    // hifiasm's purity/dominance gates (Correct.cpp, 0.95 and 0.70). BOTH are
+    // annotated ///Fix-attention: looks definitely wrong in hifiasm's own
+    // source, and measured on E821 that doubt is justified: their unique
+    // contribution is 6 rejected sites, all true variants, no false positives.
+    // The other 1373 sites they reject are already caught by the binomial test,
+    // the cc floor or the MSA -- gates hifiasm does not have. Disabled; the
+    // hifiasm values are still settable.
+    double snpSiteMinPurity = 0.0;
+    double snpSiteMinAltDominance = 0.0;
     // When two independent anchors land on the same base of one read, shasta2
     // forbids keeping both (positionOffsetAB asserts strictly increasing
     // positions), so one must lose. True keeps the het anchor, false the

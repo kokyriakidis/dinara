@@ -1145,7 +1145,8 @@ void Assembler::detectCigarSnpSites(
          << " in a homopolymer, " << droppedRepeat.load() << " in an STR, "
          << droppedStrandBias.load() << " strand-biased (Fisher p < "
          << strandBiasPValue << ")" << endl;
-    cout << "  biallelic reduction (hifiasm's rule): "
+    cout << "  biallelic reduction (hifiasm's rule; purity and dominance "
+            "disabled by default, see snpSiteMinPurity): "
          << droppedTiedAlleles.load() << " with tied alternates, "
          << droppedImpure.load() << " below " << siteMinPurity << " purity, "
          << droppedNotDominant.load() << " alternate below "
@@ -1161,7 +1162,7 @@ void Assembler::detectCigarSnpSites(
          << "\n    passed by both            : " << binomialVsCc[3].load()
          << "\n    (excludes " << noAlternateSites.load()
          << " owned sites with no alternate allele at all)" << endl;
-    cout << "  adjacent to another site (+/- 1 bp, hifiasm's live ONT rule): "
+    cout << "  adjacent to another site (+/- 1 bp, hifiasm's rule): "
          << droppedAdjacent.load() << endl;
     cout << "  sites surviving ALL filters: " << sitesAfterFilters.load()
          << " of " << ownedSites.load() << endl;

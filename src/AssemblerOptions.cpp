@@ -1253,15 +1253,23 @@ void AssemblerOptions::addConfigurableOptions()
 
         ("Assembly.mode3.snpSiteMinPurity",
         value<double>(&assemblyOptions.mode3Options.snpSiteMinPurity)->
-        default_value(0.95),
+        default_value(0.0),
         "Reference plus chosen alternate must account for at least this "
-        "fraction of the reads at a candidate site (hifiasm's rule).")
+        "fraction of the reads at a candidate site. This is hifiasm's gate "
+        "(Correct.cpp, threshold 0.95), but hifiasm's own source annotates it "
+        "///Fix-attention: looks definitely wrong, and measured on E821 it is "
+        "right to doubt: with dominance it uniquely rejects 6 sites, ALL of "
+        "them true variants and none a false positive. DISABLED (0) by "
+        "default; set 0.95 to reproduce hifiasm.")
 
         ("Assembly.mode3.snpSiteMinAltDominance",
         value<double>(&assemblyOptions.mode3Options.snpSiteMinAltDominance)->
-        default_value(0.70),
+        default_value(0.0),
         "The chosen alternate must be at least this fraction of all the "
-        "disagreeing reads at a candidate site (hifiasm's rule).")
+        "disagreeing reads at a candidate site. hifiasm's gate (threshold "
+        "0.70), carrying the same ///Fix-attention: looks definitely wrong "
+        "annotation upstream. DISABLED (0) by default; set 0.70 to reproduce "
+        "hifiasm. See Assembly.mode3.snpSiteMinPurity.")
 
         ("Assembly.mode3.snpSiteAlleleCoverageRate",
         value<double>(&assemblyOptions.mode3Options.snpSiteAlleleCoverageRate)->
