@@ -115,7 +115,15 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
         return verdict;
     }
 
-    // The agreed column must still look het. Only rows that PLACED vote here:
+    // INVARIANT CHECK, not a filter. Once every member contributes a window
+    // and all of them place in one column, both arms are present by
+    // construction and the CIGAR pass already proved their bases differ -- so
+    // this cannot fail unless the FRAME is wrong. It fires zero times as
+    // shipped, and that zero is the signal: under the shared-anchor windowing
+    // this replaced, it fired 4157 times because the frame was starving one arm
+    // of the site. Keep it as the canary for the next framing regression.
+    //
+    // Only rows that PLACED vote here:
     // a row whose SNP base sits elsewhere is not evidence about this column,
     // and counting it was letting clipped rows tip the allele census.
     std::array<uint32_t, 4> baseCount{0, 0, 0, 0};
@@ -148,6 +156,14 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
         return verdict;
     }
 
+    // INVARIANT CHECK, not a filter, for the same reason as the biallelic test
+    // above -- the arms were assigned from the same bases this reads back, so
+    // it fires zero times as shipped. Worth keeping anyway: it is the ONLY
+    // guard anywhere on the read PARTITION, which is what phasing consumes and
+    // is not measured by any truth comparison in this tree. If the arms and the
+    // alignment ever disagree about which read carries which allele, nothing
+    // else notices.
+    //
     // Does the column split the reads the same way the ARMS do? Both arms can
     // be biallelic and still disagree about which reads carry which allele, and
     // phasing consumes the partition, not the allele count. Score both possible
@@ -173,10 +189,10 @@ MsaSiteVerdict dinara::verifyColumnAgreement(
     verdict.partitionAgreeing = std::max(straight, swapped);
     verdict.partitionTotal =
         table[0][0] + table[0][1] + table[1][0] + table[1][1];
-    if(verdict.partitionTotal < minPlacedRows) {
-        verdict.reason = MsaSiteVerdict::Reason::tooFewMembers;
-        return verdict;
-    }
+    // No separate size check here: partitionTotal counts rows that placed AND
+    // carry one of the two alleles, and the biallelic gate above already
+    // required two alleles with >= 2 rows each, so it cannot be below 4 once
+    // that gate has passed.
     if(double(verdict.partitionAgreeing) <
         minAgreementFraction * double(verdict.partitionTotal)) {
         verdict.reason = MsaSiteVerdict::Reason::partitionMismatch;

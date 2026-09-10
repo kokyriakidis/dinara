@@ -1125,12 +1125,23 @@ void dinara::main::assemble(
                          << (before - rejected) << " of " << before
                          << " sites confirmed, " << rejected << " rejected."
                          << endl;
+                    // Only nonzero reasons are printed. notBiallelic and
+                    // partitionMismatch are INVARIANT checks rather than
+                    // filters -- they cannot fail unless the MSA frame is
+                    // wrong -- so their absence here is the healthy case and
+                    // their appearance is an alarm, not a statistic.
                     for(uint64_t i = 0; i < reasons.size(); i++) {
-                        if(reasons[i] != 0) {
-                            cout << "    "
-                                 << msaVerdictReasonName(MsaSiteVerdict::Reason(i))
-                                 << ": " << reasons[i] << endl;
+                        if(reasons[i] == 0) {
+                            continue;
                         }
+                        const auto reason = MsaSiteVerdict::Reason(i);
+                        const bool isInvariant =
+                            (reason == MsaSiteVerdict::Reason::notBiallelic) or
+                            (reason == MsaSiteVerdict::Reason::partitionMismatch);
+                        cout << "    " << msaVerdictReasonName(reason) << ": "
+                             << reasons[i]
+                             << (isInvariant ? "   <-- INVARIANT VIOLATED: the "
+                                 "MSA frame is wrong, not the data" : "") << endl;
                     }
                 }
 
