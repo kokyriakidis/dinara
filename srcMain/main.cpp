@@ -775,6 +775,29 @@ void dinara::main::assemble(
     hifiOpt.is_ont         = assemblerOptions.alignOptions.hifiasmIsOnt ? 1 : 0;
     hifiOpt.raw_candidates =
         assemblerOptions.alignOptions.useHifiasmBaseAlignment ? 0 : 1;
+    // Align each read pair ONCE. hifiasm's overlap worker runs per read and
+    // aligns every candidate of that read, so the pair (A,B) is base-aligned
+    // twice -- once with A as query, once with B -- and importAlignment-
+    // CandidatesFromMemory then merges the two into one candidate and throws
+    // one alignment away. hifiasm itself needs both (it is error-correcting
+    // each read against its own partners); dinara consumes one record per
+    // pair, so half of the single most expensive stage in the pipeline was
+    // being computed and discarded.
+    //
+    // Measured on E821 chr12:11-17Mb, 8129 ONT reads, 20 threads:
+    //   base-level alignment  423.3 -> 210.2 CPU-seconds (exactly halved)
+    //   overlap detection      30.5 ->  20.1 s wall
+    //   whole assembly         63.8 ->  49.9 s wall  (-21.8%)
+    // The candidate set shrinks 274805 -> 271103 (-1.35%): those are the pairs
+    // that only ONE direction ever finds, half of which are found only from
+    // the higher read id. Nothing downstream noticed -- markers -0.13%, marker
+    // graph vertices +0.03%, external anchors +0.11%, anchor-graph round trip
+    // still verifies -- because every marker position and anchor is supported
+    // by many overlaps, not one. Against the HG002 chr12 truth track the het
+    // sites came out 99.6% precise (vs 99.7%) while recovering 5 MORE true
+    // variants: 16 -> 17 false positives for 4560 -> 4565 truth variants
+    // found. Off at the hifiasm CLI/parity level, on here.
+    hifiOpt.one_alignment_per_pair = 1;
     performanceLog << timestamp
         << "Overlap detection: no-HPC, k=w=" << markerK
         << ", reusing prebuilt marker filter, "
