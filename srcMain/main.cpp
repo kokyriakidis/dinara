@@ -1079,9 +1079,14 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAlleleFraction,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr,
-            assemblerOptions.assemblyOptions.mode3Options.snpSiteMinHomopolymerRun,
+            // Repeat context ROUTES to MSA verification rather than rejecting,
+            // which is what longcallD does with the same predicate. When
+            // verification is off there is nothing downstream to adjudicate, so
+            // these fall back to rejecting.
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer and
+                not assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites,
+            assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr and
+                not assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageRate,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteAlleleCoverageFloor,
             assemblerOptions.assemblyOptions.mode3Options.snpSitePloidy,

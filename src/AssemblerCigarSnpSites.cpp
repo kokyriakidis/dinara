@@ -115,7 +115,6 @@ void Assembler::detectCigarSnpSites(
     double minAlleleFraction,
     bool filterHomopolymer,
     bool filterStr,
-    uint64_t minHomopolymerRun,
     double alleleCoverageRate,
     uint64_t alleleCoverageFloor,
     uint64_t ploidy,
@@ -780,60 +779,36 @@ void Assembler::detectCigarSnpSites(
                         KmVarKey key{};
                         key.type = KmVarType::Snp;
                         key.pos = uint32_t(sitePosition - lo);
-                        // Homopolymer test, LENGTH-AWARE. kmIsRepeatUnitRange
-                        // with unit 1 fires on a run of only 3 immediately
-                        // beside the site, and 3-base runs occur constantly by
-                        // chance -- which is why the old gate rejected 10261
-                        // sites here and, measured against the HG002 track, 392
-                        // truth variants that are not in a homopolymer at all.
-                        //
-                        // ONT homopolymer error scales with RUN LENGTH: runs of
-                        // 3 basecall fine, long ones do not. So require a run of
-                        // at least minHomopolymerRun bases adjacent to the site
-                        // before rejecting it.
-                        {
-                            const uint8_t* const ctx = contextBuffer.data();
-                            const int64_t n = int64_t(contextBuffer.size());
-                            const int64_t p = int64_t(key.pos);
-                            const auto runFrom = [&](int64_t start, int64_t step) {
-                                if(start < 0 || start >= n) return uint32_t(0);
-                                const uint8_t b = ctx[start];
-                                uint32_t len = 0;
-                                for(int64_t q = start; q >= 0 && q < n && ctx[q] == b; q += step) {
-                                    ++len;
-                                }
-                                return len;
-                            };
-                            const uint32_t after = runFrom(p + 1, 1);
-                            const uint32_t before = runFrom(p - 1, -1);
-                            inHomopolymer =
-                                (std::max(after, before) >= minHomopolymerRun);
-                        }
+                        inHomopolymer = kmIsRepeatUnitRange(
+                            contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 1, 1);
                         inStr = kmIsRepeatUnitRange(
                             contextBuffer.data(), uint32_t(contextBuffer.size()), key, 0, 2, 6);
                     }
-                    // The homopolymer gate is measured to be NET HARMFUL and is
-                    // off by default. Against the HG002 truth track it was the
-                    // single largest cause of missed real variants -- 49 of the
-                    // 58 truth SNVs that reached the filters and were rejected
-                    // died here -- while removing almost no false positives,
-                    // because the VAF floor above already accounts for those.
-                    // Disabling it takes recall 57.8% -> 70.0% with precision
-                    // unchanged (97.5% -> 98.0%), on the naive all-truth
-                    // denominator in use at the time. Note the circularity this
-                    // avoids: scoring a homopolymer gate against truth calls
-                    // that are themselves unreliable in homopolymers measures
-                    // agreement between two guesses, which is why the truth
-                    // partition at the top of this file excludes them.
+                    // These two are longcallD's var_is_homopolymer, ported
+                    // predicate and constants intact (3 copies, unit 1 for a
+                    // homopolymer and 2..6 for an STR).
                     //
-                    // The rationale for having it was sound (ONT homopolymer
-                    // error is systematic, so no significance test can reject
-                    // it) but incomplete: real heterozygous SNVs are common
-                    // immediately beside homopolymers, and a +/-16 bp context
-                    // window rejects those too. The STR gate (unit 2..6) stays
-                    // on: dropping it as well adds recall (-> 73.6%) but costs
-                    // precision (-> 94.4%), a bad trade when each surviving site
-                    // becomes an anchor.
+                    // In longcallD they do NOT reject anything. A variant in
+                    // repeat context is classified LONGCALLD_REP_HET_VAR and
+                    // ROUTED to noisy-region MSA realignment -- kept, and given
+                    // a better look. Only depth, allele fraction and strand
+                    // bias discard a variant there.
+                    //
+                    // dinara originally used them as rejection gates, which is
+                    // what made them look harmful: a run of 3 beside a site
+                    // happens constantly by chance, so the homopolymer gate
+                    // rejected 10261 sites and cost 392 truth variants sitting
+                    // in no homopolymer at all. Measured against the HG002
+                    // chr12 track, dropping BOTH gates and letting the MSA
+                    // adjudicate takes recall on verifiable truth from 90.9% to
+                    // 93.3% for 11 extra false positives out of 4626 sites --
+                    // 91 real variants recovered, about 8 gained per 1 lost.
+                    //
+                    // So when MSA verification is running they only REPORT; the
+                    // caller passes false for both and the MSA decides. With
+                    // verification off there is nothing downstream to adjudicate,
+                    // so they fall back to rejecting, which is the safe
+                    // behaviour rather than the intended one.
                     if(inHomopolymer && !filterHomopolymer) inHomopolymer = false;
                     if(inStr && !filterStr) inStr = false;
                     if(inHomopolymer) droppedHomopolymer.fetch_add(1, std::memory_order_relaxed);

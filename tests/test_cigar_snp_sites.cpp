@@ -142,7 +142,6 @@ public:
             /*minAlleleFraction*/ 0.0,
             /*filterHomopolymer*/ false,
             /*filterStr*/ false,
-            /*minHomopolymerRun*/ 5,
             /*alleleCoverageRate*/ 0.0,
             /*alleleCoverageFloor*/ alleleFloor,
             /*ploidy*/ 2,

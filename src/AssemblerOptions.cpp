@@ -1296,27 +1296,18 @@ void AssemblerOptions::addConfigurableOptions()
         ("Assembly.mode3.snpSiteFilterHomopolymer",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer)->
         default_value(true),
-        "Reject het sites beside a homopolymer run of at least "
-        "Assembly.mode3.snpSiteMinHomopolymerRun bases. ON by default: ONT "
-        "basecalling in a long run is unreliable regardless of what a truth "
-        "track says, and the truth track is itself ambiguous there. This was "
-        "off while the gate fired on runs of 3, where it cost 10.3 points of "
-        "recall on verifiable truth; gated on run length it costs 0.3.")
-
-        ("Assembly.mode3.snpSiteMinHomopolymerRun",
-        value<uint64_t>(&assemblyOptions.mode3Options.snpSiteMinHomopolymerRun)->
-        default_value(5),
-        "Minimum homopolymer run length immediately beside a het site before "
-        "Assembly.mode3.snpSiteFilterHomopolymer rejects it. The gate used to "
-        "fire on a run of 3, which happens constantly by chance -- on E821 that "
-        "rejected 10261 sites and cost 392 truth variants sitting in no "
-        "homopolymer at all. ONT basecalling error scales with run length, so "
-        "this gates on length rather than on mere presence.")
+        "Flag het sites in a homopolymer. When "
+        "Assembly.mode3.msaVerifySnpSites is on these sites are ROUTED to the "
+        "MSA rather than rejected -- which is what longcallD does with this "
+        "same predicate -- and only rejected outright when verification is off "
+        "and nothing downstream can adjudicate. Rejecting them cost 392 truth "
+        "variants sitting in no homopolymer at all; routing them takes recall "
+        "on verifiable truth from 90.9% to 93.3%.")
 
         ("Assembly.mode3.snpSiteFilterStr",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterStr)->
         default_value(true),
-        "Reject het sites inside a short tandem repeat (unit length 2..6).")
+        "Flag het sites in a short tandem repeat (unit length 2..6). Routed to the MSA rather than rejected when Assembly.mode3.msaVerifySnpSites is on; see Assembly.mode3.snpSiteFilterHomopolymer.")
 
         ("Assembly.mode3.createSnpSiteAnchors",
         value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
@@ -1818,7 +1809,6 @@ void Mode3AssemblyOptions::write(ostream& s) const
     s << "mode3.journeyTiePreferHet = " << convertBoolToPythonString(journeyTiePreferHet) << "\n";
     s << "mode3.snpSiteMinAlleleFraction = " << snpSiteMinAlleleFraction << "\n";
     s << "mode3.snpSiteFilterHomopolymer = " << convertBoolToPythonString(snpSiteFilterHomopolymer) << "\n";
-    s << "mode3.snpSiteMinHomopolymerRun = " << snpSiteMinHomopolymerRun << "\n";
     s << "mode3.snpSiteFilterStr = " << convertBoolToPythonString(snpSiteFilterStr) << "\n";
     s << "mode3.snpSitePloidy = " << snpSitePloidy << "\n";
     s << "mode3.createSnpSiteAnchors = " <<
