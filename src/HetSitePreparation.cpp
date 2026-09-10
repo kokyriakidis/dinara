@@ -1,6 +1,8 @@
 #include "HetSitePreparation.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 
 using namespace dinara;
 
@@ -84,7 +86,7 @@ uint64_t dinara::collapseDuplicateLoci(vector<Assembler::CigarSnpSite>& sites)
 
 uint64_t dinara::dropAlreadyAnchoredArmMembers(
     vector<Assembler::CigarSnpSite>& sites,
-    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied)
+    const AnchorOccupancy& occupied)
 {
     uint64_t removed = 0;
     for(Assembler::CigarSnpSite& site: sites) {
@@ -92,9 +94,7 @@ uint64_t dinara::dropAlreadyAnchoredArmMembers(
             const size_t before = members.size();
             members.erase(std::remove_if(members.begin(), members.end(),
                 [&](const pair<OrientedReadId, uint32_t>& m) {
-                    return occupied.count(
-                        (uint64_t(m.first.getValue()) << 32) |
-                        uint64_t(m.second)) != 0;
+                    return occupied.contains(m.first.getValue(), m.second);
                 }), members.end());
             removed += before - members.size();
         }
@@ -104,17 +104,115 @@ uint64_t dinara::dropAlreadyAnchoredArmMembers(
 
 
 
-std::unordered_map<uint64_t, Shasta2AnchorId> dinara::buildOccupiedPositions(
-    const Shasta2Anchors& anchors)
+AnchorOccupancy dinara::AnchorOccupancy::forTesting(
+    uint64_t orientedReadCount,
+    const vector<std::pair<uint64_t, uint32_t>>& entries)
 {
-    std::unordered_map<uint64_t, Shasta2AnchorId> occupied;
+    AnchorOccupancy occupancy;
+    occupancy.begin_.assign(orientedReadCount + 1, 0);
+    for(const auto& [v, position] : entries) {
+        static_cast<void>(position);
+        if(v < orientedReadCount) ++occupancy.begin_[v + 1];
+    }
+    for(uint64_t v = 0; v < orientedReadCount; v++) {
+        occupancy.begin_[v + 1] += occupancy.begin_[v];
+    }
+    occupancy.positions_.resize(occupancy.begin_[orientedReadCount]);
+    vector<uint64_t> cursor(occupancy.begin_.begin(), occupancy.begin_.end() - 1);
+    for(const auto& [v, position] : entries) {
+        if(v < orientedReadCount) occupancy.positions_[cursor[v]++] = position;
+    }
+    for(uint64_t v = 0; v < orientedReadCount; v++) {
+        std::sort(occupancy.positions_.begin() + std::ptrdiff_t(occupancy.begin_[v]),
+                  occupancy.positions_.begin() + std::ptrdiff_t(occupancy.begin_[v + 1]));
+    }
+    return occupancy;
+}
+
+
+AnchorOccupancy dinara::buildOccupiedPositions(
+    const Shasta2Anchors& anchors, uint64_t threadCount)
+{
+    if(threadCount == 0) threadCount = std::thread::hardware_concurrency();
+    if(threadCount == 0) threadCount = 1;
+
     const uint64_t anchorCount = anchors.size();
+    uint64_t orientedReadCount = 0;
     for(Shasta2AnchorId id = 0; id < anchorCount; id++) {
         for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
-            occupied.emplace(
-                (uint64_t(mi.orientedReadId.getValue()) << 32) |
-                uint64_t(mi.position), id);
+            orientedReadCount = std::max<uint64_t>(
+                orientedReadCount, uint64_t(mi.orientedReadId.getValue()) + 1);
         }
     }
-    return occupied;
+
+    AnchorOccupancy occupancy;
+    occupancy.begin_.assign(orientedReadCount + 1, 0);
+
+    const auto runOverAnchors = [&](auto&& body) {
+        const uint64_t chunk = (anchorCount + threadCount - 1) / threadCount;
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                body(t * chunk, std::min(anchorCount, (t + 1) * chunk));
+            });
+        }
+        for(std::thread& thread : threads) thread.join();
+    };
+
+    // Count, prefix-sum, fill, sort -- the same shape as the marker CSR. Fill
+    // order inside a read's slice is nondeterministic and irrelevant: the slice
+    // is sorted immediately afterwards.
+    {
+        vector<std::atomic<uint64_t>> counts(orientedReadCount);
+        for(std::atomic<uint64_t>& c : counts) c.store(0, std::memory_order_relaxed);
+        runOverAnchors([&](uint64_t begin, uint64_t end) {
+            for(Shasta2AnchorId id = begin; id < end; id++) {
+                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
+                    counts[mi.orientedReadId.getValue()].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+        });
+        uint64_t total = 0;
+        for(uint64_t v = 0; v < orientedReadCount; v++) {
+            occupancy.begin_[v] = total;
+            total += counts[v].load(std::memory_order_relaxed);
+        }
+        occupancy.begin_[orientedReadCount] = total;
+        occupancy.positions_.resize(total);
+    }
+    {
+        vector<std::atomic<uint64_t>> cursor(orientedReadCount);
+        for(uint64_t v = 0; v < orientedReadCount; v++) {
+            cursor[v].store(occupancy.begin_[v], std::memory_order_relaxed);
+        }
+        runOverAnchors([&](uint64_t begin, uint64_t end) {
+            for(Shasta2AnchorId id = begin; id < end; id++) {
+                for(const Shasta2AnchorMarkerInfo& mi : anchors[id]) {
+                    occupancy.positions_[cursor[mi.orientedReadId.getValue()].fetch_add(
+                        1, std::memory_order_relaxed)] = mi.position;
+                }
+            }
+        });
+    }
+    {
+        const uint64_t chunk = (orientedReadCount + threadCount - 1) / threadCount;
+        vector<std::thread> threads;
+        threads.reserve(threadCount);
+        for(uint64_t t = 0; t < threadCount; t++) {
+            threads.emplace_back([&, t]() {
+                const uint64_t b = t * chunk;
+                const uint64_t e = std::min(orientedReadCount, (t + 1) * chunk);
+                for(uint64_t v = b; v < e; v++) {
+                    std::sort(
+                        occupancy.positions_.begin() + std::ptrdiff_t(occupancy.begin_[v]),
+                        occupancy.positions_.begin() + std::ptrdiff_t(occupancy.begin_[v + 1]));
+                }
+            });
+        }
+        for(std::thread& thread : threads) thread.join();
+    }
+
+    return occupancy;
 }

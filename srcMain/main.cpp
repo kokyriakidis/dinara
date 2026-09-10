@@ -1164,7 +1164,7 @@ void dinara::main::assemble(
                     }
                 }
 
-                const auto occupied = buildOccupiedPositions(*shasta2Anchors);
+                const auto occupied = buildOccupiedPositions(*shasta2Anchors, threadCount);
                 const uint64_t alreadyAnchored = dropAlreadyAnchoredArmMembers(
                     snpSites, occupied);
                 cout << timestamp << "  " << alreadyAnchored

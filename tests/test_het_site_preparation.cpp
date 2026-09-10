@@ -152,12 +152,13 @@ TEST_CASE("dropAlreadyAnchoredArmMembers removes only occupied positions",
     // offset one side by hetKHalf; the mismatch matched nothing and removed 192
     // of the wrong members while leaving every real collision in place, so the
     // frames being identical is the property under test.
-    std::unordered_map<uint64_t, Shasta2AnchorId> occupied;
+    std::vector<std::pair<uint64_t, uint32_t>> entries;
     const auto occupy = [&](OrientedReadId r, uint32_t position) {
-        occupied.emplace((uint64_t(r.getValue()) << 32) | uint64_t(position), 0);
+        entries.push_back({uint64_t(r.getValue()), position});
     };
     occupy(fwd(1), 100);      // read 1 at raw 100 is already anchored
     occupy(fwd(3), 100);
+    const auto occupied = AnchorOccupancy::forTesting(16, entries);
 
     vector<Assembler::CigarSnpSite> sites;
     sites.push_back(makeSite({{fwd(0), 100}, {fwd(1), 100}},
@@ -178,8 +179,8 @@ TEST_CASE("dropAlreadyAnchoredArmMembers ignores a different position on the sam
 {
     // Occupancy is per (read, position), not per read: a read anchored
     // elsewhere is still a usable member here.
-    std::unordered_map<uint64_t, Shasta2AnchorId> occupied;
-    occupied.emplace((uint64_t(fwd(1).getValue()) << 32) | uint64_t(999), 0);
+    const auto occupied = AnchorOccupancy::forTesting(
+        16, {{uint64_t(fwd(1).getValue()), 999u}});
 
     vector<Assembler::CigarSnpSite> sites;
     sites.push_back(makeSite({{fwd(0), 100}, {fwd(1), 100}}, {{fwd(2), 100}}));
@@ -194,10 +195,11 @@ TEST_CASE("dropAlreadyAnchoredArmMembers can empty an arm", "[hetprep]")
     // Every member of one arm already anchored leaves that arm empty. The
     // function does not decide what that means -- the arm floor downstream
     // does -- but it must not silently keep the members.
-    std::unordered_map<uint64_t, Shasta2AnchorId> occupied;
+    std::vector<std::pair<uint64_t, uint32_t>> entries;
     for(uint32_t r: {2u, 3u}) {
-        occupied.emplace((uint64_t(fwd(r).getValue()) << 32) | uint64_t(100), 0);
+        entries.push_back({uint64_t(fwd(r).getValue()), 100u});
     }
+    const auto occupied = AnchorOccupancy::forTesting(16, entries);
 
     vector<Assembler::CigarSnpSite> sites;
     sites.push_back(makeSite({{fwd(0), 100}, {fwd(1), 100}},

@@ -26,7 +26,8 @@
 #include "cstdint.hpp"
 #include "vector.hpp"
 
-#include <unordered_map>
+#include <algorithm>
+#include <utility>
 
 namespace dinara {
 
@@ -57,8 +58,12 @@ uint64_t collapseDuplicateLoci(vector<Assembler::CigarSnpSite>& sites);
 // and building a het anchor over it would clone it and then compete with it for
 // a position shasta2 lets only one anchor hold.
 //
-// `occupied` maps (orientedReadId.getValue() << 32 | position) to nothing --
-// only membership is used. Build it with buildOccupiedPositions().
+// `occupied` answers one question -- does an anchor already hold this
+// (read, position)? -- so it is a SET, not a map. It used to be an
+// unordered_map<uint64_t, Shasta2AnchorId> whose value was never read: 16M hash
+// inserts, each allocating a node, with repeated rehashing, single-threaded, and
+// measured at 7.3 s on a 74 s run. It is now a flat CSR of per-read sorted
+// positions, built on every thread and queried by binary search.
 //
 // Site positions and stored anchor positions are in the SAME frame: a het
 // anchor is a zero-length marker whose stored position is the SNP base itself
@@ -66,15 +71,40 @@ uint64_t collapseDuplicateLoci(vector<Assembler::CigarSnpSite>& sites);
 // used to take a hetKHalf argument for the old 2-base het marker; getting that
 // offset wrong matched nothing and removed the wrong members, so the frames are
 // now identical by construction rather than by a caller-supplied constant.
+// Which (oriented read, position) pairs an anchor already holds.
+//
+// Per oriented read, its anchor positions ascending, in one flat array. Lookup
+// is a binary search inside that read's slice.
+class AnchorOccupancy {
+public:
+    bool contains(uint64_t orientedReadIdValue, uint32_t position) const
+    {
+        if(orientedReadIdValue + 1 >= begin_.size()) {
+            return false;
+        }
+        const auto b = positions_.begin() + std::ptrdiff_t(begin_[orientedReadIdValue]);
+        const auto e = positions_.begin() + std::ptrdiff_t(begin_[orientedReadIdValue + 1]);
+        return std::binary_search(b, e, position);
+    }
+
+    // Build from explicit (orientedReadIdValue, position) pairs. For tests;
+    // the assembly path uses buildOccupiedPositions.
+    static AnchorOccupancy forTesting(
+        uint64_t orientedReadCount,
+        const vector<std::pair<uint64_t, uint32_t>>& entries);
+
+    vector<uint64_t> begin_;        // size orientedReadCount + 1
+    vector<uint32_t> positions_;    // sorted within each read's slice
+};
+
 uint64_t dropAlreadyAnchoredArmMembers(
     vector<Assembler::CigarSnpSite>& sites,
-    const std::unordered_map<uint64_t, Shasta2AnchorId>& occupied);
+    const AnchorOccupancy& occupied);
 
 
-// (orientedRead, storedPosition) -> the anchor holding it, over every anchor
-// currently in the store.
-std::unordered_map<uint64_t, Shasta2AnchorId> buildOccupiedPositions(
-    const Shasta2Anchors& anchors);
+// Build the occupancy over every anchor currently in the store.
+AnchorOccupancy buildOccupiedPositions(
+    const Shasta2Anchors& anchors, uint64_t threadCount);
 
 }
 
