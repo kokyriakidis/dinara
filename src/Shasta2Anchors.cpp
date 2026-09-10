@@ -1,4 +1,7 @@
 #include "Shasta2Anchors.hpp"
+
+#include <charconv>
+#include <cstring>
 #include "Shasta2Journeys.hpp"
 #include "deduplicate.hpp"
 #include "findMarkerId.hpp"
@@ -417,7 +420,11 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     //
     // The per-read position map is the only added cost: one entry per exported
     // member, which is the same order as the data being written.
-    std::unordered_map<uint64_t, std::vector<uint32_t>> positionsByOrientedRead;
+    // Indexed by OrientedReadId::getValue(), not hashed by it: this takes one
+    // push_back per exported member (8.3M on E821), and an unordered_map made
+    // every one of those a hash lookup. Grown on demand because
+    // writeExternalAnchors is not given the read count.
+    std::vector<std::vector<uint32_t>> positionsByOrientedRead;
     uint64_t emptyAnchors = 0, thinAnchors = 0;
 
     // Optional dump of the EXACT exported (anchorId, orientedRead, rawPosition)
@@ -451,6 +458,12 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     // We must not skip empty anchors: shasta2 assigns sequential IDs to
     // external anchors, so skipping would break the identity mapping
     // between dinara anchor IDs and shasta2 anchor IDs.
+    // Reused across every anchor: the fixed "anchor-" prefix is written once and
+    // only the decimal id is re-formatted per anchor (see below).
+    static constexpr size_t anchorNamePrefixLength = 7;   // strlen("anchor-")
+    char anchorNameBuffer[anchorNamePrefixLength + 24];
+    std::memcpy(anchorNameBuffer, "anchor-", anchorNamePrefixLength);
+
     for(Shasta2AnchorId anchorId=0; anchorId<size(); ++anchorId) {
 
         // Skip RC anchors (odd indices) when canonicalOnly is set.
@@ -459,12 +472,19 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
         }
 
         const Shasta2Anchor anchor = (*this)[anchorId];
-        const string anchorName = "anchor-" + shasta2AnchorIdToString(anchorId);
+        // "anchor-<id>" formatted into the reused buffer declared above. This
+        // runs once per exported anchor (~500k times); building it as
+        // "anchor-" + std::to_string(anchorId) was two heap allocations each.
+        const char* const anchorNameBegin = anchorNameBuffer;
+        const char* const anchorNameEnd = std::to_chars(
+            anchorNameBuffer + anchorNamePrefixLength,
+            anchorNameBuffer + sizeof(anchorNameBuffer),
+            uint64_t(anchorId)).ptr;
 
         if(anchor.empty()) {
             // Export an empty anchor to preserve ID numbering.
             data.appendVector();
-            names.appendVector(anchorName.begin(), anchorName.end());
+            names.appendVector(anchorNameBegin, anchorNameEnd);
             ++exportedCount;
             continue;
         }
@@ -524,7 +544,7 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
         else if(keptMembers < 2) ++thinAnchors;
 
         data.appendVector();
-        names.appendVector(anchorName.begin(), anchorName.end());
+        names.appendVector(anchorNameBegin, anchorNameEnd);
         // Every anchor's rawPosition is its stored midpoint minus the uniform
         // export shift, so shasta2 (which stores midpoint = rawPosition + k/2 on
         // load) recovers exactly the original midpoint for backbone, het, and
@@ -549,8 +569,11 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
             // External anchors store the raw position (first base of the k-mer).
             const uint32_t rawPosition = markerInfo.position;
             data.append(ExternalAnchorOrientedRead(markerInfo.orientedReadId, rawPosition));
-            positionsByOrientedRead[markerInfo.orientedReadId.getValue()]
-                .push_back(rawPosition);
+            const uint64_t orientedReadValue = markerInfo.orientedReadId.getValue();
+            if(orientedReadValue >= positionsByOrientedRead.size()) {
+                positionsByOrientedRead.resize(orientedReadValue + 1);
+            }
+            positionsByOrientedRead[orientedReadValue].push_back(rawPosition);
             if(expDump) {
                 std::fprintf(expDump, "%llu\t%llu\t%u\t%d\n",
                     (unsigned long long)anchorId,
@@ -568,8 +591,7 @@ uint64_t Shasta2Anchors::writeExternalAnchors(
     }
 
     uint64_t positionCollisions = 0, readsWithCollision = 0;
-    for(auto& [orientedReadValue, positions]: positionsByOrientedRead) {
-        static_cast<void>(orientedReadValue);
+    for(auto& positions: positionsByOrientedRead) {
         if(positions.size() < 2) continue;
         std::sort(positions.begin(), positions.end());
         uint64_t here = 0;
