@@ -833,6 +833,15 @@ void dinara::main::assemble(
     // variants: 16 -> 17 false positives for 4560 -> 4565 truth variants
     // found. Off at the hifiasm CLI/parity level, on here.
     hifiOpt.one_alignment_per_pair = 1;
+    // Drop overlaps whose native chain is shorter than Align.minAlignedMarkerCount
+    // before hifiasm base-aligns them. computeBaseAlignmentsAndStore applies that
+    // same threshold to the chain AFTER mapping it to marker ordinals, and
+    // mapNativeChainToOrdinals can only DROP anchors (position lookup, k-mer
+    // agreement, monotone filter), so a chain already shorter than the threshold
+    // can never clear it -- aligning it is work whose only outcome is rejection.
+    // Passing the option through rather than hardcoding a value keeps the two
+    // thresholds from drifting apart when the flag changes.
+    hifiOpt.min_chain_anchors = assemblerOptions.alignOptions.minAlignedMarkerCount;
     performanceLog << timestamp
         << "Overlap detection: no-HPC, k=w=" << markerK
         << ", reusing prebuilt marker filter, "
