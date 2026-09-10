@@ -809,10 +809,16 @@ void Assembler::detectCigarSnpSites(
                     // verification off there is nothing downstream to adjudicate,
                     // so they fall back to rejecting, which is the safe
                     // behaviour rather than the intended one.
-                    if(inHomopolymer && !filterHomopolymer) inHomopolymer = false;
-                    if(inStr && !filterStr) inStr = false;
+                    // MEASURE always, ACT only when asked. Zeroing these when
+                    // the filter is off made the funnel print "0 in a
+                    // homopolymer" -- which reads as "none were" when it meant
+                    // "we did not look" -- and blanked the same two columns in
+                    // the owned-site dump, losing the diagnostic entirely in
+                    // the default configuration.
                     if(inHomopolymer) droppedHomopolymer.fetch_add(1, std::memory_order_relaxed);
                     if(inStr)         droppedRepeat.fetch_add(1, std::memory_order_relaxed);
+                    const bool rejectForHomopolymer = inHomopolymer && filterHomopolymer;
+                    const bool rejectForStr = inStr && filterStr;
                     allelesTotal.fetch_add(total, std::memory_order_relaxed);
                     alleleCountHistogram[std::min<size_t>(8, size_t(distinct))]
                         .fetch_add(1, std::memory_order_relaxed);
@@ -1018,7 +1024,7 @@ void Assembler::detectCigarSnpSites(
                     }
 
                     if(passing >= 2 && biallelicClean && enoughCoverage &&
-                       !inHomopolymer && !inStr && !strandBiased) {
+                       !rejectForHomopolymer && !rejectForStr && !strandBiased) {
                         sitesAfterFilters.fetch_add(1, std::memory_order_relaxed);
                         if(sitesOut) {
                             // Two arms: the dominant allele and the chosen
@@ -1141,10 +1147,12 @@ void Assembler::detectCigarSnpSites(
         const uint64_t count = significanceHistogram[i].load();
         if(count) cout << "    " << i << ": " << count << endl;
     }
-    cout << "  context/strand filters: " << droppedHomopolymer.load()
-         << " in a homopolymer, " << droppedRepeat.load() << " in an STR, "
-         << droppedStrandBias.load() << " strand-biased (Fisher p < "
-         << strandBiasPValue << ")" << endl;
+    cout << "  context: " << droppedHomopolymer.load()
+         << " in a homopolymer, " << droppedRepeat.load() << " in an STR "
+         << (filterHomopolymer ? "(rejected)" : "(reported only; the MSA "
+             "adjudicates these)")
+         << "; " << droppedStrandBias.load() << " strand-biased and rejected "
+            "(Fisher p < " << strandBiasPValue << ")" << endl;
     cout << "  biallelic reduction (hifiasm's rule; purity and dominance "
             "disabled by default, see snpSiteMinPurity): "
          << droppedTiedAlleles.load() << " with tied alternates, "

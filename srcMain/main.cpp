@@ -1079,10 +1079,14 @@ void dinara::main::assemble(
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinPurity,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAltDominance,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteMinAlleleFraction,
-            // Repeat context ROUTES to MSA verification rather than rejecting,
-            // which is what longcallD does with the same predicate. When
-            // verification is off there is nothing downstream to adjudicate, so
-            // these fall back to rejecting.
+            // Repeat context stops REJECTING when MSA verification is on.
+            //
+            // Not "routing": every surviving site goes to the MSA regardless,
+            // so the flag has no destination to route to -- it only decides
+            // whether the context rejects. longcallD really does route (only
+            // its REP_HET_VAR variants reach realignment); we verify everything,
+            // which is measurably better here because 53 of our false positives
+            // sit in CLEAN context where no predicate would flag them.
             assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterHomopolymer and
                 not assemblerOptions.assemblyOptions.mode3Options.msaVerifySnpSites,
             assemblerOptions.assemblyOptions.mode3Options.snpSiteFilterStr and

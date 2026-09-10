@@ -1304,18 +1304,18 @@ void AssemblerOptions::addConfigurableOptions()
         ("Assembly.mode3.snpSiteFilterHomopolymer",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterHomopolymer)->
         default_value(true),
-        "Flag het sites in a homopolymer. When "
-        "Assembly.mode3.msaVerifySnpSites is on these sites are ROUTED to the "
-        "MSA rather than rejected -- which is what longcallD does with this "
-        "same predicate -- and only rejected outright when verification is off "
-        "and nothing downstream can adjudicate. Rejecting them cost 392 truth "
-        "variants sitting in no homopolymer at all; routing them takes recall "
-        "on verifiable truth from 90.9% to 93.3%.")
+        "Reject het sites in a homopolymer. This gate is SUPPRESSED whenever "
+        "Assembly.mode3.msaVerifySnpSites is on: every site goes to the MSA "
+        "regardless, so there is nothing for the flag to route -- it simply "
+        "stops rejecting, and the MSA decides. Suppressing it is worth 12 "
+        "points of recall on verifiable truth (81.5% -> 93.3%) because a run "
+        "of 3 beside a site happens constantly by chance. The context is still "
+        "MEASURED and reported either way.")
 
         ("Assembly.mode3.snpSiteFilterStr",
         value<bool>(&assemblyOptions.mode3Options.snpSiteFilterStr)->
         default_value(true),
-        "Flag het sites in a short tandem repeat (unit length 2..6). Routed to the MSA rather than rejected when Assembly.mode3.msaVerifySnpSites is on; see Assembly.mode3.snpSiteFilterHomopolymer.")
+        "Reject het sites in a short tandem repeat (unit length 2..6). Suppressed when Assembly.mode3.msaVerifySnpSites is on, exactly as for Assembly.mode3.snpSiteFilterHomopolymer; see that option.")
 
         ("Assembly.mode3.createSnpSiteAnchors",
         value<bool>(&assemblyOptions.mode3Options.createSnpSiteAnchors)->
