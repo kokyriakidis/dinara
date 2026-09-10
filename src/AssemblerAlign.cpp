@@ -3,6 +3,7 @@
 
 // Dinara.
 #include "Assembler.hpp"
+#include <cstdlib>
 #include "hifiasmCoordinateTransforms.hpp"
 #include "Alignment.hpp"
 #include "AlignmentGraph.hpp"
@@ -540,7 +541,15 @@ void Assembler::importAlignmentCandidatesFromMemory(
                         basesChecked += agree + disagree;
                         basesAgree += agree;
                         basesDisagree += disagree;
-                    } else {
+                    } else if(std::getenv("DINARA_CIGAR_SPAN_DETAIL") != nullptr) {
+                        // Per-case diagnosis of a CIGAR that does not span its
+                        // declared box: try anchoring the walk at the start and
+                        // at the end and report which one agrees with the
+                        // sequence. Two extra full walks per case, so it is
+                        // opt-in -- the summary line below carries the signal,
+                        // and these overlaps are dropped downstream anyway
+                        // (detectCigarSnpSites counts them as "CIGAR shorter
+                        // than its box"). On E821 it is 12 of 188415, 0.006%.
                         const uint64_t qGapForEndAnchor =
                             (declaredQ > qConsumed) ? (declaredQ - qConsumed) : 0;
                         const uint64_t tGapForEndAnchor =
